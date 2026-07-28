@@ -20,7 +20,7 @@ use crate::llm_client::{
     ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
     StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
     is_retryable_llm_error, llm_retry_tier, messages_include_images,
-    rewrite_image_prompt_provider_error, stream_chat_no_visible_output_with_retry,
+    rewrite_image_prompt_provider_error,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 
@@ -909,6 +909,12 @@ enum PermissionScopeClassifierOutcome {
         usage: TokenUsage,
     },
     Unavailable(String),
+}
+
+struct PermissionScopeClassifierResult {
+    outcome: PermissionScopeClassifierOutcome,
+    attempts: u64,
+    usage: TokenUsage,
 }
 
 /// Pure permission-gate logic. Given the snapshot of mode + kind + name +
@@ -4095,15 +4101,17 @@ async fn classify_gate_or_reject(
     evaluation: PureGateEvaluation,
     cancel: &CancellationToken,
 ) -> GateOutcome {
+    let start = Instant::now();
     let escalation_requested = evaluation.shell_sandbox_escalation_requested;
-    match classify_permission_scope_with_model(
+    let classifier = classify_permission_scope_with_model(
         &request,
         escalation_requested,
         evaluation.shell_sandboxed,
         cancel,
     )
-    .await
-    {
+    .await;
+
+    match classifier.outcome {
         PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
@@ -4118,6 +4126,14 @@ async fn classify_gate_or_reject(
                 let notice = auto_permission_notice(
                     "did not approve this tool call",
                     &classification.rationale,
+                );
+                trace_permission_classifier_decision(
+                    request.tool_name,
+                    "reject",
+                    classifier.attempts,
+                    start.elapsed(),
+                    request.model,
+                    classifier.usage,
                 );
                 return GateOutcome {
                     decision: GateDecision::Reject {
@@ -4141,6 +4157,14 @@ async fn classify_gate_or_reject(
                             classifier_rationale = %classification.rationale,
                             "permission gate: auto-classifier approved only normal sandbox execution; denying escalation without prompting"
                         );
+                        trace_permission_classifier_decision(
+                            request.tool_name,
+                            "reject",
+                            classifier.attempts,
+                            start.elapsed(),
+                            request.model,
+                            classifier.usage,
+                        );
                         return GateOutcome {
                             decision: GateDecision::Reject {
                                 message: format!(
@@ -4160,6 +4184,14 @@ async fn classify_gate_or_reject(
                     if request.tool_name != "run_shell_command" {
                         let rationale =
                             "outside-sandbox execution is only valid for shell commands.";
+                        trace_permission_classifier_decision(
+                            request.tool_name,
+                            "reject",
+                            classifier.attempts,
+                            start.elapsed(),
+                            request.model,
+                            classifier.usage,
+                        );
                         return GateOutcome {
                             decision: GateDecision::Reject {
                                 message: format!(
@@ -4195,6 +4227,14 @@ async fn classify_gate_or_reject(
                     &classification.rationale,
                 ))
             };
+            trace_permission_classifier_decision(
+                request.tool_name,
+                "allow",
+                classifier.attempts,
+                start.elapsed(),
+                request.model,
+                classifier.usage,
+            );
             GateOutcome {
                 decision: GateDecision::Allow {
                     sandbox_policy_override,
@@ -4212,6 +4252,14 @@ async fn classify_gate_or_reject(
                 rationale = %rationale,
                 "permission gate: auto-classifier unavailable; denying without prompting"
             );
+            trace_permission_classifier_decision(
+                request.tool_name,
+                "unavailable",
+                classifier.attempts,
+                start.elapsed(),
+                request.model,
+                classifier.usage,
+            );
             GateOutcome::without_usage(GateDecision::Reject {
                 message: format!(
                     "Tool use denied: auto permissions could not evaluate this tool call ({rationale})."
@@ -4223,6 +4271,44 @@ async fn classify_gate_or_reject(
             })
         }
     }
+}
+
+fn trace_permission_classifier_decision(
+    tool_name: &str,
+    decision: &str,
+    attempts: u64,
+    elapsed: Duration,
+    model: &str,
+    usage: TokenUsage,
+) {
+    append_trace_record(permission_classifier_trace_record(
+        tool_name, decision, attempts, elapsed, model, usage,
+    ));
+}
+
+fn permission_classifier_trace_record(
+    tool_name: &str,
+    decision: &str,
+    attempts: u64,
+    elapsed: Duration,
+    model: &str,
+    usage: TokenUsage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "permission_classifier",
+        "tool": tool_name,
+        "decision": decision,
+        "attempts": attempts,
+        "elapsed_millis": elapsed.as_millis(),
+        "model": model,
+        "usage": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "thought": usage.thought_tokens,
+            "cached_read": usage.cached_read_tokens,
+            "cached_write": usage.cached_write_tokens,
+        },
+    })
 }
 
 async fn request_user_permission_or_reject(
@@ -4395,11 +4481,15 @@ async fn classify_permission_scope_with_model(
     escalation_requested: bool,
     shell_sandboxed: bool,
     cancel: &CancellationToken,
-) -> PermissionScopeClassifierOutcome {
+) -> PermissionScopeClassifierResult {
     if request.original_user_request.trim().is_empty() {
-        return PermissionScopeClassifierOutcome::Unavailable(
-            "the original user request is empty.".to_string(),
-        );
+        return PermissionScopeClassifierResult {
+            outcome: PermissionScopeClassifierOutcome::Unavailable(
+                "the original user request is empty.".to_string(),
+            ),
+            attempts: 0,
+            usage: TokenUsage::default(),
+        };
     }
 
     let classifier_input =
@@ -4441,7 +4531,7 @@ async fn classify_permission_scope_with_model(
         ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
         ChatMessage::user(prompt),
     ];
-    let result = stream_chat_no_visible_output_with_retry(
+    let (result, attempts, trace_usage) = stream_permission_classifier_with_retry(
         request.llm.as_ref(),
         "classifying permission scope",
         cancel,
@@ -4477,9 +4567,13 @@ async fn classify_permission_scope_with_model(
                 tool_name = request.tool_name,
                 "permission auto-classifier failed; denying without prompting: {detail}"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(format!(
-                "the auto-classifier request failed: {detail}"
-            ));
+            return PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(format!(
+                    "the auto-classifier request failed: {detail}"
+                )),
+                attempts,
+                usage: trace_usage,
+            };
         }
     };
     let usage = response.usage();
@@ -4491,15 +4585,24 @@ async fn classify_permission_scope_with_model(
                 tool_name = request.tool_name,
                 "permission auto-classifier returned tool calls; denying without prompting"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(
-                "the auto-classifier returned tool calls instead of a JSON decision.".to_string(),
-            );
+            return PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(
+                    "the auto-classifier returned tool calls instead of a JSON decision."
+                        .to_string(),
+                ),
+                attempts,
+                usage: trace_usage,
+            };
         }
     };
     match parse_permission_scope_classification(&text) {
-        Some(classification) => PermissionScopeClassifierOutcome::Classified {
-            classification,
-            usage,
+        Some(classification) => PermissionScopeClassifierResult {
+            outcome: PermissionScopeClassifierOutcome::Classified {
+                classification,
+                usage,
+            },
+            attempts,
+            usage: trace_usage,
         },
         None => {
             let output = truncate_for_permission_classifier(&text);
@@ -4509,9 +4612,84 @@ async fn classify_permission_scope_with_model(
                 output = %output,
                 "permission auto-classifier returned invalid JSON; denying without prompting"
             );
-            PermissionScopeClassifierOutcome::Unavailable(format!(
-                "the auto-classifier returned invalid JSON: {output}"
-            ))
+            PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(format!(
+                    "the auto-classifier returned invalid JSON: {output}"
+                )),
+                attempts,
+                usage: trace_usage,
+            }
+        }
+    }
+}
+
+async fn stream_permission_classifier_with_retry<F>(
+    llm: &dyn LlmBackend,
+    operation: &str,
+    cancel: &CancellationToken,
+    mut build_request: F,
+) -> (anyhow::Result<LlmResponse>, u64, TokenUsage)
+where
+    F: FnMut() -> StreamChatRequest,
+{
+    let mut attempt = 1u64;
+    let mut usage = TokenUsage::default();
+    loop {
+        match llm.stream_chat(build_request()).await {
+            Ok(response)
+                if !cancel.is_cancelled()
+                    && is_degenerate_empty_completion(&response)
+                    && attempt < crate::http_retry::LlmRetryTier::Fast.max_attempts() =>
+            {
+                usage.add(response.usage());
+                tracing::warn!(
+                    attempt,
+                    max_attempts = crate::http_retry::LlmRetryTier::Fast.max_attempts(),
+                    operation,
+                    "retrying empty LLM completion with no visible output"
+                );
+                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                    operation,
+                    crate::http_retry::LlmRetryTier::Fast,
+                    attempt,
+                    EMPTY_COMPLETION_RETRY_REASON.to_string(),
+                    Some(cancel),
+                )
+                .await
+                {
+                    return (Err(error), attempt, usage);
+                }
+                attempt += 1;
+            }
+            Ok(response) => {
+                usage.add(response.usage());
+                return (Ok(response), attempt, usage);
+            }
+            Err(error)
+                if !cancel.is_cancelled()
+                    && llm_retry_tier(&error).is_some_and(|tier| attempt < tier.max_attempts()) =>
+            {
+                let tier = llm_retry_tier(&error).expect("guard checked retry tier");
+                tracing::warn!(
+                    attempt,
+                    max_attempts = tier.max_attempts(),
+                    operation,
+                    "retrying transient LLM stream failure with no visible output"
+                );
+                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                    operation,
+                    tier,
+                    attempt,
+                    format!("{error:#}"),
+                    Some(cancel),
+                )
+                .await
+                {
+                    return (Err(error), attempt, usage);
+                }
+                attempt += 1;
+            }
+            Err(error) => return (Err(error), attempt, usage),
         }
     }
 }
@@ -5810,6 +5988,36 @@ mod tests {
         assert!(other.get("command").is_none());
     }
 
+    #[test]
+    fn permission_classifier_trace_record_includes_decision_model_attempts_elapsed_and_usage() {
+        let record = permission_classifier_trace_record(
+            "run_shell_command",
+            "allow",
+            2,
+            Duration::from_millis(42),
+            "test-model",
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                thought_tokens: 3,
+                cached_read_tokens: 2,
+                cached_write_tokens: 1,
+            },
+        );
+
+        assert_eq!(record["type"], "permission_classifier");
+        assert_eq!(record["tool"], "run_shell_command");
+        assert_eq!(record["decision"], "allow");
+        assert_eq!(record["attempts"], 2);
+        assert_eq!(record["elapsed_millis"], 42);
+        assert_eq!(record["model"], "test-model");
+        assert_eq!(record["usage"]["input"], 10);
+        assert_eq!(record["usage"]["output"], 4);
+        assert_eq!(record["usage"]["thought"], 3);
+        assert_eq!(record["usage"]["cached_read"], 2);
+        assert_eq!(record["usage"]["cached_write"], 1);
+    }
+
     fn task_call_for_test(id: &str, permission_mode: Option<&str>) -> ToolCall {
         let mut arguments = serde_json::json!({
             "description": format!("task {id}"),
@@ -6694,6 +6902,7 @@ mod tests {
             usage,
         } = classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
             .await
+            .outcome
         else {
             panic!("classifier should parse valid model output");
         };
@@ -6725,6 +6934,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
             classify_permission_scope_with_model(&request, false, false, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("classifier should parse valid model output");
         };
@@ -6766,6 +6976,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("retry should recover classifier output");
         };
@@ -6833,6 +7044,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("hard transport error should yield Unavailable");
         };
@@ -6863,6 +7075,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("non-JSON model output should yield Unavailable");
         };

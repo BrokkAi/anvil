@@ -27,6 +27,10 @@ Auto-mode user still pays them:
   forced a wasted main-loop turn. Fail open with a visible notice (or prompt).
 - Memoize decisions on (tool_name, normalized input): repeated edits to the
   same file currently re-classify from scratch every time.
+- Usage accounting: classifier retry-attempt usage and unavailable-response
+  usage are dropped from turn/session usage (only successful-decision usage
+  is added). The permission_classifier trace record now captures the true
+  sums; the session accounting should too.
 
 ## 3. Cheaper classifier model (Jonathan, 2026-07-28)
 
