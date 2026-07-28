@@ -5475,8 +5475,14 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
             .collect::<Vec<_>>();
+        // Match the LAST record of each shape: a lingering async task from a
+        // previously-finished test can drain into this test's fresh trace
+        // file (append_trace_record re-reads ANVIL_TRACE_JSONL at write time,
+        // after ENV_GUARD has moved on), and such leaks land before this
+        // run's own records. First-match picked up a foreign w3 window once.
         let w2_window = trace_records
             .iter()
+            .rev()
             .find(|record| {
                 record["type"] == "asgard_worker_window"
                     && record["worker"] == serde_json::json!(2)
@@ -5486,6 +5492,7 @@ mod tests {
             .expect("w2 worker-window trace");
         let w3_launch = trace_records
             .iter()
+            .rev()
             .find(|record| {
                 record["type"] == "asgard_spawn_launch"
                     && record["worker"] == serde_json::json!(3)
@@ -5495,6 +5502,7 @@ mod tests {
             .expect("w3 spawn-launch trace");
         let w3_window = trace_records
             .iter()
+            .rev()
             .find(|record| {
                 record["type"] == "asgard_worker_window"
                     && record["worker"] == serde_json::json!(3)
