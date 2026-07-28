@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
+use crate::asgard::WindowOracles;
 use crate::llm_client::{ChatMessage, TokenUsage};
 use crate::tokens::approximate_tokens_messages;
 
@@ -122,6 +123,8 @@ pub(crate) struct TrajectoryWindow {
     pub(crate) stop: WorkerStopReason,
     pub(crate) steps: usize,
     pub(crate) diffstat: String,
+    /// What this window did to test files (see [`WindowOracles`]).
+    pub(crate) oracles: WindowOracles,
     pub(crate) usage: TokenUsage,
     pub(crate) elapsed_millis: u64,
 }
@@ -326,6 +329,11 @@ impl TrajectoryDag {
         bail!(
             "commit {sha} does not descend from any known Asgard checkpoint via first-parent ancestry"
         );
+    }
+
+    /// Every saved checkpoint's window, in worker order.
+    pub(crate) fn saved_windows(&self) -> impl Iterator<Item = &TrajectoryWindow> {
+        self.nodes.values().map(|node| &node.window)
     }
 
     pub(crate) fn node(&self, worker: usize) -> Option<&TrajectoryNode> {
@@ -697,6 +705,16 @@ pub(crate) fn render_fragment(
             escape_content(&window.diffstat)
         ));
     }
+    // Oracle edits are the one class of change a diffstat hides: a test file
+    // that existed before this window looks like any other modified file in
+    // the stat, and the supervisor is reviewing work graded by those tests.
+    // Shown, never judged - no classification of "weakening", no gate.
+    if !window.oracles.changed_hunks.is_empty() {
+        rendered.push_str(&format!(
+            "<changed_oracles note=\"test files that existed at this window's start\">\n{}\n</changed_oracles>\n",
+            escape_content(window.oracles.changed_hunks.trim_end())
+        ));
+    }
     rendered.push_str(&format!(
         "<runtime elapsed_millis=\"{}\" context_tokens=\"{}\" input_tokens=\"{}\" output_tokens=\"{}\" thought_tokens=\"{}\" cached_read_tokens=\"{}\" cached_write_tokens=\"{}\" />\n",
         window.elapsed_millis,
@@ -988,6 +1006,7 @@ mod tests {
             stop: WorkerStopReason::Finished,
             steps: 2,
             diffstat: String::new(),
+            oracles: WindowOracles::default(),
             usage: TokenUsage::default(),
             elapsed_millis: 0,
         }
@@ -1198,6 +1217,26 @@ mod tests {
         let failed = render_fragment(&trajectory, None, None);
         assert!(failed.contains(r#"stop="failed""#));
         assert!(failed.contains("<failure>boom &lt;bad&gt;</failure>"));
+    }
+
+    #[test]
+    fn render_fragment_shows_changed_oracles_only_when_the_window_edited_one() {
+        let mut trajectory = window(4, CheckpointId::Root, "oracles");
+        let created_only = render_fragment(&trajectory, None, None);
+        assert!(!created_only.contains("<changed_oracles"));
+
+        trajectory.oracles = crate::asgard::WindowOracles {
+            changed_hunks: "--- a/tests/parser_test.py\n-    assert n == 3\n+    assert n >= 0\n"
+                .to_string(),
+            touched: Vec::new(),
+        };
+        let rendered = render_fragment(&trajectory, None, None);
+        assert!(
+            rendered.contains(
+                "<changed_oracles note=\"test files that existed at this window's start\">"
+            )
+        );
+        assert!(rendered.contains("+    assert n &gt;= 0"));
     }
 
     #[test]

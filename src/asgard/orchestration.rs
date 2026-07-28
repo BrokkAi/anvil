@@ -13,13 +13,15 @@ use anyhow::{Result, anyhow};
 use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
-    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, CandidateRepository,
-    CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL, PREFINALIZE_TOOL,
-    PrefixFrom, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
-    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
-    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions,
-    format_token_count, git_refusal, parse_finalize, parse_git_args, parse_prefinalize,
-    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
+    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, CLOSE_MUTATION_TOOL,
+    CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL,
+    MutationClosure, MutationVerdict, PREFINALIZE_TOOL, PrefixFrom, ResolutionBasis,
+    SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
+    SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
+    VIEW_TOOL_CALL_TOOL, WindowOracles, WorkerStopReason, bifrost_tool_definitions,
+    format_token_count, git_refusal, parse_ambiguity_resolutions, parse_close_mutation,
+    parse_finalize, parse_git_args, parse_mutations, parse_prefinalize, parse_spawn_workers,
+    parse_update_plan, parse_view_tool_call, quote_supported_by, render_dag_overview,
     render_fragment, render_resolved_views, render_window_compact_for_worker,
     rendered_window_tokens, retain_payloads_for_permanent_record, run_supervisor_git, short_sha,
     stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
@@ -143,6 +145,7 @@ struct FinishedWorker {
     stop: WorkerStopReason,
     steps: usize,
     diffstat: String,
+    oracles: WindowOracles,
     usage: TokenUsage,
     elapsed_millis: u64,
     repository: CandidateRepository,
@@ -163,6 +166,7 @@ impl FinishedWorker {
             stop: self.stop.clone(),
             steps: self.steps,
             diffstat: self.diffstat.clone(),
+            oracles: self.oracles.clone(),
             usage: self.usage,
             elapsed_millis: self.elapsed_millis,
         }
@@ -173,6 +177,27 @@ impl FinishedWorker {
 enum PendingResolution {
     Save,
     Discard,
+}
+
+/// A plant the supervisor acknowledged as surviving its suite. It stays in
+/// the ephemeral status block until a closure is recorded: an untested path
+/// in the delivery is state, not a passing remark in one turn's transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SurvivedMutation {
+    target: String,
+    /// The prefinalize worker that planted it.
+    worker: usize,
+}
+
+/// One entry of the supervisor's ambiguity register, as displayed. `basis`
+/// is the label after harness verification, so a quote that is not in the
+/// task text is already an assumption here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegisteredResolution {
+    id: String,
+    reading: String,
+    basis: String,
+    assumption: bool,
 }
 
 enum AsgardExit {
@@ -220,9 +245,19 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     launch: WorkerLaunch<'fut>,
     allowed_models: &'ctx [String],
     prefinalize_coverage_bounced: &'ctx mut bool,
+    /// Whether the "resolving a prefinalize worker needs mutations" bounce has
+    /// already been spent this run. Bounce-once, like the coverage gate: the
+    /// acknowledgment is required, but an omission must not be able to burn a
+    /// whole turn's steps.
+    mutations_bounced: &'ctx mut bool,
     finalize_lineage_bounced: &'ctx mut bool,
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
+    /// Survived plants awaiting a closure, in the order they were reported.
+    survived_mutations: &'ctx mut Vec<SurvivedMutation>,
+    /// The ambiguity register, in first-mention order; a repeated id replaces
+    /// its entry in place.
+    ambiguity_register: &'ctx mut Vec<RegisteredResolution>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
     prefix_recency: &'ctx mut HashMap<CheckpointId, Instant>,
     /// Count of consecutive regular `spawn_workers` calls (across turns) that
@@ -283,6 +318,8 @@ struct FinalizeContext<'a> {
     evidence: &'a [String],
     abandoned: &'a [String],
     prefinalize_workers: &'a [usize],
+    /// Survived plants that were never closed. Recorded, never gating.
+    open_mutations: &'a [SurvivedMutation],
 }
 
 struct WorkerLaunch<'a> {
@@ -358,8 +395,12 @@ async fn launch_worker<'a>(
          of what you did, what you verified, and what remains. You are working in a git \
          worktree of {parent_cwd_display}, shared with other workers; use \
          repository-relative paths in commands and edits - absolute paths are never \
-         required inside the repository. asgard/* refs and sibling commits are harness \
-         state - do not modify, rebase, or build on them. Your own commits are fine; \
+         required inside the repository. Sibling workers are editing the same packages \
+         concurrently, so any test file you create must stand alone: its own helpers and \
+         fixtures, no symbols redeclared from another file, and a file name specific enough \
+         that no sibling picks the same one. A test that depends on another file's helpers \
+         compiles for you and breaks when the two changes are merged. asgard/* refs and \
+         sibling commits are harness state - do not modify, rebase, or build on them. Your own commits are fine; \
          the harness snapshots your worktree regardless."
     ));
     messages.push(instruction_message.clone());
@@ -443,6 +484,17 @@ async fn launch_worker<'a>(
                 String::new()
             }
         };
+        let oracles = match crate::asgard::capture_window_oracles(&repository.root, &parent_commit)
+        {
+            Ok(oracles) => oracles,
+            Err(error) => {
+                tracing::warn!(
+                    worker = worker_id,
+                    "failed to capture Asgard worker oracle changes: {error:#}"
+                );
+                WindowOracles::default()
+            }
+        };
         let compact = render_window_compact_for_worker(worker_id, &window_messages);
         let rendered_tokens = rendered_window_tokens(&instruction_message, &window_messages);
         let raw_bytes = serialized_messages_len(&window_messages);
@@ -461,6 +513,18 @@ async fn launch_worker<'a>(
             "raw_bytes": raw_bytes,
             "compact_bytes": compact_bytes,
             "head_moved": head_moved,
+            "changed_oracles": oracles
+                .touched
+                .iter()
+                .filter(|file| file.pre_existing)
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            "created_oracles": oracles
+                .touched
+                .iter()
+                .filter(|file| !file.pre_existing)
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
         }));
         send_thought(
             &live_output.cx,
@@ -480,6 +544,7 @@ async fn launch_worker<'a>(
             stop,
             steps,
             diffstat,
+            oracles,
             usage: outcome.usage,
             elapsed_millis,
             repository,
@@ -652,9 +717,12 @@ async fn run_asgard_trajectory_loop_inner(
     let mut fallback_idle_cycles = 0usize;
     let mut canonical_plan = initial_plan;
     let mut prefinalize_coverage_bounced = false;
+    let mut mutations_bounced = false;
     let mut finalize_lineage_bounced = false;
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
+    let mut survived_mutations: Vec<SurvivedMutation> = Vec::new();
+    let mut ambiguity_register: Vec<RegisteredResolution> = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
     let mut prefix_recency: HashMap<CheckpointId, Instant> = HashMap::new();
     let mut width1_streak = 0usize;
@@ -709,8 +777,12 @@ async fn run_asgard_trajectory_loop_inner(
             &prefix_recency,
             ASGARD_BATCH_CAP,
             run_started.elapsed().as_secs() / 60,
-            idle_note,
-            &parent_status,
+            &AsgardStatusState {
+                idle_note,
+                parent_status: &parent_status,
+                survived_mutations: &survived_mutations,
+                ambiguity_register: &ambiguity_register,
+            },
         );
         let ephemeral = vec![ChatMessage::user(status)];
         let sinks = AsgardStreamSinks::new(&live_output, "Supervisor");
@@ -755,9 +827,12 @@ async fn run_asgard_trajectory_loop_inner(
             },
             allowed_models: &config.candidate_models,
             prefinalize_coverage_bounced: &mut prefinalize_coverage_bounced,
+            mutations_bounced: &mut mutations_bounced,
             finalize_lineage_bounced: &mut finalize_lineage_bounced,
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
+            survived_mutations: &mut survived_mutations,
+            ambiguity_register: &mut ambiguity_register,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
             prefix_recency: &mut prefix_recency,
             width1_streak: &mut width1_streak,
@@ -943,6 +1018,7 @@ async fn run_asgard_trajectory_loop_inner(
                 evidence: &evidence,
                 abandoned: &abandoned,
                 prefinalize_workers: &prefinalize_workers,
+                open_mutations: &survived_mutations,
             },
             checkpoint,
             response,
@@ -1246,15 +1322,33 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             Ok(plan) => {
                 let steps = plan.plan.len();
                 state.latest_plan = Some(plan);
-                Ok(format!("plan updated ({steps} steps)"))
+                let register_note = match parse_ambiguity_resolutions(call) {
+                    Ok(resolutions) if resolutions.is_empty() => String::new(),
+                    Ok(resolutions) => {
+                        let recorded = record_ambiguity_resolutions(cx, resolutions);
+                        format!("; {recorded} resolutions registered")
+                    }
+                    Err(error) => format!("; resolutions ignored: {error}"),
+                };
+                Ok(format!("plan updated ({steps} steps){register_note}"))
             }
             Err(error) => Ok(format!("error: {error}")),
         },
+        CLOSE_MUTATION_TOOL => {
+            let closure = match parse_close_mutation(call) {
+                Ok(closure) => closure,
+                Err(error) => return Ok(format!("error: close_mutation: {error}")),
+            };
+            Ok(close_survived_mutation(cx, &closure))
+        }
         SAVE_CHECKPOINT_TOOL => {
             let worker = match pending_worker_for_call(call, cx.pending, &state.resolved_pending, "save_checkpoint") {
                 Ok(worker) => worker,
                 Err(error) => return Ok(format!("error: {error}")),
             };
+            if let Err(error) = record_resolution_mutations(cx, call, worker, "save_checkpoint") {
+                return Ok(error);
+            }
             let outcome = save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
             state.saved_any = true;
             Ok(match outcome {
@@ -1308,6 +1402,9 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 Ok(worker) => worker,
                 Err(error) => return Ok(format!("error: {error}")),
             };
+            if let Err(error) = record_resolution_mutations(cx, call, worker, "discard") {
+                return Ok(error);
+            }
             let Some(finished) = cx.pending.remove(&worker) else {
                 return Ok(format!("error: discard: w{worker} is not pending"));
             };
@@ -1468,7 +1565,22 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             } else {
                 format!("evidence: {}", evidence.join(", "))
             };
-            Ok(format!("finalizing {checkpoint}; {evidence_text}"))
+            // Loud, not gating: an open survived mutant does not block
+            // delivery, but it is not allowed to leave quietly either.
+            let open_mutants = if cx.survived_mutations.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} survived mutant(s) still open: {}",
+                    cx.survived_mutations.len(),
+                    cx.survived_mutations
+                        .iter()
+                        .map(|open| open.target.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            Ok(format!("finalizing {checkpoint}; {evidence_text}{open_mutants}"))
         }
         name if cx.bifrost_tool_names.contains(name) => {
             let Some(client) = cx.bifrost else {
@@ -1520,6 +1632,156 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         other => Ok(format!("error: unknown supervisor tool {other}")),
     }
+}
+
+/// Records the `mutations` acknowledgment a resolution call carries, and
+/// requires one when the trajectory being resolved is a prefinalize worker:
+/// that worker was spawned to plant mutations, so "what happened to them" is
+/// part of resolving it, not an optional remark. An empty array is a valid
+/// answer ("it planted none"). Survived entries become run state.
+fn record_resolution_mutations(
+    cx: &mut SupervisorLoopContext<'_, '_>,
+    call: &ToolCall,
+    worker: usize,
+    tool: &str,
+) -> std::result::Result<(), String> {
+    let mutations = parse_mutations(call).map_err(|error| format!("error: {tool}: {error}"))?;
+    let is_prefinalize_worker = cx.prefinalize_workers.contains(&worker);
+    let Some(mutations) = mutations else {
+        if is_prefinalize_worker {
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_mutation_outcome",
+                "worker": worker,
+                "target": serde_json::Value::Null,
+                "outcome": "unreported",
+                "bounced": !*cx.mutations_bounced,
+            }));
+            // Bounce once per run, then let the resolution through: the
+            // acknowledgment matters, but a supervisor that keeps omitting it
+            // must not be able to spend a whole turn failing to resolve.
+            if !*cx.mutations_bounced {
+                *cx.mutations_bounced = true;
+                return Err(format!(
+                    "error: {tool}: resolving prefinalize worker w{worker} requires mutations: [{{\"target\": \"<what you mutated>\", \"outcome\": \"caught\"|\"survived\"}}] - pass an empty array if it planted none."
+                ));
+            }
+        }
+        return Ok(());
+    };
+    for mutation in &mutations {
+        crate::trace_logging::append_trace_record(serde_json::json!({
+            "type": "asgard_mutation_outcome",
+            "worker": worker,
+            "target": mutation.target,
+            "outcome": mutation.outcome.label(),
+        }));
+        if mutation.outcome == MutationVerdict::Survived
+            && !cx
+                .survived_mutations
+                .iter()
+                .any(|open| open.target == mutation.target)
+        {
+            cx.survived_mutations.push(SurvivedMutation {
+                target: mutation.target.clone(),
+                worker,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Closes one survived mutant by exact target match. Nothing is inferred: an
+/// unmatched target reports the open ones rather than guessing which was
+/// meant.
+fn close_survived_mutation(
+    cx: &mut SupervisorLoopContext<'_, '_>,
+    closure: &MutationClosure,
+) -> String {
+    let Some(index) = cx
+        .survived_mutations
+        .iter()
+        .position(|open| open.target == closure.target)
+    else {
+        if cx.survived_mutations.is_empty() {
+            return "error: close_mutation: no survived mutants are open".to_string();
+        }
+        return format!(
+            "error: close_mutation: no open survived mutant named {:?}; open: {}",
+            closure.target,
+            cx.survived_mutations
+                .iter()
+                .map(|open| open.target.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
+    let closed = cx.survived_mutations.remove(index);
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_mutation_closure",
+        "target": closed.target,
+        "worker": closed.worker,
+        "closure": closure.closure.label(),
+        "reason": closure.reason,
+    }));
+    format!(
+        "closed survived mutant {:?} as {}",
+        closed.target,
+        closure.closure.label()
+    )
+}
+
+/// Folds an `update_plan` register into run state, applying the one
+/// mechanical check: a quote that is not literally in the task text is
+/// downgraded to an assumption (and traced), never rejected.
+fn record_ambiguity_resolutions(
+    cx: &mut SupervisorLoopContext<'_, '_>,
+    resolutions: Vec<crate::asgard::AmbiguityResolution>,
+) -> usize {
+    let recorded = resolutions.len();
+    for resolution in resolutions {
+        let basis = match &resolution.basis {
+            ResolutionBasis::Quote(quote) => {
+                let supported = quote_supported_by(cx.launch.original_task, quote);
+                crate::trace_logging::append_trace_record(serde_json::json!({
+                    "type": "asgard_ambiguity_resolution",
+                    "id": resolution.id,
+                    "basis": "quote",
+                    "quote_verified": supported,
+                    "downgraded": !supported,
+                }));
+                if supported {
+                    ResolutionBasis::Quote(quote.clone())
+                } else {
+                    ResolutionBasis::Assumption
+                }
+            }
+            basis => {
+                crate::trace_logging::append_trace_record(serde_json::json!({
+                    "type": "asgard_ambiguity_resolution",
+                    "id": resolution.id,
+                    "basis": basis.label(),
+                    "quote_verified": serde_json::Value::Null,
+                    "downgraded": false,
+                }));
+                basis.clone()
+            }
+        };
+        let entry = RegisteredResolution {
+            id: resolution.id.clone(),
+            reading: resolution.reading.clone(),
+            basis: basis.label().to_string(),
+            assumption: matches!(basis, ResolutionBasis::Assumption),
+        };
+        match cx
+            .ambiguity_register
+            .iter_mut()
+            .find(|registered| registered.id == entry.id)
+        {
+            Some(registered) => *registered = entry,
+            None => cx.ambiguity_register.push(entry),
+        }
+    }
+    recorded
 }
 
 /// Render a Bifrost tool result (already unwrapped by the MCP client's
@@ -1720,11 +1982,15 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             .filter_map(|spawn| cx.dag.commit_for(&spawn.from).map(str::to_string))
             .collect();
     }
+    let prefinalize_context = match kind {
+        SpawnKind::Regular => None,
+        SpawnKind::Prefinalize => prefinalize_context_block(cx),
+    };
     let mut spawned_by_index = HashMap::new();
     for spawn in spawns {
         let from = spawn.from.clone();
         let spawn_index = spawned_by_index.len();
-        let launched = launch_spawn(cx, spawn).await?;
+        let launched = launch_spawn(cx, spawn, prefinalize_context.clone()).await?;
         let worker = launched.worker;
         state.spawned_this_turn += 1;
         state.spawned.push(worker);
@@ -1771,6 +2037,82 @@ async fn execute_spawn_requests<'ctx, 'fut>(
         }
     }
     Ok(lines.join("\n"))
+}
+
+/// Deterministic context handed to every verification worker in a prefinalize
+/// batch: what the run did to its own oracles, and which settled readings rest
+/// on nothing but the supervisor's choice. Both are listings - no obligation,
+/// no per-entry spawn, nothing gated on them.
+fn prefinalize_context_block(cx: &SupervisorLoopContext<'_, '_>) -> Option<String> {
+    let modified_oracles = modified_test_file_summary(cx.dag);
+    let assumptions = cx
+        .ambiguity_register
+        .iter()
+        .filter(|entry| entry.assumption)
+        .map(|entry| {
+            format!(
+                "- {}: {}",
+                entry.id,
+                resolution_reading_stub(&entry.reading)
+            )
+        })
+        .collect::<Vec<_>>();
+    if modified_oracles.is_empty() && assumptions.is_empty() {
+        return None;
+    }
+    let mut rendered = String::from("<prefinalize_context>\n");
+    if !assumptions.is_empty() {
+        rendered.push_str(
+            "Settled readings resting on assumption - nothing in the task text or the repository \
+             forced them. SUGGESTED attack targets, not assignments:\n",
+        );
+        rendered.push_str(&assumptions.join("\n"));
+        rendered.push('\n');
+    }
+    if !modified_oracles.is_empty() {
+        rendered.push_str(
+            "Test files this run modified after they first appeared (the oracles grading this \
+             delivery were themselves edited):\n",
+        );
+        rendered.push_str(&modified_oracles.join("\n"));
+        rendered.push('\n');
+    }
+    rendered.push_str("</prefinalize_context>");
+    Some(rendered)
+}
+
+/// One line per test file that some saved window edited after it existed:
+/// where it came from, and which workers changed it since.
+fn modified_test_file_summary(dag: &TrajectoryDag) -> Vec<String> {
+    let mut created: BTreeMap<String, usize> = BTreeMap::new();
+    let mut modified: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for window in dag.saved_windows() {
+        for file in &window.oracles.touched {
+            if file.pre_existing {
+                modified
+                    .entry(file.path.clone())
+                    .or_default()
+                    .push(window.worker);
+            } else {
+                created.entry(file.path.clone()).or_insert(window.worker);
+            }
+        }
+    }
+    modified
+        .into_iter()
+        .map(|(path, workers)| {
+            let origin = match created.get(&path) {
+                Some(worker) => format!("created by w{worker}"),
+                None => "in the repository at run start".to_string(),
+            };
+            let workers = workers
+                .iter()
+                .map(|worker| format!("w{worker}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("- {path} ({origin}; modified by {workers})")
+        })
+        .collect()
 }
 
 fn unresolved_prefinalize_workers(
@@ -1900,6 +2242,7 @@ fn save_pending_if_needed(
 async fn launch_spawn<'a>(
     cx: &mut SupervisorLoopContext<'_, 'a>,
     spawn: SpawnRequest,
+    prefinalize_context: Option<String>,
 ) -> Result<LaunchedSpawn> {
     let worker_id = *cx.worker_counter;
     *cx.worker_counter += 1;
@@ -1923,7 +2266,13 @@ async fn launch_spawn<'a>(
         &spawn,
     )
     .await?;
-    let messages = assemble_spawn_messages(cx.dag, cx.launch.parent_cwd, &spawn, orientation)?;
+    let messages = assemble_spawn_messages(
+        cx.dag,
+        cx.launch.parent_cwd,
+        &spawn,
+        orientation,
+        prefinalize_context,
+    )?;
     if let Some(checkpoint) = prefix_recency_checkpoint(&spawn) {
         cx.prefix_recency.insert(checkpoint, Instant::now());
     }
@@ -1982,11 +2331,17 @@ fn assemble_spawn_messages(
     repo_root: &Path,
     spawn: &SpawnRequest,
     orientation: Option<String>,
+    prefinalize_context: Option<String>,
 ) -> Result<Vec<ChatMessage>> {
     let mut messages = initial_messages_with_orientation(dag.initial_messages(), orientation);
     messages.extend(dag.prefix_window_messages(&spawn.from, spawn.prefix_from.as_ref())?);
     if let Some(briefing) = merge_briefing(dag, repo_root, spawn)? {
         messages.push(ChatMessage::user(briefing));
+    }
+    // Identical for every worker in the batch, so the batch still shares one
+    // prompt-cache prefix.
+    if let Some(context) = prefinalize_context {
+        messages.push(ChatMessage::user(context));
     }
     Ok(messages)
 }
@@ -2417,16 +2772,38 @@ fn finalize_asgard(
         "off_lineage_unmerged": off_lineage_unmerged,
         "abandoned": context.abandoned,
         "prefinalize_workers": context.prefinalize_workers,
+        "open_survived_mutations": context
+            .open_mutations
+            .iter()
+            .map(|open| serde_json::json!({
+                "target": open.target,
+                "worker": open.worker,
+            }))
+            .collect::<Vec<_>>(),
     }));
     let evidence_text = if context.evidence.is_empty() {
         "no evidence named".to_string()
     } else {
         format!("evidence: {}", context.evidence.join(", "))
     };
+    let open_mutants = if context.open_mutations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} survived mutant(s) never closed: {}",
+            context.open_mutations.len(),
+            context
+                .open_mutations
+                .iter()
+                .map(|open| open.target.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     send_thought(
         &context.live_output.cx,
         &context.live_output.session_id,
-        &format!("Asgard finalized checkpoint {checkpoint}; {evidence_text}.\n"),
+        &format!("Asgard finalized checkpoint {checkpoint}; {evidence_text}{open_mutants}.\n"),
     );
     let continuation_messages = match context.dag.ancestor_messages(&checkpoint) {
         Ok(messages) => messages,
@@ -2737,14 +3114,21 @@ fn count_worker_steps(messages: &[ChatMessage]) -> usize {
         .count()
 }
 
+/// Everything the status block reports beyond the DAG itself.
+struct AsgardStatusState<'a> {
+    idle_note: Option<&'a str>,
+    parent_status: &'a [String],
+    survived_mutations: &'a [SurvivedMutation],
+    ambiguity_register: &'a [RegisteredResolution],
+}
+
 fn render_asgard_status_block(
     dag: &TrajectoryDag,
     pending: &BTreeMap<usize, TrajectoryWindow>,
     prefix_recency: &HashMap<CheckpointId, Instant>,
     capacity_available: usize,
     elapsed_minutes: u64,
-    idle_note: Option<&str>,
-    parent_status: &[String],
+    state: &AsgardStatusState<'_>,
 ) -> String {
     let mut live = Vec::new();
     for worker in pending.values() {
@@ -2763,9 +3147,33 @@ fn render_asgard_status_block(
     rendered.push_str("<dag>\n");
     rendered.push_str(&render_dag_overview(dag, &live, prefix_recency));
     rendered.push_str("</dag>\n");
-    if !parent_status.is_empty() {
+    if !state.ambiguity_register.is_empty() {
+        rendered.push_str("<ambiguity_register>\n");
+        for entry in state.ambiguity_register {
+            rendered.push_str(&format!(
+                "{} [{}] {}\n",
+                entry.id,
+                if entry.assumption {
+                    "ASSUMPTION".to_string()
+                } else {
+                    entry.basis.clone()
+                },
+                resolution_reading_stub(&entry.reading)
+            ));
+        }
+        rendered.push_str("</ambiguity_register>\n");
+    }
+    // Survived plants are run state, not turn state: they stay here every
+    // turn until close_mutation says what happened to them.
+    for mutation in state.survived_mutations {
+        rendered.push_str(&format!(
+            "SURVIVED MUTANT: {} (planted by w{})\n",
+            mutation.target, mutation.worker
+        ));
+    }
+    if !state.parent_status.is_empty() {
         rendered.push_str("<parent_worktree_status>\n");
-        for line in parent_status {
+        for line in state.parent_status {
             rendered.push_str(line);
             rendered.push('\n');
         }
@@ -2773,11 +3181,22 @@ fn render_asgard_status_block(
     }
     rendered.push_str(&format!("capacity_available: {capacity_available}\n"));
     rendered.push_str("</asgard_status>\n");
-    if let Some(note) = idle_note {
+    if let Some(note) = state.idle_note {
         rendered.push_str(note);
         rendered.push('\n');
     }
     rendered
+}
+
+fn resolution_reading_stub(value: &str) -> String {
+    let text = value.replace('\n', " ");
+    if text.chars().count() <= crate::asgard::ASGARD_RESOLUTION_READING_MAX_LENGTH {
+        text
+    } else {
+        text.chars()
+            .take(crate::asgard::ASGARD_RESOLUTION_READING_MAX_LENGTH)
+            .collect()
+    }
 }
 
 fn parent_worktree_status_rollup(root: &Path) -> Result<Vec<String>> {
@@ -3031,24 +3450,36 @@ mod tests {
         named_tool_call(id, "prefinalize", serde_json::json!({ "workers": workers }))
     }
 
+    // The scripted resolutions carry an empty `mutations` array: no scripted
+    // worker plants anything, and resolving a prefinalize sibling requires
+    // the acknowledgment either way. Tests that exercise the requirement
+    // itself build their calls directly.
     fn save_call(id: &str) -> ToolCall {
-        named_tool_call(id, "save_checkpoint", serde_json::json!({}))
+        named_tool_call(
+            id,
+            "save_checkpoint",
+            serde_json::json!({ "mutations": [] }),
+        )
     }
 
     fn save_worker_call(id: &str, worker: &str) -> ToolCall {
         named_tool_call(
             id,
             "save_checkpoint",
-            serde_json::json!({ "worker": worker }),
+            serde_json::json!({ "worker": worker, "mutations": [] }),
         )
     }
 
     fn discard_call(id: &str) -> ToolCall {
-        named_tool_call(id, "discard", serde_json::json!({}))
+        named_tool_call(id, "discard", serde_json::json!({ "mutations": [] }))
     }
 
     fn discard_worker_call(id: &str, worker: &str) -> ToolCall {
-        named_tool_call(id, "discard", serde_json::json!({ "worker": worker }))
+        named_tool_call(
+            id,
+            "discard",
+            serde_json::json!({ "worker": worker, "mutations": [] }),
+        )
     }
 
     fn finalize_call(id: &str, checkpoint: &str) -> ToolCall {
@@ -3283,6 +3714,7 @@ mod tests {
             window_messages,
             rendered_tokens,
             compact: String::new(),
+            oracles: WindowOracles::default(),
             final_response: format!("final w{worker}"),
             stop: WorkerStopReason::Finished,
             steps: 1,
@@ -3357,6 +3789,7 @@ mod tests {
             Path::new("."),
             &spawn,
             Some("orientation".to_string()),
+            None,
         )
         .expect("messages");
         let second = assemble_spawn_messages(
@@ -3364,6 +3797,7 @@ mod tests {
             Path::new("."),
             &spawn,
             Some("orientation".to_string()),
+            None,
         )
         .expect("messages");
 
@@ -3411,6 +3845,7 @@ mod tests {
             Path::new("."),
             &spawn,
             Some("fresh orientation".to_string()),
+            None,
         )
         .expect("messages");
         let text = all_message_text(&messages);
@@ -3490,7 +3925,7 @@ mod tests {
             attacks: Vec::new(),
         };
 
-        let messages = assemble_spawn_messages(&dag, &repo, &spawn, None).expect("messages");
+        let messages = assemble_spawn_messages(&dag, &repo, &spawn, None, None).expect("messages");
         let text = all_message_text(&messages);
 
         assert!(text.contains("<merge_briefing>"));
@@ -5531,24 +5966,38 @@ mod tests {
             .iter()
             .filter(|record| record["trace_run_id"] == trace_run_id)
             .collect::<Vec<_>>();
-        let w2_window = trace_records
+        // `ANVIL_TRACE_JSONL` and `ANVIL_TRACE_RUN_ID` are process-wide, so any
+        // Asgard test running concurrently appends its own records here under
+        // this run id too. Match on the invariant across every candidate
+        // rather than on whichever record happens to come first.
+        let w2_rendered_tokens = trace_records
             .iter()
-            .find(|record| {
+            .filter(|record| {
                 record["type"] == "asgard_worker_window"
                     && record["worker"] == serde_json::json!(2)
                     && record["parent"] == "w1"
                     && record["prefix_from"] == "full"
             })
-            .expect("w2 worker-window trace");
-        let w3_launch = trace_records
+            .filter_map(|record| record["rendered_tokens"].as_u64())
+            .collect::<Vec<_>>();
+        assert!(
+            !w2_rendered_tokens.is_empty(),
+            "w2 worker-window trace missing"
+        );
+        let w3_prefix_tokens = trace_records
             .iter()
-            .find(|record| {
+            .filter(|record| {
                 record["type"] == "asgard_spawn_launch"
                     && record["worker"] == serde_json::json!(3)
                     && record["from"] == "w2"
                     && record["prefix_from"] == "w2"
             })
-            .expect("w3 spawn-launch trace");
+            .filter_map(|record| record["prefix_context_tokens"].as_u64())
+            .collect::<Vec<_>>();
+        assert!(
+            !w3_prefix_tokens.is_empty(),
+            "w3 spawn-launch trace missing"
+        );
         let w3_window = trace_records
             .iter()
             .find(|record| {
@@ -5559,9 +6008,13 @@ mod tests {
             })
             .expect("w3 worker-window trace");
         assert!(w3_window["rendered_tokens"].as_u64().is_some());
-        assert_eq!(
-            w3_launch["prefix_context_tokens"],
-            w2_window["rendered_tokens"]
+        // A spawn that inherits exactly w2's window is charged exactly w2's
+        // rendered window tokens.
+        assert!(
+            w3_prefix_tokens
+                .iter()
+                .any(|tokens| w2_rendered_tokens.contains(tokens)),
+            "prefix context tokens {w3_prefix_tokens:?} should match a w2 window rendering {w2_rendered_tokens:?}"
         );
     }
 
@@ -6577,6 +7030,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -6600,6 +7054,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -6611,8 +7066,12 @@ mod tests {
             &HashMap::new(),
             4,
             0,
-            Some("No worker is awaiting review. Spawn workers or finalize."),
-            &[],
+            &AsgardStatusState {
+                idle_note: Some("No worker is awaiting review. Spawn workers or finalize."),
+                parent_status: &[],
+                survived_mutations: &[],
+                ambiguity_register: &[],
+            },
         );
 
         assert!(rendered.contains("<asgard_status>"));
@@ -6628,5 +7087,288 @@ mod tests {
         ));
         assert!(rendered.contains("capacity_available: 4"));
         assert!(rendered.contains("Spawn workers or finalize."));
+    }
+
+    #[tokio::test]
+    async fn survived_mutants_persist_until_closed_and_finalize_records_the_rest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let trace_path = temp.path().join("trace.jsonl");
+        let trace_run_id = uuid::Uuid::new_v4().to_string();
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+        let _trace_run_id_env = crate::openrouter_auth::test_support::EnvScope::set(
+            "ANVIL_TRACE_RUN_ID",
+            &trace_run_id,
+        );
+
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let plan_with_register = named_tool_call(
+            "sv-plan",
+            "update_plan",
+            serde_json::json!({
+                "plan": [{ "step": "implement parse()", "status": "in_progress" }],
+                "resolutions": [
+                    {
+                        "id": "A1",
+                        "reading": "empty input yields an empty list",
+                        "basis": { "quote": "return an empty list for empty input" },
+                    },
+                    {
+                        "id": "A2",
+                        "reading": "trailing separators are ignored",
+                        "basis": { "quote": "ignore trailing separators" },
+                    },
+                ],
+            }),
+        );
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    tool_response(vec![
+                        plan_with_register,
+                        spawn_call("sv-spawn-w1", "root", "implement parse()"),
+                    ]),
+                    tool_response(vec![
+                        save_call("sv-save-w1"),
+                        prefinalize_call("sv-prefinalize-w2", "w1", "plant and verify"),
+                    ]),
+                    // Resolving a prefinalize sibling without the mutations
+                    // acknowledgment bounces once.
+                    tool_response(vec![named_tool_call(
+                        "sv-discard-bare",
+                        "discard",
+                        serde_json::json!({ "worker": "w2" }),
+                    )]),
+                    tool_response(vec![named_tool_call(
+                        "sv-discard-w2",
+                        "discard",
+                        serde_json::json!({
+                            "worker": "w2",
+                            "mutations": [
+                                { "target": "src/merge.rs boundary", "outcome": "survived" },
+                                { "target": "src/parse.rs argument order", "outcome": "survived" },
+                                { "target": "src/parse.rs empty case", "outcome": "caught" },
+                            ],
+                        }),
+                    )]),
+                    text_response("two plants survived"),
+                    tool_response(vec![named_tool_call(
+                        "sv-close",
+                        "close_mutation",
+                        serde_json::json!({
+                            "target": "src/parse.rs argument order",
+                            "closure": "oracle_validated",
+                            "reason": "the spec test now fails under that swap",
+                        }),
+                    )]),
+                    text_response("one mutant closed"),
+                    tool_response(vec![finalize_call_with_evidence(
+                        "sv-finalize",
+                        "w1",
+                        &["w1m1"],
+                    )]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("w1 implemented parse()"),
+                    text_response("w2 planted three mutations"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user(
+                "Implement parse(): return an empty list for empty input, and reject trailing commas.",
+            )],
+        )
+        .await;
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+
+        let supervisor_texts = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>();
+        let supervisor_text = supervisor_texts.join("\n");
+        assert!(
+            supervisor_text.contains("resolving prefinalize worker w2 requires mutations"),
+            "the bare resolution should have been bounced:\n{supervisor_text}"
+        );
+        assert!(
+            supervisor_text.contains("SURVIVED MUTANT: src/merge.rs boundary (planted by w2)"),
+            "survived plants must persist in the status block:\n{supervisor_text}"
+        );
+        assert!(supervisor_text.contains("SURVIVED MUTANT: src/parse.rs argument order"));
+        // The caught plant is not run state.
+        assert!(!supervisor_text.contains("SURVIVED MUTANT: src/parse.rs empty case"));
+        // Closing one clears exactly that one: the finalize turn still sees
+        // the mutant nobody answered for.
+        let finalize_turn = supervisor_texts.last().expect("finalize turn request");
+        assert!(finalize_turn.contains("SURVIVED MUTANT: src/merge.rs boundary"));
+        assert!(
+            !finalize_turn.contains("SURVIVED MUTANT: src/parse.rs argument order"),
+            "a closed mutant must leave the status block:\n{finalize_turn}"
+        );
+        // A quote that is literally in the task text keeps its basis; one that
+        // is not is downgraded, and both render in the register.
+        assert!(supervisor_text.contains("A1 [quote] empty input yields an empty list"));
+        assert!(supervisor_text.contains("A2 [ASSUMPTION] trailing separators are ignored"));
+
+        // The verification batch is told which settled readings rest on
+        // assumption - a listing, not an assignment - and every worker is
+        // briefed to keep new test files self-contained.
+        let worker_texts = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "worker-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>();
+        let verification_text = worker_texts
+            .iter()
+            .find(|text| text.contains("plant and verify"))
+            .expect("prefinalize worker request");
+        assert!(
+            verification_text.contains("<prefinalize_context>"),
+            "prefinalize workers should get the run's oracle/assumption context:\n{verification_text}"
+        );
+        assert!(verification_text.contains("SUGGESTED attack targets"));
+        assert!(verification_text.contains("- A2: trailing separators are ignored"));
+        assert!(!verification_text.contains("- A1:"));
+        assert!(
+            worker_texts
+                .iter()
+                .all(|text| text.contains("any test file you create must stand alone")),
+            "every worker briefing should carry the self-contained test doctrine"
+        );
+
+        let records = fs::read_to_string(&trace_path)
+            .expect("trace jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .filter(|record| record["trace_run_id"] == trace_run_id)
+            .collect::<Vec<_>>();
+        // Matched on content, not position: concurrently running Asgard tests
+        // inherit ANVIL_TRACE_RUN_ID and append to the same file, so only the
+        // distinctive payload identifies this run's records.
+        // Loud, not gating: the run delivered with one mutant still open.
+        assert!(
+            records.iter().any(|record| {
+                record["type"] == "asgard_finalize"
+                    && record["open_survived_mutations"]
+                        == serde_json::json!([{ "target": "src/merge.rs boundary", "worker": 2 }])
+            }),
+            "finalize should record the mutant nobody closed"
+        );
+        assert!(records.iter().any(|record| {
+            record["type"] == "asgard_mutation_closure"
+                && record["target"] == "src/parse.rs argument order"
+                && record["closure"] == "oracle_validated"
+        }));
+        assert!(records.iter().any(|record| {
+            record["type"] == "asgard_ambiguity_resolution"
+                && record["id"] == "A2"
+                && record["downgraded"] == serde_json::json!(true)
+        }));
+    }
+
+    #[test]
+    fn status_block_keeps_survived_mutants_and_marks_assumption_resolutions() {
+        let dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        let rendered = render_asgard_status_block(
+            &dag,
+            &BTreeMap::new(),
+            &HashMap::new(),
+            8,
+            3,
+            &AsgardStatusState {
+                idle_note: None,
+                parent_status: &[],
+                survived_mutations: &[SurvivedMutation {
+                    target: "src/merge.rs boundary".to_string(),
+                    worker: 7,
+                }],
+                ambiguity_register: &[
+                    RegisteredResolution {
+                        id: "A1".to_string(),
+                        reading: "empty input yields []".to_string(),
+                        basis: "quote".to_string(),
+                        assumption: false,
+                    },
+                    RegisteredResolution {
+                        id: "A2".to_string(),
+                        reading: "trailing separators are ignored".to_string(),
+                        basis: "assumption".to_string(),
+                        assumption: true,
+                    },
+                ],
+            },
+        );
+
+        assert!(rendered.contains("SURVIVED MUTANT: src/merge.rs boundary (planted by w7)"));
+        assert!(rendered.contains("A1 [quote] empty input yields []"));
+        assert!(rendered.contains("A2 [ASSUMPTION] trailing separators are ignored"));
+    }
+
+    #[test]
+    fn modified_test_file_summary_names_origin_and_every_modifier() {
+        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        let mut insert = |worker: usize, parent: CheckpointId, touched: Vec<(&str, bool)>| {
+            let mut window = test_window(worker, parent, "work", TokenUsage::default());
+            window.oracles = WindowOracles {
+                changed_hunks: String::new(),
+                touched: touched
+                    .into_iter()
+                    .map(|(path, pre_existing)| crate::asgard::TouchedTestFile {
+                        path: path.to_string(),
+                        pre_existing,
+                    })
+                    .collect(),
+            };
+            dag.insert(TrajectoryNode {
+                window,
+                commit: format!("c{worker}"),
+                merged_from: Vec::new(),
+            })
+            .expect("insert node");
+        };
+        insert(1, CheckpointId::Root, vec![("tests/spec_test.py", false)]);
+        insert(
+            2,
+            CheckpointId::Worker(1),
+            vec![("tests/spec_test.py", true), ("tests/legacy_test.py", true)],
+        );
+        insert(
+            3,
+            CheckpointId::Worker(2),
+            vec![("tests/spec_test.py", true)],
+        );
+
+        assert_eq!(
+            modified_test_file_summary(&dag),
+            vec![
+                "- tests/legacy_test.py (in the repository at run start; modified by w2)"
+                    .to_string(),
+                "- tests/spec_test.py (created by w1; modified by w2, w3)".to_string(),
+            ]
+        );
     }
 }

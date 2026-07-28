@@ -29,6 +29,92 @@ pub(crate) const DISCARD_TOOL: &str = "discard";
 pub(crate) const FINALIZE_TOOL: &str = "finalize";
 pub(crate) const VIEW_TOOL_CALL_TOOL: &str = "view_tool_call";
 pub(crate) const UPDATE_PLAN_TOOL: &str = "update_plan";
+pub(crate) const CLOSE_MUTATION_TOOL: &str = "close_mutation";
+
+/// Cap on a registered ambiguity reading rendered in the status block.
+pub(crate) const ASGARD_RESOLUTION_READING_MAX_LENGTH: usize = 300;
+
+/// How a prefinalize batch's planted mutation ended: the suite caught it, or
+/// it survived and the delivery has an untested path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationVerdict {
+    Caught,
+    Survived,
+}
+
+impl MutationVerdict {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Caught => "caught",
+            Self::Survived => "survived",
+        }
+    }
+}
+
+/// One plant's outcome, acknowledged when the supervisor resolves the
+/// prefinalize sibling that planted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MutationOutcome {
+    pub(crate) target: String,
+    pub(crate) outcome: MutationVerdict,
+}
+
+/// How a survived mutant was closed. Deliberately without an "added a test"
+/// option: a test that catches the plant is `oracle_validated`, and the
+/// enum's job is to make the other two answers say themselves out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationClosureKind {
+    OracleValidated,
+    LogicRemoved,
+    AcceptedRisk,
+}
+
+impl MutationClosureKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OracleValidated => "oracle_validated",
+            Self::LogicRemoved => "logic_removed",
+            Self::AcceptedRisk => "accepted_risk",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MutationClosure {
+    pub(crate) target: String,
+    pub(crate) closure: MutationClosureKind,
+    pub(crate) reason: String,
+}
+
+/// What a settled ambiguity resolution rests on. The harness verifies exactly
+/// one of these mechanically (see [`quote_supported_by`]); the other two are
+/// recorded as stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolutionBasis {
+    Quote(String),
+    Precedent(String),
+    Assumption,
+}
+
+impl ResolutionBasis {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Quote(_) => "quote",
+            Self::Precedent(_) => "precedent",
+            Self::Assumption => "assumption",
+        }
+    }
+}
+
+/// One numbered ambiguity resolution from `update_plan`'s optional register.
+/// The free-form plan text is untouched by this: only entries in the
+/// `resolutions` array carry a basis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AmbiguityResolution {
+    pub(crate) id: String,
+    pub(crate) reading: String,
+    pub(crate) basis: ResolutionBasis,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnRequest {
@@ -103,13 +189,14 @@ pub(crate) fn supervisor_supplement() -> String {
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
 - spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
 Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
-- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
+- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. When you resolve a prefinalize sibling (save_checkpoint or discard) you must pass mutations: one {{target, outcome}} entry per plant that worker made, or an empty array if it made none. A survived plant names a path in the delivery that no oracle checks; it stays in your status block as SURVIVED MUTANT until close_mutation records what happened to it, and finalize reports any still open. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
 - code intelligence - search_symbols, get_summaries, get_symbol_sources, usage_graph, scan_usages_by_location, get_definitions_by_location, semantic search, and more: read-only Bifrost tools indexing the repository at its base state. Use them to UNDERSTAND before you direct: find the symbols, files, and call sites your task touches so your worker mandates name exact functions and locations instead of describing them. activate_workspace switches Bifrost to another path (for example your git scratch worktree after you check out a checkpoint's hash) to analyze a specific candidate's code.
 - discard: permanently discard a reviewed trajectory. Pass `worker` to name which one when multiple siblings are under review.
 - view_tool_call: expand compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only once a trajectory has been presented for review.
-- update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
+- update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself. Its optional resolutions array is your ambiguity register: one entry per numbered ambiguity (A1, A2, ...) with the reading you settled on and its basis - a literal quote from the task text, a repository precedent, or an assumption. A quote is checked mechanically against the task text and silently becomes an assumption if it is not literally there, so quote what the task says, not what you concluded. Assumption-basis entries are listed to your prefinalize workers as suggested attack targets.
+- close_mutation: close one survived mutant from your status block, naming what happened to it: oracle_validated, logic_removed, or accepted_risk, with a reason.
 - finalize: ends the run. The named checkpoint's repository state is delivered as the result, and that worker's final message (or the response you provide) becomes the final answer.
 
 Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions by default, and know nothing about sibling workers or your plans - put everything they need into the instructions. You may set prefix_from to an ancestor checkpoint on the worker's first-parent lineage to inherit only windows from that checkpoint through `from`, inclusive; set prefix_from to "none" for a fresh worker with no inherited windows. Elided history is replaced by deterministic git diff orientation, and re-using a recently-used prefix is cheaper because providers can reuse prompt-cache prefixes. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
@@ -187,12 +274,13 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: SAVE_CHECKPOINT_TOOL.to_string(),
-                description: "Save a reviewed trajectory as a permanent checkpoint without spawning from it yet. Pass worker like \"w7\" when multiple siblings are pending.".to_string(),
+                description: "Save a reviewed trajectory as a permanent checkpoint without spawning from it yet. Pass worker like \"w7\" when multiple siblings are pending. Resolving a prefinalize worker requires mutations: the outcome of every plant it made.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "worker": { "type": "string" },
+                        "mutations": mutations_property(),
                     },
                 }),
             },
@@ -220,12 +308,13 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: DISCARD_TOOL.to_string(),
-                description: "Discard a reviewed trajectory permanently. Every reviewed trajectory must be saved, spawned from (which saves it implicitly), or discarded. Pass worker like \"w7\" when multiple siblings are pending.".to_string(),
+                description: "Discard a reviewed trajectory permanently. Every reviewed trajectory must be saved, spawned from (which saves it implicitly), or discarded. Pass worker like \"w7\" when multiple siblings are pending. Resolving a prefinalize worker requires mutations: the outcome of every plant it made.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "worker": { "type": "string" },
+                        "mutations": mutations_property(),
                     },
                 }),
             },
@@ -275,8 +364,115 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                 }),
             },
         },
-        crate::tools::update_plan_tool_definition(),
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: CLOSE_MUTATION_TOOL.to_string(),
+                description: "Close one survived mutant recorded in your status block. A survived plant means the delivered code has a path no oracle checks; it stays visible until you say what happened to it. oracle_validated: an existing or strengthened test now fails when that mutation is applied, and you have seen it fail. logic_removed: the mutated code no longer exists in the delivery. accepted_risk: the path stays untested and you are delivering anyway - say why. Closing does not delete work; it records a decision.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["target", "closure", "reason"],
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "the mutation target exactly as it appears in SURVIVED MUTANT",
+                        },
+                        "closure": {
+                            "type": "string",
+                            "enum": ["oracle_validated", "logic_removed", "accepted_risk"],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "one sentence naming the evidence or the decision",
+                        },
+                    },
+                }),
+            },
+        },
+        supervisor_update_plan_tool_definition(),
     ]
+}
+
+/// The `mutations` array shared by the two resolution tools: what each plant
+/// the prefinalize sibling made did to the suite.
+fn mutations_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "description": "Required when resolving a prefinalize worker; empty array when it planted nothing. One entry per plant: what was mutated, and whether the suite caught it.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target", "outcome"],
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "what was mutated, specifically enough to find again (file plus function or line)",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["caught", "survived"],
+                    "description": "caught: the suite went red. survived: it stayed green, so nothing tests that path.",
+                },
+            },
+        },
+    })
+}
+
+/// The supervisor's `update_plan`: the shared agent tool plus an optional
+/// structured ambiguity register. The register is additive - the plan text
+/// itself keeps exactly the shape every other agent uses, and other agents
+/// never see the extra property.
+fn supervisor_update_plan_tool_definition() -> ToolDefinition {
+    let mut definition = crate::tools::update_plan_tool_definition();
+    if let Some(properties) = definition
+        .function
+        .parameters
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.insert(
+            "resolutions".to_string(),
+            serde_json::json!({
+                "type": "array",
+                "description": "Your numbered ambiguity register (A1, A2, ...). Optional, additive, and separate from the plan text: one entry per detail of the task that admitted more than one reading, with the reading you settled on and what it rests on.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "reading", "basis"],
+                    "properties": {
+                        "id": { "type": "string", "description": "the number you gave it, e.g. \"A3\"" },
+                        "reading": {
+                            "type": "string",
+                            "maxLength": ASGARD_RESOLUTION_READING_MAX_LENGTH,
+                            "description": "the settled reading, stated as behavior",
+                        },
+                        "basis": {
+                            "description": "What the reading rests on. quote: the exact task text that settles it - checked mechanically against the task, and downgraded to assumption if it is not literally there. precedent: an analogous implementation already in the repository. assumption: nothing in the task or the repository settles it and you chose.",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["quote"],
+                                    "properties": { "quote": { "type": "string" } },
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["precedent"],
+                                    "properties": { "precedent": { "type": "string" } },
+                                },
+                                { "type": "string", "enum": ["assumption"] },
+                            ],
+                        },
+                    },
+                },
+            }),
+        );
+    }
+    definition
 }
 
 /// Maps a live Bifrost (`core` toolset) MCP client's advertised tools into
@@ -710,6 +906,165 @@ pub(crate) fn parse_update_plan(
         .map_err(|error| format!("Invalid update_plan arguments: {error}"))
 }
 
+/// Parses `update_plan`'s optional ambiguity register. A call without a
+/// `resolutions` array yields an empty register - the plan itself is
+/// unaffected either way.
+pub(crate) fn parse_ambiguity_resolutions(
+    call: &ToolCall,
+) -> std::result::Result<Vec<AmbiguityResolution>, String> {
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    let entries = match arguments.get("resolutions") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "resolutions must be an array".to_string())?,
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("resolutions[{index}].id must be a string"))?
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return Err(format!("resolutions[{index}].id must not be empty"));
+            }
+            let reading = entry
+                .get("reading")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("resolutions[{index}].reading must be a string"))?
+                .trim()
+                .to_string();
+            Ok(AmbiguityResolution {
+                id,
+                reading,
+                basis: parse_resolution_basis(entry.get("basis")),
+            })
+        })
+        .collect()
+}
+
+/// Basis parsing is deliberately lenient: anything the schema did not shape
+/// into a quote or a precedent counts as an assumption. Assumption is the
+/// conservative reading - it marks the entry as an attack target rather than
+/// letting a malformed basis pass as evidence.
+fn parse_resolution_basis(value: Option<&serde_json::Value>) -> ResolutionBasis {
+    match value {
+        Some(serde_json::Value::Object(object)) => {
+            if let Some(quote) = object.get("quote").and_then(serde_json::Value::as_str)
+                && !quote.trim().is_empty()
+            {
+                return ResolutionBasis::Quote(quote.to_string());
+            }
+            if let Some(precedent) = object.get("precedent").and_then(serde_json::Value::as_str)
+                && !precedent.trim().is_empty()
+            {
+                return ResolutionBasis::Precedent(precedent.to_string());
+            }
+            ResolutionBasis::Assumption
+        }
+        _ => ResolutionBasis::Assumption,
+    }
+}
+
+/// The single mechanical check the harness performs on the register: a quote
+/// basis holds only when the quoted string really is in the run's task text.
+/// Whitespace is collapsed on both sides - a model re-wrapping a quoted line
+/// is not a different quote - and nothing else is normalized, because any
+/// further leniency would start accepting paraphrase as citation.
+pub(crate) fn quote_supported_by(task_text: &str, quote: &str) -> bool {
+    fn collapse(value: &str) -> String {
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let quote = collapse(quote);
+    !quote.is_empty() && collapse(task_text).contains(&quote)
+}
+
+/// Parses the optional `mutations` array carried by a resolution call.
+/// `Ok(None)` means the caller never mentioned mutations, which is what the
+/// prefinalize-resolution requirement keys on; `Ok(Some(vec![]))` is an
+/// explicit "this worker planted nothing".
+pub(crate) fn parse_mutations(
+    call: &ToolCall,
+) -> std::result::Result<Option<Vec<MutationOutcome>>, String> {
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    let entries = match arguments.get("mutations") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "mutations must be an array".to_string())?,
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let target = entry
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("mutations[{index}].target must be a string"))?
+                .trim()
+                .to_string();
+            if target.is_empty() {
+                return Err(format!("mutations[{index}].target must not be empty"));
+            }
+            let outcome = match entry.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("caught") => MutationVerdict::Caught,
+                Some("survived") => MutationVerdict::Survived,
+                _ => {
+                    return Err(format!(
+                        "mutations[{index}].outcome must be \"caught\" or \"survived\""
+                    ));
+                }
+            };
+            Ok(MutationOutcome { target, outcome })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+pub(crate) fn parse_close_mutation(
+    call: &ToolCall,
+) -> std::result::Result<MutationClosure, String> {
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    let target = arguments
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "target must be a string".to_string())?
+        .trim()
+        .to_string();
+    if target.is_empty() {
+        return Err("target must name a survived mutant".to_string());
+    }
+    let closure = match arguments.get("closure").and_then(serde_json::Value::as_str) {
+        Some("oracle_validated") => MutationClosureKind::OracleValidated,
+        Some("logic_removed") => MutationClosureKind::LogicRemoved,
+        Some("accepted_risk") => MutationClosureKind::AcceptedRisk,
+        _ => {
+            return Err(
+                "closure must be \"oracle_validated\", \"logic_removed\", or \"accepted_risk\""
+                    .to_string(),
+            );
+        }
+    };
+    let reason = arguments
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if reason.is_empty() {
+        return Err("reason must say what happened to the mutant".to_string());
+    }
+    Ok(MutationClosure {
+        target,
+        closure,
+        reason,
+    })
+}
+
 /// Parses the `git` tool's `{args: string[]}` payload into the argv that
 /// will be passed to the git CLI directly - never through a shell, so a
 /// value containing shell metacharacters stays exactly one argv token.
@@ -789,6 +1144,7 @@ fn is_supervisor_action_tool(name: &str) -> bool {
             | DISCARD_TOOL
             | FINALIZE_TOOL
             | UPDATE_PLAN_TOOL
+            | CLOSE_MUTATION_TOOL
     )
 }
 
@@ -850,7 +1206,7 @@ fn string_array_property(
 mod tests {
     use super::*;
 
-    use crate::asgard::{TrajectoryNode, TrajectoryWindow, WorkerStopReason};
+    use crate::asgard::{TrajectoryNode, TrajectoryWindow, WindowOracles, WorkerStopReason};
     use crate::llm_client::{FunctionCall, TokenUsage};
 
     fn supervisor_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -880,6 +1236,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -1010,6 +1367,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -1031,6 +1389,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -1427,6 +1786,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
+                oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
@@ -1549,6 +1909,203 @@ mod tests {
             parse_update_plan(&call)
                 .expect_err("invalid plan")
                 .contains("Invalid update_plan arguments")
+        );
+    }
+
+    #[test]
+    fn ambiguity_register_parses_bases_and_ignores_a_plan_without_one() {
+        let bare = supervisor_tool_call(
+            "plan",
+            UPDATE_PLAN_TOOL,
+            serde_json::json!({ "plan": [{ "step": "implement", "status": "pending" }] }),
+        );
+        assert!(parse_update_plan(&bare).is_ok());
+        assert_eq!(parse_ambiguity_resolutions(&bare), Ok(Vec::new()));
+
+        let registered = supervisor_tool_call(
+            "plan",
+            UPDATE_PLAN_TOOL,
+            serde_json::json!({
+                "plan": [{ "step": "implement", "status": "pending" }],
+                "resolutions": [
+                    { "id": "A1", "reading": "empty input yields []", "basis": { "quote": "return an empty list" } },
+                    { "id": "A2", "reading": "argument order is (needle, haystack)", "basis": { "precedent": "src/find.rs" } },
+                    { "id": "A3", "reading": "trailing separators are ignored", "basis": "assumption" },
+                    // An unrecognized basis shape is read as an assumption,
+                    // never as evidence.
+                    { "id": "A4", "reading": "ties break toward the first", "basis": { "vibes": "felt right" } },
+                ],
+            }),
+        );
+        assert!(parse_update_plan(&registered).is_ok());
+        let resolutions = parse_ambiguity_resolutions(&registered).expect("resolutions");
+        assert_eq!(
+            resolutions
+                .iter()
+                .map(|resolution| (resolution.id.as_str(), resolution.basis.label()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A1", "quote"),
+                ("A2", "precedent"),
+                ("A3", "assumption"),
+                ("A4", "assumption"),
+            ]
+        );
+
+        let malformed = supervisor_tool_call(
+            "plan",
+            UPDATE_PLAN_TOOL,
+            serde_json::json!({
+                "plan": [],
+                "resolutions": [{ "reading": "no id" }],
+            }),
+        );
+        assert!(
+            parse_ambiguity_resolutions(&malformed)
+                .expect_err("missing id")
+                .contains("resolutions[0].id")
+        );
+    }
+
+    #[test]
+    fn quote_basis_holds_only_for_literal_task_text() {
+        let task =
+            "The parser must reject trailing commas\nand return an empty list for empty input.";
+        assert!(quote_supported_by(task, "reject trailing commas"));
+        // Re-wrapped whitespace is the same quote.
+        assert!(quote_supported_by(
+            task,
+            "trailing commas   and    return an empty list"
+        ));
+        // A paraphrase is not.
+        assert!(!quote_supported_by(task, "reject trailing separators"));
+        assert!(!quote_supported_by(task, "   "));
+    }
+
+    #[test]
+    fn resolution_mutations_parse_and_reject_unknown_outcomes() {
+        let absent = supervisor_tool_call("save", SAVE_CHECKPOINT_TOOL, serde_json::json!({}));
+        assert_eq!(parse_mutations(&absent), Ok(None));
+
+        let empty = supervisor_tool_call(
+            "save",
+            SAVE_CHECKPOINT_TOOL,
+            serde_json::json!({ "mutations": [] }),
+        );
+        assert_eq!(parse_mutations(&empty), Ok(Some(Vec::new())));
+
+        let reported = supervisor_tool_call(
+            "discard",
+            DISCARD_TOOL,
+            serde_json::json!({
+                "mutations": [
+                    { "target": "src/tokenize.rs quote handling", "outcome": "caught" },
+                    { "target": "src/merge.rs boundary", "outcome": "survived" },
+                ],
+            }),
+        );
+        assert_eq!(
+            parse_mutations(&reported),
+            Ok(Some(vec![
+                MutationOutcome {
+                    target: "src/tokenize.rs quote handling".to_string(),
+                    outcome: MutationVerdict::Caught,
+                },
+                MutationOutcome {
+                    target: "src/merge.rs boundary".to_string(),
+                    outcome: MutationVerdict::Survived,
+                },
+            ]))
+        );
+
+        let bogus = supervisor_tool_call(
+            "discard",
+            DISCARD_TOOL,
+            serde_json::json!({ "mutations": [{ "target": "x", "outcome": "maybe" }] }),
+        );
+        assert!(
+            parse_mutations(&bogus)
+                .expect_err("bad outcome")
+                .contains("mutations[0].outcome")
+        );
+    }
+
+    #[test]
+    fn close_mutation_parser_requires_target_closure_and_reason() {
+        let call = supervisor_tool_call(
+            "close",
+            CLOSE_MUTATION_TOOL,
+            serde_json::json!({
+                "target": "src/merge.rs boundary",
+                "closure": "accepted_risk",
+                "reason": "the path is unreachable from the public surface",
+            }),
+        );
+        assert_eq!(
+            parse_close_mutation(&call),
+            Ok(MutationClosure {
+                target: "src/merge.rs boundary".to_string(),
+                closure: MutationClosureKind::AcceptedRisk,
+                reason: "the path is unreachable from the public surface".to_string(),
+            })
+        );
+
+        for (arguments, expected) in [
+            (
+                serde_json::json!({ "closure": "logic_removed", "reason": "gone" }),
+                "target must be a string",
+            ),
+            (
+                serde_json::json!({ "target": "x", "closure": "added_a_test", "reason": "r" }),
+                "closure must be",
+            ),
+            (
+                serde_json::json!({ "target": "x", "closure": "logic_removed" }),
+                "reason must say",
+            ),
+        ] {
+            let call = supervisor_tool_call("close", CLOSE_MUTATION_TOOL, arguments);
+            assert!(
+                parse_close_mutation(&call)
+                    .expect_err("invalid closure")
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_tools_carry_mutations_and_update_plan_gains_only_the_supervisor_register() {
+        let tools = supervisor_tool_definitions(&["model-a".to_string()]);
+        for tool in [SAVE_CHECKPOINT_TOOL, DISCARD_TOOL] {
+            let definition = tools
+                .iter()
+                .find(|definition| definition.function.name == tool)
+                .unwrap_or_else(|| panic!("{tool} definition"));
+            assert!(
+                definition.function.parameters["properties"]["mutations"]["items"]["properties"]["outcome"]
+                    ["enum"]
+                    == serde_json::json!(["caught", "survived"]),
+                "{tool} must carry the mutations acknowledgment"
+            );
+        }
+        assert!(
+            tools
+                .iter()
+                .any(|definition| definition.function.name == CLOSE_MUTATION_TOOL)
+        );
+
+        let supervisor_plan = tools
+            .iter()
+            .find(|definition| definition.function.name == UPDATE_PLAN_TOOL)
+            .expect("update_plan definition");
+        assert!(supervisor_plan.function.parameters["properties"]["resolutions"].is_object());
+        // The shared agent tool is untouched: only the supervisor's copy
+        // carries the register.
+        let shared = crate::tools::update_plan_tool_definition();
+        assert!(shared.function.parameters["properties"]["resolutions"].is_null());
+        assert_eq!(
+            shared.function.parameters["properties"]["plan"],
+            supervisor_plan.function.parameters["properties"]["plan"]
         );
     }
 

@@ -130,12 +130,12 @@ fn matches_test_file_pattern(path: &str, pattern: &str) -> bool {
 }
 
 /// A test file the run touched, as reported by `git diff --name-status`.
-#[derive(Debug, PartialEq, Eq)]
-struct TouchedTestFile {
-    path: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TouchedTestFile {
+    pub(crate) path: String,
     /// True when the file already existed at the base commit (the worker
     /// edited or deleted it) rather than being created by the run.
-    pre_existing: bool,
+    pub(crate) pre_existing: bool,
 }
 
 /// Parses `git diff --name-status -z --no-renames` output into the test
@@ -547,6 +547,99 @@ fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
 
 pub(crate) fn capture_diffstat(root: &Path, base_commit: &str) -> Result<String> {
     capture_worktree_diffstat(root, base_commit)
+}
+
+/// Cap on the changed-oracles hunks shown per window. Oracle edits are
+/// normally a handful of lines; a window that rewrites a whole test file
+/// gets truncated with a note rather than displacing the review.
+pub(crate) const ASGARD_CHANGED_ORACLES_MAX_LINES: usize = 200;
+
+/// What a worker window did to the repository's test files, captured once
+/// when the worker finishes. Visibility only: nothing here classifies an
+/// edit as weakening, and nothing gates on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowOracles {
+    /// Hunks from this window's diff for test files that already existed at
+    /// the window's start. Empty when the window only created new tests.
+    pub(crate) changed_hunks: String,
+    /// Every test file this window touched, with whether it existed at the
+    /// window's start. Feeds the run-level "test files modified since they
+    /// first appeared" summary.
+    pub(crate) touched: Vec<TouchedTestFile>,
+}
+
+/// Captures [`WindowOracles`] for a finished worker's worktree against the
+/// commit it forked from. Untracked files are staged into a scratch index
+/// first (same trick as the diffstat capture), so a brand-new test file is
+/// classified as created rather than missed.
+pub(crate) fn capture_window_oracles(root: &Path, base_commit: &str) -> Result<WindowOracles> {
+    let index_path =
+        std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+    let _index_guard = TemporaryIndex::new(index_path.clone());
+    git_with_index(root, &index_path, &["read-tree", base_commit])?;
+    add_intent_to_add_untracked(root, &index_path)?;
+    let touched = parse_touched_test_files(
+        &git_with_index(
+            root,
+            &index_path,
+            &[
+                "diff",
+                "--name-status",
+                "-z",
+                "--no-renames",
+                base_commit,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?
+        .stdout,
+    );
+    let pre_existing = touched
+        .iter()
+        .filter(|file| file.pre_existing)
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let changed_hunks = if pre_existing.is_empty() {
+        String::new()
+    } else {
+        let mut args = vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            base_commit.to_string(),
+            "--".to_string(),
+        ];
+        // `literal` magic so a path containing glob metacharacters still
+        // names exactly itself.
+        args.extend(pre_existing.iter().map(|path| format!(":(literal){path}")));
+        let diff = String::from_utf8(
+            git_with_index(
+                root,
+                &index_path,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?
+            .stdout,
+        )
+        .context("git diff output for changed test files was not UTF-8")?;
+        truncate_to_lines(&diff, ASGARD_CHANGED_ORACLES_MAX_LINES)
+    };
+    Ok(WindowOracles {
+        changed_hunks,
+        touched,
+    })
+}
+
+fn truncate_to_lines(value: &str, max_lines: usize) -> String {
+    let lines = value.lines().collect::<Vec<_>>();
+    if lines.len() <= max_lines {
+        return value.trim_end().to_string();
+    }
+    let dropped = lines.len() - max_lines;
+    format!(
+        "{}\n[{dropped} more diff lines truncated]",
+        lines[..max_lines].join("\n")
+    )
 }
 
 fn capture_worktree_diffstat(root: &Path, base_commit: &str) -> Result<String> {
@@ -1656,6 +1749,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn capture_window_oracles_reports_edited_tests_and_ignores_brand_new_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::create_dir(repo.join("tests")).unwrap();
+        fs::write(repo.join("service.go"), "package main\n").unwrap();
+        fs::write(
+            repo.join("tests/existing_test.py"),
+            "def test_alpha():\n    assert compute() == 3\n",
+        )
+        .unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim().to_string();
+
+        let editing = create_candidate_repository(repo, "oracle-edit").unwrap();
+        fs::write(editing.root.join("service.go"), "package main\n// fix\n").unwrap();
+        fs::write(
+            editing.root.join("tests/existing_test.py"),
+            "def test_alpha():\n    assert compute() == 4\n",
+        )
+        .unwrap();
+        let edited = capture_window_oracles(&editing.root, &base_commit).unwrap();
+        assert!(
+            edited.changed_hunks.contains("tests/existing_test.py"),
+            "changed oracles should name the edited test file:\n{}",
+            edited.changed_hunks
+        );
+        assert!(edited.changed_hunks.contains("assert compute() == 4"));
+        assert_eq!(
+            edited.touched,
+            vec![TouchedTestFile {
+                path: "tests/existing_test.py".to_string(),
+                pre_existing: true,
+            }]
+        );
+
+        let creating = create_candidate_repository(repo, "oracle-create").unwrap();
+        fs::write(
+            creating.root.join("tests/brand_new_test.py"),
+            "def test_beta():\n    assert True\n",
+        )
+        .unwrap();
+        let created = capture_window_oracles(&creating.root, &base_commit).unwrap();
+        assert!(
+            created.changed_hunks.is_empty(),
+            "a brand-new test file is not a changed oracle:\n{}",
+            created.changed_hunks
+        );
+        assert_eq!(
+            created.touched,
+            vec![TouchedTestFile {
+                path: "tests/brand_new_test.py".to_string(),
+                pre_existing: false,
+            }]
+        );
+
+        remove_candidate_repository(&editing);
+        remove_candidate_repository(&creating);
+    }
+
+    #[test]
+    fn changed_oracle_hunks_truncate_with_a_note() {
+        let long = (0..500)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = truncate_to_lines(&long, ASGARD_CHANGED_ORACLES_MAX_LINES);
+        assert_eq!(
+            truncated.lines().count(),
+            ASGARD_CHANGED_ORACLES_MAX_LINES + 1
+        );
+        assert!(truncated.ends_with("[300 more diff lines truncated]"));
+        assert_eq!(truncate_to_lines("a\nb\n", 10), "a\nb");
     }
 
     #[test]

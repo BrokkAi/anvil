@@ -35,6 +35,25 @@ pub(crate) const COMPACT_TOOL_SUMMARY_LIMIT: usize = 200;
 /// Cap for an argument value quoted inside a tool summary.
 const COMPACT_ARGUMENT_LIMIT: usize = 80;
 
+/// Cap on a cited result rendered verbatim. A citation says "this result is
+/// why I believe what I claim", so the supervisor should not have to fetch it
+/// again - but a runaway result must not swallow the review either, and the
+/// handle still resolves the untruncated original through `view_tool_call`.
+const COMPACT_CITED_RESULT_LIMIT: usize = 8_000;
+
+/// Tail budget for the trailing results of a window: the last few lines, and
+/// never more than this many characters of them.
+const COMPACT_TAIL_LINES: usize = 10;
+const COMPACT_TAIL_CHARS: usize = 800;
+
+/// How many trailing tool results of a window keep a verbatim tail. Evidence
+/// produced immediately before a forced report is exactly what a summary line
+/// cannot stand in for.
+const COMPACT_TAIL_RESULTS: usize = 2;
+
+/// Cap on the first non-empty line of a failed result kept verbatim.
+const COMPACT_FAILURE_LINE_LIMIT: usize = 200;
+
 pub(crate) struct CompactText {
     pub(crate) text: String,
     pub(crate) len: usize,
@@ -133,6 +152,59 @@ fn shell_exit_code(result: &str) -> Option<i32> {
         .last()
         .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
         .and_then(|capture| capture.as_str().parse::<i32>().ok())
+}
+
+/// Whether a tool result reports a failure. Anvil has no typed failures, so
+/// this is the same textual evidence `summarize_tool_result` keys on: an
+/// `Error:` prefix, or a shell command that reported a non-zero exit code.
+fn result_failed(result: &str) -> bool {
+    result_error(result).is_some() || shell_exit_code(result).is_some_and(|code| code != 0)
+}
+
+/// The first non-empty line of a failed result, capped. Modeled on mjolnir's
+/// review renderer, which appends the first error line to a failed tool's
+/// delta: the size floor elides the line that says *what* broke, and the
+/// supervisor cannot judge a failure it cannot see.
+fn failure_first_line(result: &str) -> Option<String> {
+    if !result_failed(result) {
+        return None;
+    }
+    let line = result
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(truncate_summary(line, COMPACT_FAILURE_LINE_LIMIT))
+}
+
+/// The last [`COMPACT_TAIL_LINES`] lines of a result, capped at
+/// [`COMPACT_TAIL_CHARS`] characters.
+fn result_tail(result: &str) -> String {
+    let trimmed = result.trim_end();
+    let lines = trimmed.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(COMPACT_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    let length = tail.chars().count();
+    if length <= COMPACT_TAIL_CHARS {
+        tail
+    } else {
+        tail.chars().skip(length - COMPACT_TAIL_CHARS).collect()
+    }
+}
+
+/// Whether `report` cites `handle` as an exact token. Purely mechanical: the
+/// handle must appear with non-alphanumeric neighbours, so "w3m1" in a report
+/// does not match handle "w3m12" and prose can never be parsed for intent.
+pub(crate) fn report_cites_handle(report: &str, handle: &str) -> bool {
+    if handle.is_empty() {
+        return false;
+    }
+    let bytes = report.as_bytes();
+    report.match_indices(handle).any(|(start, _)| {
+        let end = start + handle.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
 }
 
 fn omitted(result: &str) -> String {
@@ -274,16 +346,38 @@ pub(crate) fn originating_tool_call(
 
 /// Renders one v2 worker window compactly.
 pub(crate) fn render_window_compact_for_worker(worker: usize, messages: &[ChatMessage]) -> String {
-    render_window_compact_with_handle(messages, |index| worker_tool_handle(worker, index))
+    let report = crate::asgard::extract_worker_final_response(messages);
+    render_window_compact_with_handle(messages, &report, |index| worker_tool_handle(worker, index))
 }
 
+/// Indexes of the last [`COMPACT_TAIL_RESULTS`] tool results in the window.
+fn trailing_result_indexes(messages: &[ChatMessage]) -> std::collections::HashSet<usize> {
+    let results = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == "tool")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    results
+        .iter()
+        .rev()
+        .take(COMPACT_TAIL_RESULTS)
+        .copied()
+        .collect()
+}
+
+/// `report` is the worker's own final message, scanned only for exact result
+/// handles: a cited result is rendered verbatim instead of elided. Nothing
+/// else about the report is interpreted.
 fn render_window_compact_with_handle(
     messages: &[ChatMessage],
+    report: &str,
     handle_for_index: impl Fn(usize) -> String,
 ) -> String {
     let mut rendered = String::new();
     let mut seen_results: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let trailing = trailing_result_indexes(messages);
 
     for (index, message) in messages.iter().enumerate() {
         if let Some(reasoning) = &message.reasoning_content {
@@ -321,9 +415,32 @@ fn render_window_compact_with_handle(
                 let summary =
                     summarize_tool_result(tool, &arguments, &raw, COMPACT_TOOL_SUMMARY_LIMIT);
                 rendered.push_str(&format!(
-                    "<tool name=\"{tool}\" id=\"{handle}\">{}</tool>\n",
+                    "<tool name=\"{tool}\" id=\"{handle}\">{}",
                     escape_content(&summary)
                 ));
+                // Retention, in precedence order. A cited result is already
+                // whole, so neither of the partial retentions adds anything
+                // to it.
+                if report_cites_handle(report, &handle) {
+                    rendered.push_str(&format!(
+                        "\n<cited_result>{}</cited_result>",
+                        escape_content(&truncate_summary(&raw, COMPACT_CITED_RESULT_LIMIT))
+                    ));
+                } else {
+                    if let Some(line) = failure_first_line(&raw) {
+                        rendered.push_str(&format!(
+                            "\n<failure_line>{}</failure_line>",
+                            escape_content(&line)
+                        ));
+                    }
+                    if trailing.contains(&index) && !raw.trim().is_empty() {
+                        rendered.push_str(&format!(
+                            "\n<result_tail>{}</result_tail>",
+                            escape_content(&result_tail(&raw))
+                        ));
+                    }
+                }
+                rendered.push_str("</tool>\n");
             }
             role => {
                 let text = message_text(message);
@@ -396,14 +513,126 @@ mod tests {
                 r#"{"command":"cargo test"}"#,
             )),
             ChatMessage::tool_result("c2", "run_shell_command", "ok\nExit code: 0".to_string()),
+            assistant_call(call("c3", "list_directory", r#"{"path":"src"}"#)),
+            ChatMessage::tool_result("c3", "list_directory", "main.rs".to_string()),
+            assistant_call(call("c4", "list_directory", r#"{"path":"docs"}"#)),
+            ChatMessage::tool_result("c4", "list_directory", "readme.md".to_string()),
         ];
         let rendered = render_window_compact_for_worker(2, &messages);
         assert!(rendered.contains(
             r#"<tool name="read_file" id="w2m1">read src/main.rs (9000 chars omitted)</tool>"#
         ));
         assert!(rendered.contains(r#"id="w2m3">$ "cargo test" (exit 0)"#));
-        // The 9,000-char result never reaches the supervisor verbatim.
+        // A big, uncited, mid-window success result never reaches the
+        // supervisor verbatim - that size floor is the whole point.
         assert!(!rendered.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn failed_results_keep_their_first_line_however_large() {
+        let mut noise = "error[E0308]: mismatched types\n".to_string();
+        noise.push_str(&"context line\n".repeat(2_000));
+        let messages = vec![
+            assistant_call(call(
+                "c1",
+                "run_shell_command",
+                r#"{"command":"cargo build"}"#,
+            )),
+            ChatMessage::tool_result("c1", "run_shell_command", format!("{noise}Exit code: 101")),
+            assistant_call(call("c2", "read_file", r#"{"file_path":"missing.rs"}"#)),
+            ChatMessage::tool_result("c2", "read_file", "Error: no such file".to_string()),
+            assistant_call(call("c3", "list_directory", r#"{"path":"src"}"#)),
+            ChatMessage::tool_result("c3", "list_directory", "main.rs".to_string()),
+            assistant_call(call("c4", "list_directory", r#"{"path":"docs"}"#)),
+            ChatMessage::tool_result("c4", "list_directory", "readme.md".to_string()),
+        ];
+        let rendered = render_window_compact_for_worker(3, &messages);
+        assert!(
+            rendered.contains("<failure_line>error[E0308]: mismatched types</failure_line>"),
+            "failed shell result should keep its first line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("<failure_line>Error: no such file</failure_line>"),
+            "failed tool result should keep its first line:\n{rendered}"
+        );
+        // The rest of the failure is still elided.
+        assert!(!rendered.contains(&"context line\n".repeat(4)));
+    }
+
+    #[test]
+    fn a_result_the_report_cites_by_handle_renders_whole() {
+        let cited = format!("SUITE OUTPUT\n{}\n42 passed", "detail line\n".repeat(60));
+        let messages = vec![
+            assistant_call(call(
+                "c1",
+                "run_shell_command",
+                r#"{"command":"cargo test"}"#,
+            )),
+            ChatMessage::tool_result("c1", "run_shell_command", cited.clone()),
+            assistant_call(call("c2", "list_directory", r#"{"path":"src"}"#)),
+            ChatMessage::tool_result("c2", "list_directory", "main.rs".to_string()),
+            assistant_call(call("c3", "list_directory", r#"{"path":"docs"}"#)),
+            ChatMessage::tool_result("c3", "list_directory", "readme.md".to_string()),
+            ChatMessage::assistant("Suite is green; see w5m1 for the full run.".to_string()),
+        ];
+        let rendered = render_window_compact_for_worker(5, &messages);
+        assert!(
+            rendered.contains(&format!("<cited_result>{}</cited_result>", cited)),
+            "cited result should render whole:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_uncited_handle_prefix_does_not_count_as_a_citation() {
+        let big = "payload line\n".repeat(200);
+        let messages = vec![
+            assistant_call(call("c1", "read_file", r#"{"file_path":"a.rs"}"#)),
+            ChatMessage::tool_result("c1", "read_file", big.clone()),
+            assistant_call(call("c2", "list_directory", r#"{"path":"src"}"#)),
+            ChatMessage::tool_result("c2", "list_directory", "main.rs".to_string()),
+            assistant_call(call("c3", "list_directory", r#"{"path":"docs"}"#)),
+            ChatMessage::tool_result("c3", "list_directory", "readme.md".to_string()),
+            // w5m11 is a different handle; the substring w5m1 must not match.
+            ChatMessage::assistant("see w5m11 for details".to_string()),
+        ];
+        let rendered = render_window_compact_for_worker(5, &messages);
+        assert!(!rendered.contains("<cited_result>"));
+        assert!(!rendered.contains(&"payload line\n".repeat(4)));
+    }
+
+    #[test]
+    fn the_last_two_results_keep_a_verbatim_tail() {
+        let long = |file: &str| {
+            (0..40)
+                .map(|index| format!("{file} line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let messages = vec![
+            assistant_call(call("c1", "read_file", r#"{"file_path":"a.rs"}"#)),
+            ChatMessage::tool_result("c1", "read_file", long("a")),
+            assistant_call(call("c2", "read_file", r#"{"file_path":"b.rs"}"#)),
+            ChatMessage::tool_result("c2", "read_file", long("b")),
+            assistant_call(call("c3", "read_file", r#"{"file_path":"c.rs"}"#)),
+            ChatMessage::tool_result("c3", "read_file", long("c")),
+        ];
+        let rendered = render_window_compact_for_worker(6, &messages);
+        // The last two results keep their last 10 lines; the first does not.
+        assert_eq!(rendered.matches("<result_tail>").count(), 2);
+        assert!(rendered.contains("c line 30\nc line 31"));
+        assert!(rendered.contains("b line 39"));
+        // The first result stays elided: its tail never appears.
+        assert!(!rendered.contains("a line 39"));
+    }
+
+    #[test]
+    fn handle_citation_detection_is_exact_token_matching() {
+        assert!(report_cites_handle("evidence: w3m5 is the run", "w3m5"));
+        assert!(report_cites_handle("(w3m5)", "w3m5"));
+        assert!(report_cites_handle("w3m5", "w3m5"));
+        assert!(!report_cites_handle("w3m50", "w3m5"));
+        assert!(!report_cites_handle("aw3m5", "w3m5"));
+        assert!(!report_cites_handle("nothing here", "w3m5"));
     }
 
     #[test]
