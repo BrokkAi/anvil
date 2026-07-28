@@ -4978,6 +4978,9 @@ Never assume standard commands.
 together with the project's suite. An import check or ad-hoc script is not a substitute \
 for running tests. If the project's test runner is broken or unavailable, fixing or \
 unblocking it is part of the task - do not substitute a weaker check and report success.
+- Prefer fixing production code over weakening an existing test: a pre-existing test that \
+fails against your change is evidence about the change, not about the test. If you believe \
+a test is genuinely obsolete or wrong, say so explicitly rather than silently rewriting it.
 - A test earns its place by the wrong implementation it would catch — name that bug to \
 yourself as you write it. Assert exact values, not just non-null or no-crash. Pick inputs \
 that expose the classic mistakes: operands where argument order matters, both sides of \
@@ -10665,6 +10668,10 @@ mod tests {
             assert!(
                 prompt.contains("Match the surrounding code's conventions exactly"),
                 "system prompt for {mode:?} must make existing output the convention reference, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("Prefer fixing production code over weakening an existing test"),
+                "system prompt for {mode:?} must carry the test-immutability norm, got: {prompt}"
             );
             assert!(
                 !prompt.contains("create a task list"),
