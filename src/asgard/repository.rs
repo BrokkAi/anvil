@@ -750,7 +750,10 @@ impl SnapshotStage {
         .map(str::to_string)
         .collect();
         if guard_test_files {
-            let excluded = self.touched_test_files(base_commit, checkpoint_commit)?;
+            let touched_test_files = self.touched_test_files(base_commit, checkpoint_commit)?;
+            let (retained_pre_existing, excluded): (Vec<_>, Vec<_>) = touched_test_files
+                .iter()
+                .partition(|file| file.pre_existing);
             // `literal` magic so a path that happens to contain glob
             // metacharacters still excludes exactly itself.
             args.extend(
@@ -769,6 +772,10 @@ impl SnapshotStage {
                         "path": file.path,
                         "pre_existing": file.pre_existing,
                     }))
+                    .collect::<Vec<_>>(),
+                "retained_pre_existing": retained_pre_existing
+                    .iter()
+                    .map(|file| file.path.as_str())
                     .collect::<Vec<_>>(),
             }));
             if !excluded.is_empty() {
@@ -1123,6 +1130,7 @@ fn merge_head_exists(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
 
     fn run_git(root: &Path, args: &[&str]) {
         assert!(
@@ -1651,29 +1659,33 @@ mod tests {
     }
 
     #[test]
-    fn finalize_patch_guard_drops_test_files_but_keeps_production_changes() {
+    fn finalize_patch_guard_excludes_new_tests_but_retains_pre_existing_matches() {
+        let _lock = ENV_GUARD.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
+        let trace_path = temp.path().join("trace.jsonl");
+        let _trace_env = EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
         run_git(repo, &["init"]);
         configure_test_user(repo);
+        fs::create_dir(repo.join("mobly")).unwrap();
         fs::write(repo.join("service.go"), "package main\n").unwrap();
-        fs::write(repo.join("service_test.go"), "// original expectation\n").unwrap();
-        run_git(repo, &["add", "service.go", "service_test.go"]);
+        fs::write(repo.join("mobly/base_test.py"), "# production module\n").unwrap();
+        run_git(repo, &["add", "service.go", "mobly/base_test.py"]);
         run_git(repo, &["commit", "-m", "initial"]);
         let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
         let base_commit = base_commit.trim();
 
         let worker = create_candidate_repository(repo, "guard-worker").unwrap();
         fs::write(worker.root.join("service.go"), "package main\n// fixed\n").unwrap();
-        // The carnage case: the worker rewrites a pre-existing test AND
-        // authors a new one whose name a hidden test patch may also claim.
+        // `mobly/base_test.py` matches `*_test.py` by basename, but it is a
+        // pre-existing production module and must still be delivered.
         fs::write(
-            worker.root.join("service_test.go"),
-            "// rewritten expectation\n",
+            worker.root.join("mobly/base_test.py"),
+            "# production module\nFIXED = True\n",
         )
         .unwrap();
         fs::create_dir(worker.root.join("tests")).unwrap();
-        fs::write(worker.root.join("tests/extra_test.go"), "// new\n").unwrap();
+        fs::write(worker.root.join("tests/foo_test.py"), "# worker test\n").unwrap();
         fs::write(worker.root.join("helper.go"), "package main\n").unwrap();
 
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
@@ -1685,8 +1697,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(unguarded.contains("service_test.go"));
-        assert!(unguarded.contains("tests/extra_test.go"));
+        assert!(unguarded.contains("mobly/base_test.py"));
+        assert!(unguarded.contains("FIXED = True"));
+        assert!(unguarded.contains("tests/foo_test.py"));
 
         let guarded = String::from_utf8(
             stage
@@ -1695,11 +1708,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !guarded.contains("service_test.go"),
-            "an edited pre-existing test file must not be delivered:\n{guarded}"
+            guarded.contains("mobly/base_test.py") && guarded.contains("FIXED = True"),
+            "an edited pre-existing pattern match must be delivered:\n{guarded}"
         );
         assert!(
-            !guarded.contains("tests/extra_test.go"),
+            !guarded.contains("tests/foo_test.py"),
             "a worker-authored test file must not be delivered:\n{guarded}"
         );
         assert!(
@@ -1711,15 +1724,33 @@ mod tests {
             "new production files must survive the guard:\n{guarded}"
         );
 
+        let trace_records = fs::read_to_string(&trace_path).expect("trace jsonl");
+        let guard_record: serde_json::Value = trace_records
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("trace record json"))
+            .find(|record: &serde_json::Value| record["type"] == "asgard_test_guard")
+            .expect("asgard test guard trace record");
+        assert_eq!(guard_record["excluded_count"], 1);
+        assert_eq!(
+            guard_record["excluded"],
+            serde_json::json!([
+                {
+                    "path": "tests/foo_test.py",
+                    "pre_existing": false,
+                }
+            ])
+        );
+        assert_eq!(
+            guard_record["retained_pre_existing"],
+            serde_json::json!(["mobly/base_test.py"])
+        );
+
         // Snapshots keep the test files regardless -- only delivery filters.
         assert_eq!(
-            git_text(
-                repo,
-                &["show", &format!("{checkpoint}:tests/extra_test.go")]
-            )
-            .unwrap()
-            .replace("\r\n", "\n"),
-            "// new\n"
+            git_text(repo, &["show", &format!("{checkpoint}:tests/foo_test.py")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "# worker test\n"
         );
 
         remove_candidate_repository(&worker);
