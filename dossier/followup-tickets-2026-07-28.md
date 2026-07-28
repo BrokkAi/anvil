@@ -6,12 +6,16 @@ classifier LLM call per gated tool call (~52% of wall-clock, 19% spurious
 denials). Deployment fix landed: `BROKK_ACP_PERMISSION_MODE` env default in
 anvil + staged by brokkbench. These tickets are the rest of the story.
 
-## 1. Fix the mj flag plumbing (protocol-correct fix)
+## 1. Fix the mj flag plumbing (protocol-correct fix) — DONE
 
-After `session/new`, mjolnir must send ACP `session/set_config_option`
-(`config_id: "permission_mode"`) with the value of its `--permission-mode`
-flag. The anvil handler already exists (acp.rs `apply_config_option`).
-Blocked on: mj source tree availability (deleted externally; binaries pinned).
+Landed as mjolnir 4d71315 (source found at ~/Projects/mjolnir; the /mnt/optane
+copy was the deleted one). True dead-end was TWO-fold: interactive sessions
+built RuntimeRoleConfig with permission: None, and configure_permissions
+mapped (AdapterKind::Custom, _) to None — benchmark runs are always
+custom/bpr-agent/<wire>, so they were in the one config hole. Custom now
+reuses the Anvil permission_mode mapping, gated on the server advertising the
+option; failures warn loudly. Unpushed; benchmark binaries still pinned to
+mj-6147059 (harmless — the anvil env default covers benchmarks regardless).
 
 ## 2. Classifier hygiene for Auto-mode users
 
