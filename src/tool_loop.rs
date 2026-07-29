@@ -49,9 +49,10 @@ pub(crate) const TRAJECTORY_WINDOW_PENULTIMATE_NOTICE: &str = "Budget notice: th
 /// Injected on a trajectory-window run's last turn -- see
 /// `trajectory_window_budget_notice`.
 pub(crate) const TRAJECTORY_WINDOW_FINAL_NOTICE: &str = "Budget notice: this is your final \
-    step. Write your report to the supervisor now - a concise account of what you did, what you \
-    verified with real command output, and what remains. Do not call tools; results from this \
-    step would never be seen.";
+    step. Hand off now: report exact state - what is done, what you verified with real command \
+    output, what remains, and precisely where you stopped. Unfinished is normal and expected; \
+    the supervisor can continue this trajectory from its checkpoint, and only your report tells \
+    it where to resume. Do not call tools; results from this step would never be seen.";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 const MAX_PARALLEL_SAFE_TOOL_CALLS: usize = 6;

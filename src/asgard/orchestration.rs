@@ -13,16 +13,15 @@ use anyhow::{Result, anyhow};
 use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
-    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, CLOSE_MUTATION_TOOL,
-    CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL,
-    MutationClosure, MutationVerdict, PREFINALIZE_TOOL, PrefixFrom, ResolutionBasis,
-    SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
-    SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
-    VIEW_TOOL_CALL_TOOL, WindowOracles, WorkerStopReason, bifrost_tool_definitions,
-    format_token_count, git_refusal, parse_ambiguity_resolutions, parse_close_mutation,
-    parse_finalize, parse_git_args, parse_mutations, parse_prefinalize, parse_spawn_workers,
-    parse_update_plan, parse_view_tool_call, quote_supported_by, render_dag_overview,
-    render_fragment, render_resolved_views, render_window_compact_for_worker,
+    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, CLOSE_MUTATION_TOOL, CandidateRepository,
+    CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL, MutationClosure,
+    MutationVerdict, PREFINALIZE_TOOL, PrefixFrom, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL,
+    SnapshotStage, SpawnRequest, SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag,
+    TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WindowOracles,
+    WorkerStopReason, bifrost_tool_definitions, format_token_count, git_refusal,
+    parse_close_mutation, parse_finalize, parse_git_args, parse_mutations, parse_prefinalize,
+    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_budget_calibration,
+    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
     rendered_window_tokens, retain_payloads_for_permanent_record, run_supervisor_git, short_sha,
     stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
     window_context_tokens,
@@ -144,6 +143,7 @@ struct FinishedWorker {
     final_response: String,
     stop: WorkerStopReason,
     steps: usize,
+    max_steps: usize,
     diffstat: String,
     oracles: WindowOracles,
     usage: TokenUsage,
@@ -165,6 +165,7 @@ impl FinishedWorker {
             final_response: self.final_response.clone(),
             stop: self.stop.clone(),
             steps: self.steps,
+            max_steps: self.max_steps,
             diffstat: self.diffstat.clone(),
             oracles: self.oracles.clone(),
             usage: self.usage,
@@ -187,17 +188,6 @@ struct SurvivedMutation {
     target: String,
     /// The prefinalize worker that planted it.
     worker: usize,
-}
-
-/// One entry of the supervisor's ambiguity register, as displayed. `basis`
-/// is the label after harness verification, so a quote that is not in the
-/// task text is already an assumption here.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RegisteredResolution {
-    id: String,
-    reading: String,
-    basis: String,
-    assumption: bool,
 }
 
 enum AsgardExit {
@@ -255,9 +245,6 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     prefinalize_workers: &'ctx mut Vec<usize>,
     /// Survived plants awaiting a closure, in the order they were reported.
     survived_mutations: &'ctx mut Vec<SurvivedMutation>,
-    /// The ambiguity register, in first-mention order; a repeated id replaces
-    /// its entry in place.
-    ambiguity_register: &'ctx mut Vec<RegisteredResolution>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
     prefix_recency: &'ctx mut HashMap<CheckpointId, Instant>,
     /// Count of consecutive regular `spawn_workers` calls (across turns) that
@@ -383,7 +370,7 @@ async fn launch_worker<'a>(
     let tool_allowlist = Arc::new(worker_tool_allowlist(&registry).await);
 
     let instructions = spawn.instructions.clone();
-    let max_steps = spawn.max_steps.unwrap_or(ASGARD_WORKER_MAX_STEPS);
+    let max_steps = spawn.max_steps;
     let parent_cwd_display = launch.parent_cwd.display();
     let instruction_message = ChatMessage::user(format!(
         "<supervisor_instructions>\n{instructions}\n</supervisor_instructions>\n\
@@ -505,6 +492,7 @@ async fn launch_worker<'a>(
             "parent": parent.to_string(),
             "model": model,
             "steps": steps,
+            "max_steps": max_steps,
             "rendered_tokens": rendered_tokens,
             "prefix_from": prefix_from,
             "stop": stop.label(),
@@ -543,6 +531,7 @@ async fn launch_worker<'a>(
             final_response,
             stop,
             steps,
+            max_steps,
             diffstat,
             oracles,
             usage: outcome.usage,
@@ -722,7 +711,6 @@ async fn run_asgard_trajectory_loop_inner(
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
     let mut survived_mutations: Vec<SurvivedMutation> = Vec::new();
-    let mut ambiguity_register: Vec<RegisteredResolution> = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
     let mut prefix_recency: HashMap<CheckpointId, Instant> = HashMap::new();
     let mut width1_streak = 0usize;
@@ -781,7 +769,6 @@ async fn run_asgard_trajectory_loop_inner(
                 idle_note,
                 parent_status: &parent_status,
                 survived_mutations: &survived_mutations,
-                ambiguity_register: &ambiguity_register,
             },
         );
         let ephemeral = vec![ChatMessage::user(status)];
@@ -832,7 +819,6 @@ async fn run_asgard_trajectory_loop_inner(
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
             survived_mutations: &mut survived_mutations,
-            ambiguity_register: &mut ambiguity_register,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
             prefix_recency: &mut prefix_recency,
             width1_streak: &mut width1_streak,
@@ -1322,15 +1308,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             Ok(plan) => {
                 let steps = plan.plan.len();
                 state.latest_plan = Some(plan);
-                let register_note = match parse_ambiguity_resolutions(call) {
-                    Ok(resolutions) if resolutions.is_empty() => String::new(),
-                    Ok(resolutions) => {
-                        let recorded = record_ambiguity_resolutions(cx, resolutions);
-                        format!("; {recorded} resolutions registered")
-                    }
-                    Err(error) => format!("; resolutions ignored: {error}"),
-                };
-                Ok(format!("plan updated ({steps} steps){register_note}"))
+                Ok(format!("plan updated ({steps} steps)"))
             }
             Err(error) => Ok(format!("error: {error}")),
         },
@@ -1730,60 +1708,6 @@ fn close_survived_mutation(
     )
 }
 
-/// Folds an `update_plan` register into run state, applying the one
-/// mechanical check: a quote that is not literally in the task text is
-/// downgraded to an assumption (and traced), never rejected.
-fn record_ambiguity_resolutions(
-    cx: &mut SupervisorLoopContext<'_, '_>,
-    resolutions: Vec<crate::asgard::AmbiguityResolution>,
-) -> usize {
-    let recorded = resolutions.len();
-    for resolution in resolutions {
-        let basis = match &resolution.basis {
-            ResolutionBasis::Quote(quote) => {
-                let supported = quote_supported_by(cx.launch.original_task, quote);
-                crate::trace_logging::append_trace_record(serde_json::json!({
-                    "type": "asgard_ambiguity_resolution",
-                    "id": resolution.id,
-                    "basis": "quote",
-                    "quote_verified": supported,
-                    "downgraded": !supported,
-                }));
-                if supported {
-                    ResolutionBasis::Quote(quote.clone())
-                } else {
-                    ResolutionBasis::Assumption
-                }
-            }
-            basis => {
-                crate::trace_logging::append_trace_record(serde_json::json!({
-                    "type": "asgard_ambiguity_resolution",
-                    "id": resolution.id,
-                    "basis": basis.label(),
-                    "quote_verified": serde_json::Value::Null,
-                    "downgraded": false,
-                }));
-                basis.clone()
-            }
-        };
-        let entry = RegisteredResolution {
-            id: resolution.id.clone(),
-            reading: resolution.reading.clone(),
-            basis: basis.label().to_string(),
-            assumption: matches!(basis, ResolutionBasis::Assumption),
-        };
-        match cx
-            .ambiguity_register
-            .iter_mut()
-            .find(|registered| registered.id == entry.id)
-        {
-            Some(registered) => *registered = entry,
-            None => cx.ambiguity_register.push(entry),
-        }
-    }
-    recorded
-}
-
 /// Render a Bifrost tool result (already unwrapped by the MCP client's
 /// `parse_tool_result`: the `structuredContent` value, the first content
 /// block's text, or the raw envelope) into readable text. A JSON string is
@@ -2040,35 +1964,14 @@ async fn execute_spawn_requests<'ctx, 'fut>(
 }
 
 /// Deterministic context handed to every verification worker in a prefinalize
-/// batch: what the run did to its own oracles, and which settled readings rest
-/// on nothing but the supervisor's choice. Both are listings - no obligation,
-/// no per-entry spawn, nothing gated on them.
+/// batch: what the run did to its own oracles. A listing - no obligation, no
+/// per-entry spawn, nothing gated on it.
 fn prefinalize_context_block(cx: &SupervisorLoopContext<'_, '_>) -> Option<String> {
     let modified_oracles = modified_test_file_summary(cx.dag);
-    let assumptions = cx
-        .ambiguity_register
-        .iter()
-        .filter(|entry| entry.assumption)
-        .map(|entry| {
-            format!(
-                "- {}: {}",
-                entry.id,
-                resolution_reading_stub(&entry.reading)
-            )
-        })
-        .collect::<Vec<_>>();
-    if modified_oracles.is_empty() && assumptions.is_empty() {
+    if modified_oracles.is_empty() {
         return None;
     }
     let mut rendered = String::from("<prefinalize_context>\n");
-    if !assumptions.is_empty() {
-        rendered.push_str(
-            "Settled readings resting on assumption - nothing in the task text or the repository \
-             forced them. SUGGESTED attack targets, not assignments:\n",
-        );
-        rendered.push_str(&assumptions.join("\n"));
-        rendered.push('\n');
-    }
     if !modified_oracles.is_empty() {
         rendered.push_str(
             "Test files this run modified after they first appeared (the oracles grading this \
@@ -3119,7 +3022,6 @@ struct AsgardStatusState<'a> {
     idle_note: Option<&'a str>,
     parent_status: &'a [String],
     survived_mutations: &'a [SurvivedMutation],
-    ambiguity_register: &'a [RegisteredResolution],
 }
 
 fn render_asgard_status_block(
@@ -3147,21 +3049,11 @@ fn render_asgard_status_block(
     rendered.push_str("<dag>\n");
     rendered.push_str(&render_dag_overview(dag, &live, prefix_recency));
     rendered.push_str("</dag>\n");
-    if !state.ambiguity_register.is_empty() {
-        rendered.push_str("<ambiguity_register>\n");
-        for entry in state.ambiguity_register {
-            rendered.push_str(&format!(
-                "{} [{}] {}\n",
-                entry.id,
-                if entry.assumption {
-                    "ASSUMPTION".to_string()
-                } else {
-                    entry.basis.clone()
-                },
-                resolution_reading_stub(&entry.reading)
-            ));
-        }
-        rendered.push_str("</ambiguity_register>\n");
+    // Budget calibration across every window so far, saved and under review:
+    // what workers actually spend against what they were given, and how often
+    // a budget - not the work - ended the window.
+    if let Some(line) = render_budget_calibration(dag.saved_windows().chain(pending.values())) {
+        rendered.push_str(&line);
     }
     // Survived plants are run state, not turn state: they stay here every
     // turn until close_mutation says what happened to them.
@@ -3186,17 +3078,6 @@ fn render_asgard_status_block(
         rendered.push('\n');
     }
     rendered
-}
-
-fn resolution_reading_stub(value: &str) -> String {
-    let text = value.replace('\n', " ");
-    if text.chars().count() <= crate::asgard::ASGARD_RESOLUTION_READING_MAX_LENGTH {
-        text
-    } else {
-        text.chars()
-            .take(crate::asgard::ASGARD_RESOLUTION_READING_MAX_LENGTH)
-            .collect()
-    }
 }
 
 fn parent_worktree_status_rollup(root: &Path) -> Result<Vec<String>> {
@@ -3402,6 +3283,7 @@ mod tests {
                 "workers": [{
                     "from": from,
                     "instructions": instructions,
+                    "max_steps": 10,
                 }],
             }),
         )
@@ -3425,6 +3307,7 @@ mod tests {
                 "workers": [{
                     "from": from,
                     "instructions": instructions,
+                    "max_steps": 10,
                     "runs_full_suite": true,
                 }],
             }),
@@ -3441,6 +3324,7 @@ mod tests {
                 "workers": [{
                     "from": from,
                     "instructions": instructions,
+                    "max_steps": 10,
                 }],
             }),
         )
@@ -3718,6 +3602,7 @@ mod tests {
             final_response: format!("final w{worker}"),
             stop: WorkerStopReason::Finished,
             steps: 1,
+            max_steps: 10,
             diffstat: String::new(),
             usage,
             elapsed_millis: 0,
@@ -3778,7 +3663,7 @@ mod tests {
             prefix_from: Some(PrefixFrom::Checkpoint(CheckpointId::Worker(2))),
             instructions: "new work".to_string(),
             model: None,
-            max_steps: None,
+            max_steps: 10,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -3834,7 +3719,7 @@ mod tests {
             prefix_from: Some(PrefixFrom::Fresh),
             instructions: "verify fresh".to_string(),
             model: None,
-            max_steps: None,
+            max_steps: 10,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -3919,7 +3804,7 @@ mod tests {
             prefix_from: None,
             instructions: "continue merge".to_string(),
             model: None,
-            max_steps: None,
+            max_steps: 10,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -4054,9 +3939,9 @@ mod tests {
                     tool_response(vec![spawn_workers_call(
                         "sv-spawn-batch",
                         serde_json::json!([
-                            { "from": "root", "instructions": duplicate },
-                            { "from": "root", "instructions": duplicate },
-                            { "from": "root", "instructions": distinct }
+                            { "from": "root", "max_steps": 10, "instructions": duplicate },
+                            { "from": "root", "max_steps": 10, "instructions": duplicate },
+                            { "from": "root", "max_steps": 10, "instructions": distinct }
                         ]),
                     )]),
                     tool_response(vec![
@@ -4157,9 +4042,9 @@ mod tests {
                     tool_response(vec![spawn_workers_call(
                         "sv-spawn-3",
                         serde_json::json!([
-                            { "from": "root", "instructions": "inspect a" },
-                            { "from": "root", "instructions": "inspect b" },
-                            { "from": "root", "instructions": "inspect c" }
+                            { "from": "root", "max_steps": 10, "instructions": "inspect a" },
+                            { "from": "root", "max_steps": 10, "instructions": "inspect b" },
+                            { "from": "root", "max_steps": 10, "instructions": "inspect c" }
                         ]),
                     )]),
                     tool_response(vec![
@@ -4233,8 +4118,8 @@ mod tests {
                     tool_response(vec![spawn_workers_call(
                         "sv-spawn-2",
                         serde_json::json!([
-                            { "from": "root", "instructions": "inspect a" },
-                            { "from": "root", "instructions": "inspect b" }
+                            { "from": "root", "max_steps": 10, "instructions": "inspect a" },
+                            { "from": "root", "max_steps": 10, "instructions": "inspect b" }
                         ]),
                     )]),
                     tool_response(vec![
@@ -4304,8 +4189,8 @@ mod tests {
                     tool_response(vec![spawn_workers_call(
                         "sv-spawn-2",
                         serde_json::json!([
-                            { "from": "root", "instructions": "inspect a" },
-                            { "from": "root", "instructions": "inspect b" }
+                            { "from": "root", "max_steps": 10, "instructions": "inspect a" },
+                            { "from": "root", "max_steps": 10, "instructions": "inspect b" }
                         ]),
                     )]),
                     text_response("leave both unresolved"),
@@ -5448,8 +5333,8 @@ mod tests {
                     tool_response(vec![prefinalize_workers_call(
                         "sv-prefinalize-batch",
                         serde_json::json!([
-                            { "from": "root", "instructions": "verify", "runs_full_suite": true },
-                            { "from": "root", "instructions": "verify", "runs_full_suite": true }
+                            { "from": "root", "max_steps": 10, "instructions": "verify", "runs_full_suite": true },
+                            { "from": "root", "max_steps": 10, "instructions": "verify", "runs_full_suite": true }
                         ]),
                     )]),
                     text_response("prefinalize launched"),
@@ -5517,7 +5402,7 @@ mod tests {
                         serde_json::json!({
                             "workers": [{
                                 "from": "root",
-                                "instructions": "run the full unfiltered suite",
+                                "max_steps": 10, "instructions": "run the full unfiltered suite",
                                 "runs_full_suite": true,
                                 "attacks": ["Belief: nothing else broke -> full unfiltered suite"],
                             }],
@@ -5622,7 +5507,7 @@ mod tests {
                         serde_json::json!({
                             "workers": [{
                                 "from": "root",
-                                "instructions": "verify the docs delivery",
+                                "max_steps": 10, "instructions": "verify the docs delivery",
                             }],
                             "full_suite_skipped": "docs-only delivery; no test suite applies",
                         }),
@@ -5717,7 +5602,7 @@ mod tests {
                             serde_json::json!([{
                                 "from": "w2",
                                 "prefix_from": "w2",
-                                "instructions": "Check whether README.md exists and report",
+                                "max_steps": 10, "instructions": "Check whether README.md exists and report",
                             }]),
                         ),
                     ]),
@@ -6178,7 +6063,7 @@ mod tests {
                             serde_json::json!({
                                 "workers": [{
                                     "from": "w3",
-                                    "instructions": "continue the same fix a fourth time",
+                                    "max_steps": 10, "instructions": "continue the same fix a fourth time",
                                 }]
                             }),
                         ),
@@ -6188,7 +6073,7 @@ mod tests {
                             serde_json::json!({
                                 "workers": [{
                                     "from": "w3",
-                                    "instructions": "continue the same fix, justified",
+                                    "max_steps": 10, "instructions": "continue the same fix, justified",
                                     "single_because": "Only one plausible fix location remains after ruling out the other hypothesis.",
                                 }]
                             }),
@@ -6198,8 +6083,8 @@ mod tests {
                     tool_response(vec![spawn_workers_call(
                         "sv-w5w6",
                         serde_json::json!([
-                            { "from": "w4", "instructions": "branch hypothesis A" },
-                            { "from": "w4", "instructions": "branch hypothesis B" },
+                            { "from": "w4", "max_steps": 10, "instructions": "branch hypothesis A" },
+                            { "from": "w4", "max_steps": 10, "instructions": "branch hypothesis B" },
                         ]),
                     )]),
                     // Turn 6: discard w6, and spawn width-1 from w5 with no
@@ -7029,6 +6914,7 @@ mod tests {
                 final_response: String::new(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -7053,6 +6939,7 @@ mod tests {
                 final_response: String::new(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -7070,7 +6957,6 @@ mod tests {
                 idle_note: Some("No worker is awaiting review. Spawn workers or finalize."),
                 parent_status: &[],
                 survived_mutations: &[],
-                ambiguity_register: &[],
             },
         );
 
@@ -7111,23 +6997,11 @@ mod tests {
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
 
-        let plan_with_register = named_tool_call(
+        let plan = named_tool_call(
             "sv-plan",
             "update_plan",
             serde_json::json!({
                 "plan": [{ "step": "implement parse()", "status": "in_progress" }],
-                "resolutions": [
-                    {
-                        "id": "A1",
-                        "reading": "empty input yields an empty list",
-                        "basis": { "quote": "return an empty list for empty input" },
-                    },
-                    {
-                        "id": "A2",
-                        "reading": "trailing separators are ignored",
-                        "basis": { "quote": "ignore trailing separators" },
-                    },
-                ],
             }),
         );
         let backend = Arc::new(ScriptedAsgardBackend::new(vec![
@@ -7135,7 +7009,7 @@ mod tests {
                 "sv-model",
                 vec![
                     tool_response(vec![
-                        plan_with_register,
+                        plan,
                         spawn_call("sv-spawn-w1", "root", "implement parse()"),
                     ]),
                     tool_response(vec![
@@ -7226,14 +7100,16 @@ mod tests {
             !finalize_turn.contains("SURVIVED MUTANT: src/parse.rs argument order"),
             "a closed mutant must leave the status block:\n{finalize_turn}"
         );
-        // A quote that is literally in the task text keeps its basis; one that
-        // is not is downgraded, and both render in the register.
-        assert!(supervisor_text.contains("A1 [quote] empty input yields an empty list"));
-        assert!(supervisor_text.contains("A2 [ASSUMPTION] trailing separators are ignored"));
+        // The ambiguity register is gone: no status block ever renders one.
+        assert!(!supervisor_text.contains("ambiguity_register"));
+        // Budget calibration replaces it as the standing status line.
+        assert!(
+            supervisor_text.contains("budgets: median "),
+            "the status block should carry the budget calibration line:\n{supervisor_text}"
+        );
 
-        // The verification batch is told which settled readings rest on
-        // assumption - a listing, not an assignment - and every worker is
-        // briefed to keep new test files self-contained.
+        // Every worker is briefed to keep new test files self-contained, and
+        // the verification batch gets the run's oracle context.
         let worker_texts = backend
             .requests
             .lock()
@@ -7246,13 +7122,13 @@ mod tests {
             .iter()
             .find(|text| text.contains("plant and verify"))
             .expect("prefinalize worker request");
+        // Nothing in the run modified a pre-existing oracle, and the
+        // assumption listing is gone, so the block is omitted entirely.
         assert!(
-            verification_text.contains("<prefinalize_context>"),
-            "prefinalize workers should get the run's oracle/assumption context:\n{verification_text}"
+            !verification_text.contains("<prefinalize_context>"),
+            "prefinalize context should be omitted when there is nothing to list:\n{verification_text}"
         );
-        assert!(verification_text.contains("SUGGESTED attack targets"));
-        assert!(verification_text.contains("- A2: trailing separators are ignored"));
-        assert!(!verification_text.contains("- A1:"));
+        assert!(!verification_text.contains("SUGGESTED attack targets"));
         assert!(
             worker_texts
                 .iter()
@@ -7283,15 +7159,21 @@ mod tests {
                 && record["target"] == "src/parse.rs argument order"
                 && record["closure"] == "oracle_validated"
         }));
+        // The register's trace record is gone with it.
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["type"] == "asgard_ambiguity_resolution")
+        );
+        // Every worker window records the budget it was given alongside what
+        // it spent.
         assert!(records.iter().any(|record| {
-            record["type"] == "asgard_ambiguity_resolution"
-                && record["id"] == "A2"
-                && record["downgraded"] == serde_json::json!(true)
+            record["type"] == "asgard_worker_window" && record["max_steps"] == 10
         }));
     }
 
     #[test]
-    fn status_block_keeps_survived_mutants_and_marks_assumption_resolutions() {
+    fn status_block_keeps_survived_mutants_and_has_no_ambiguity_register() {
         let dag = TrajectoryDag::new(Vec::new(), "base".to_string());
         let rendered = render_asgard_status_block(
             &dag,
@@ -7306,26 +7188,63 @@ mod tests {
                     target: "src/merge.rs boundary".to_string(),
                     worker: 7,
                 }],
-                ambiguity_register: &[
-                    RegisteredResolution {
-                        id: "A1".to_string(),
-                        reading: "empty input yields []".to_string(),
-                        basis: "quote".to_string(),
-                        assumption: false,
-                    },
-                    RegisteredResolution {
-                        id: "A2".to_string(),
-                        reading: "trailing separators are ignored".to_string(),
-                        basis: "assumption".to_string(),
-                        assumption: true,
-                    },
-                ],
             },
         );
 
         assert!(rendered.contains("SURVIVED MUTANT: src/merge.rs boundary (planted by w7)"));
-        assert!(rendered.contains("A1 [quote] empty input yields []"));
-        assert!(rendered.contains("A2 [ASSUMPTION] trailing separators are ignored"));
+        assert!(!rendered.contains("ambiguity_register"));
+        // No window has run, so there is nothing to calibrate against yet.
+        assert!(!rendered.contains("budgets:"));
+    }
+
+    #[test]
+    fn status_block_reports_budget_calibration_across_saved_and_pending_windows() {
+        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        // w1 finished with room to spare; w2 obeyed the final-step notice on
+        // its last allowed turn; w3 was still calling tools when the budget
+        // ran out.
+        let mut saved = |worker: usize, steps: usize, max_steps: usize, stop: WorkerStopReason| {
+            let mut window = test_window(worker, CheckpointId::Root, "work", TokenUsage::default());
+            window.steps = steps;
+            window.max_steps = max_steps;
+            window.stop = stop;
+            dag.insert(TrajectoryNode {
+                window,
+                commit: format!("c{worker}"),
+                merged_from: Vec::new(),
+            })
+            .expect("insert");
+        };
+        saved(1, 2, 10, WorkerStopReason::Finished);
+        saved(2, 19, 20, WorkerStopReason::Finished);
+        saved(3, 8, 8, WorkerStopReason::StepLimit);
+
+        let mut pending = BTreeMap::new();
+        let mut under_review =
+            test_window(4, CheckpointId::Root, "under review", TokenUsage::default());
+        under_review.steps = 6;
+        under_review.max_steps = 30;
+        pending.insert(4, under_review);
+
+        let rendered = render_asgard_status_block(
+            &dag,
+            &pending,
+            &HashMap::new(),
+            8,
+            3,
+            &AsgardStatusState {
+                idle_note: None,
+                parent_status: &[],
+                survived_mutations: &[],
+            },
+        );
+
+        // used: [2, 19, 8, 6] -> sorted [2, 6, 8, 19], lower median 6.
+        // budgets: [10, 20, 8, 30] -> sorted [8, 10, 20, 30], lower median 10.
+        assert!(
+            rendered.contains("budgets: median 6/10 steps used across 4 windows; 2 capped\n"),
+            "calibration line missing or wrong:\n{rendered}"
+        );
     }
 
     #[test]

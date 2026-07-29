@@ -109,6 +109,35 @@ impl WorkerStopReason {
     }
 }
 
+/// Whether a window ended because its budget ran out rather than because the
+/// worker was done.
+///
+/// The stop reason alone cannot answer this. The harness injects
+/// `TRAJECTORY_WINDOW_FINAL_NOTICE` on the last allowed turn and tells the
+/// worker not to call tools, so an obedient worker spends that turn writing
+/// its report and exits through the ordinary no-tool-calls path as
+/// `Finished`. The step count is what distinguishes it: budget exhaustion
+/// shows up as `steps == max_steps - 1`, because the final step is reserved
+/// for the forced report. Measured over 1,956 real worker windows: `stop` was
+/// `finished` 1,951 times and `failed` 5 times, `step_limit` never, and 77% of
+/// windows sat at exactly that `max_steps - 1` ceiling.
+///
+/// `StepLimit` is still counted - it is what a worker that ignores the notice
+/// and keeps calling tools produces (`LoopStop::MaxTurns`) - but it is not
+/// what the corpus actually contains.
+///
+/// `Failed` and `Cancelled` windows ended for their own reasons and are never
+/// reported as capped.
+pub(crate) fn window_capped(window: &TrajectoryWindow) -> bool {
+    match window.stop {
+        WorkerStopReason::StepLimit => true,
+        WorkerStopReason::Finished => {
+            window.max_steps > 0 && window.steps.saturating_add(1) >= window.max_steps
+        }
+        WorkerStopReason::Failed(_) | WorkerStopReason::Cancelled => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TrajectoryWindow {
     pub(crate) worker: usize,
@@ -122,6 +151,9 @@ pub(crate) struct TrajectoryWindow {
     pub(crate) final_response: String,
     pub(crate) stop: WorkerStopReason,
     pub(crate) steps: usize,
+    /// The step budget the supervisor gave this worker. Always set: the
+    /// supervisor must budget every worker it spawns.
+    pub(crate) max_steps: usize,
     pub(crate) diffstat: String,
     /// What this window did to test files (see [`WindowOracles`]).
     pub(crate) oracles: WindowOracles,
@@ -690,11 +722,21 @@ pub(crate) fn render_fragment(
         rendered.push_str(&format!(" parent_commit=\"{}\"", short_sha(parent_commit)));
     }
     rendered.push_str(&format!(
-        " model=\"{}\" stop=\"{}\" steps=\"{}\">\n",
+        " model=\"{}\" stop=\"{}\" steps=\"{}\" budget=\"{}\">\n",
         escape_attribute(&window.model),
         window.stop.label(),
-        window.steps
+        window.steps,
+        window.max_steps
     ));
+    // Loud on its own line, not an attribute: a window that ran out of budget
+    // is a handoff, and reading its forced report as a finished result is the
+    // single most expensive mistake available here.
+    if window_capped(window) {
+        rendered.push_str(&format!(
+            "CAPPED: this window used its whole step budget ({}/{}; the last step is reserved for the report). The report below was forced by the budget, not volunteered - read it as a handoff and continue this trajectory if the work is unfinished.\n",
+            window.steps, window.max_steps
+        ));
+    }
     rendered.push_str(&format!(
         "<instructions>{}</instructions>\n",
         escape_content(&window.instructions)
@@ -743,6 +785,43 @@ pub(crate) fn render_fragment(
     );
     rendered.push_str("</worker_trajectory>\n");
     rendered
+}
+
+/// One calibration line over every window the run has produced so far: what a
+/// typical worker actually spent against what it was given, and how many of
+/// them ended on the budget rather than on the work. `None` when no window has
+/// finished yet.
+///
+/// The median is the lower median on an even count - a whole observed value,
+/// never an interpolated half-step.
+pub(crate) fn render_budget_calibration<'a>(
+    windows: impl Iterator<Item = &'a TrajectoryWindow>,
+) -> Option<String> {
+    let mut used = Vec::new();
+    let mut budgets = Vec::new();
+    let mut capped = 0usize;
+    for window in windows {
+        used.push(window.steps);
+        budgets.push(window.max_steps);
+        if window_capped(window) {
+            capped += 1;
+        }
+    }
+    let count = used.len();
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "budgets: median {}/{} steps used across {count} window{}; {capped} capped\n",
+        lower_median(&mut used),
+        lower_median(&mut budgets),
+        if count == 1 { "" } else { "s" },
+    ))
+}
+
+fn lower_median(values: &mut [usize]) -> usize {
+    values.sort_unstable();
+    values[(values.len() - 1) / 2]
 }
 
 pub(crate) fn window_context_tokens(window: &TrajectoryWindow) -> u64 {
@@ -1005,6 +1084,7 @@ mod tests {
             final_response: format!("final {label}"),
             stop: WorkerStopReason::Finished,
             steps: 2,
+            max_steps: 10,
             diffstat: String::new(),
             oracles: WindowOracles::default(),
             usage: TokenUsage::default(),
@@ -1204,7 +1284,7 @@ mod tests {
         trajectory.diffstat = " src/lib.rs | 2 +".to_string();
         let rendered = render_fragment(&trajectory, None, None);
         assert!(rendered.contains(
-            r#"<worker_trajectory id="w3" continues_from="root" model="model-a" stop="finished" steps="2">"#
+            r#"<worker_trajectory id="w3" continues_from="root" model="model-a" stop="finished" steps="2" budget="10">"#
         ));
         assert!(rendered.contains("<diffstat> src/lib.rs | 2 +</diffstat>"));
         assert!(rendered.contains(&trajectory.final_response));
@@ -1217,6 +1297,70 @@ mod tests {
         let failed = render_fragment(&trajectory, None, None);
         assert!(failed.contains(r#"stop="failed""#));
         assert!(failed.contains("<failure>boom &lt;bad&gt;</failure>"));
+    }
+
+    #[test]
+    fn render_fragment_marks_only_budget_exhausted_windows_as_capped() {
+        // Finished with a turn to spare: the worker chose to stop.
+        let mut voluntary = window(3, CheckpointId::Root, "voluntary");
+        voluntary.steps = 2;
+        voluntary.max_steps = 10;
+        let rendered = render_fragment(&voluntary, None, None);
+        assert!(rendered.contains(r#"steps="2" budget="10""#));
+        assert!(!rendered.contains("CAPPED"));
+
+        // Still calling tools on the last allowed turn: the loop fell out of
+        // its budget.
+        let mut hard_limit = window(4, CheckpointId::Root, "hard limit");
+        hard_limit.steps = 10;
+        hard_limit.max_steps = 10;
+        hard_limit.stop = WorkerStopReason::StepLimit;
+        let rendered = render_fragment(&hard_limit, None, None);
+        assert!(rendered.contains("CAPPED: this window used its whole step budget (10/10;"));
+
+        // Obeyed the final-step notice and reported instead of calling tools:
+        // the stop reason says "finished", but the budget is what ended it.
+        let mut forced_report = window(5, CheckpointId::Root, "forced report");
+        forced_report.steps = 9;
+        forced_report.max_steps = 10;
+        forced_report.stop = WorkerStopReason::Finished;
+        let rendered = render_fragment(&forced_report, None, None);
+        assert!(rendered.contains("CAPPED: this window used its whole step budget (9/10;"));
+
+        // A window that failed or was cancelled ended for its own reason.
+        let mut failed = window(6, CheckpointId::Root, "failed");
+        failed.steps = 9;
+        failed.max_steps = 10;
+        failed.stop = WorkerStopReason::Failed("boom".to_string());
+        assert!(!render_fragment(&failed, None, None).contains("CAPPED"));
+    }
+
+    #[test]
+    fn budget_calibration_reports_the_lower_median_and_the_capped_count() {
+        assert_eq!(render_budget_calibration(std::iter::empty()), None);
+
+        let mut windows = Vec::new();
+        let mut add = |worker: usize, steps: usize, max_steps: usize, stop: WorkerStopReason| {
+            let mut entry = window(worker, CheckpointId::Root, "calibration");
+            entry.steps = steps;
+            entry.max_steps = max_steps;
+            entry.stop = stop;
+            windows.push(entry);
+        };
+        add(1, 3, 12, WorkerStopReason::Finished);
+        add(2, 40, 40, WorkerStopReason::StepLimit);
+        add(3, 4, 20, WorkerStopReason::Finished);
+
+        assert_eq!(
+            render_budget_calibration(windows.iter()).as_deref(),
+            Some("budgets: median 4/20 steps used across 3 windows; 1 capped\n")
+        );
+
+        // One window reads in the singular.
+        assert_eq!(
+            render_budget_calibration(windows[..1].iter()).as_deref(),
+            Some("budgets: median 3/12 steps used across 1 window; 0 capped\n")
+        );
     }
 
     #[test]

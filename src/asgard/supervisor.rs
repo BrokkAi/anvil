@@ -8,8 +8,15 @@ use crate::llm_client::{
 use crate::mcp::{McpClient, McpToolDef};
 
 pub(crate) const ASGARD_BATCH_CAP: usize = 8;
-pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
-pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 150;
+/// Hard ceiling on a supervisor-assigned worker step budget.
+///
+/// Derived, not chosen: the measured p75 steps-to-solve of a vanilla agent on
+/// this corpus is 147 steps, and a worker whose window is half that has to hand
+/// its state back rather than grind. 147 / 2 = 73, rounded to 75. A worker that
+/// needs more serial work gets it by continuation - the supervisor spawns from
+/// the capped window's own checkpoint (`prefix_from` that window), which costs
+/// one spawn and keeps the supervisor in the loop between windows.
+pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 75;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 pub(crate) const ASGARD_SINGLE_BECAUSE_MAX_LENGTH: usize = 300;
@@ -30,9 +37,6 @@ pub(crate) const FINALIZE_TOOL: &str = "finalize";
 pub(crate) const VIEW_TOOL_CALL_TOOL: &str = "view_tool_call";
 pub(crate) const UPDATE_PLAN_TOOL: &str = "update_plan";
 pub(crate) const CLOSE_MUTATION_TOOL: &str = "close_mutation";
-
-/// Cap on a registered ambiguity reading rendered in the status block.
-pub(crate) const ASGARD_RESOLUTION_READING_MAX_LENGTH: usize = 300;
 
 /// How a prefinalize batch's planted mutation ended: the suite caught it, or
 /// it survived and the delivery has an untested path.
@@ -86,43 +90,15 @@ pub(crate) struct MutationClosure {
     pub(crate) reason: String,
 }
 
-/// What a settled ambiguity resolution rests on. The harness verifies exactly
-/// one of these mechanically (see [`quote_supported_by`]); the other two are
-/// recorded as stated.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResolutionBasis {
-    Quote(String),
-    Precedent(String),
-    Assumption,
-}
-
-impl ResolutionBasis {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Quote(_) => "quote",
-            Self::Precedent(_) => "precedent",
-            Self::Assumption => "assumption",
-        }
-    }
-}
-
-/// One numbered ambiguity resolution from `update_plan`'s optional register.
-/// The free-form plan text is untouched by this: only entries in the
-/// `resolutions` array carry a basis.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AmbiguityResolution {
-    pub(crate) id: String,
-    pub(crate) reading: String,
-    pub(crate) basis: ResolutionBasis,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnRequest {
     pub(crate) from: CheckpointId,
     pub(crate) prefix_from: Option<PrefixFrom>,
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
-    pub(crate) max_steps: Option<usize>,
+    /// Required on every supervisor-issued worker spec: there is no harness
+    /// default. Capped at [`ASGARD_WORKER_MAX_STEPS_CEILING`].
+    pub(crate) max_steps: usize,
     /// When continuing width-1 after repeated width-1 turns: one sentence
     /// naming why exactly one continuation is live. See
     /// `ASGARD_SINGLE_BECAUSE_MAX_LENGTH` for the schema-enforced cap.
@@ -187,7 +163,7 @@ pub(crate) fn supervisor_supplement() -> String {
         r#"# Asgard supervision
 
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
-- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
+- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs for exactly the max_steps you set it (one step = one batch of tool calls) - the budget is required on every worker and capped at {worker_ceiling}; long serial work proceeds by continuation, not by one enormous window. A worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
 Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. When you resolve a prefinalize sibling (save_checkpoint or discard) you must pass mutations: one {{target, outcome}} entry per plant that worker made, or an empty array if it made none. A survived plant names a path in the delivery that no oracle checks; it stays in your status block as SURVIVED MUTANT until close_mutation records what happened to it, and finalize reports any still open. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
@@ -195,20 +171,28 @@ Example - branching review: worker w4 reports "parser change in; 3 edge tests fa
 - code intelligence - search_symbols, get_summaries, get_symbol_sources, usage_graph, scan_usages_by_location, get_definitions_by_location, semantic search, and more: read-only Bifrost tools indexing the repository at its base state. Use them to UNDERSTAND before you direct: find the symbols, files, and call sites your task touches so your worker mandates name exact functions and locations instead of describing them. activate_workspace switches Bifrost to another path (for example your git scratch worktree after you check out a checkpoint's hash) to analyze a specific candidate's code.
 - discard: permanently discard a reviewed trajectory. Pass `worker` to name which one when multiple siblings are under review.
 - view_tool_call: expand compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only once a trajectory has been presented for review.
-- update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself. Its optional resolutions array is your ambiguity register: one entry per numbered ambiguity (A1, A2, ...) with the reading you settled on and its basis - a literal quote from the task text, a repository precedent, or an assumption. A quote is checked mechanically against the task text and silently becomes an assumption if it is not literally there, so quote what the task says, not what you concluded. Assumption-basis entries are listed to your prefinalize workers as suggested attack targets.
+- update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
 - close_mutation: close one survived mutant from your status block, naming what happened to it: oracle_validated, logic_removed, or accepted_risk, with a reason.
 - finalize: ends the run. The named checkpoint's repository state is delivered as the result, and that worker's final message (or the response you provide) becomes the final answer.
 
 Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions by default, and know nothing about sibling workers or your plans - put everything they need into the instructions. You may set prefix_from to an ancestor checkpoint on the worker's first-parent lineage to inherit only windows from that checkpoint through `from`, inclusive; set prefix_from to "none" for a fresh worker with no inherited windows. Elided history is replaced by deterministic git diff orientation, and re-using a recently-used prefix is cheaper because providers can reuse prompt-cache prefixes. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
 
-First duty: pin the specification before anything is built. Read the task text for the behavioral contract a correct implementation must satisfy - every named symbol with its exact spelling, every enumerated set with all its members, every exact error message, every input domain, every ordering and formatting rule - and write down, numbered (A1, A2, ...), every detail that admits more than one reading and every boundary its quantifiers create ("empty", "each", "all", "zero", "trailing", "at least"). Resolve each one deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Before you spawn implementation workers, use the code-intelligence tools to map the code the task touches - a mandate that cites the exact functions, files, and call sites to change produces sharper work than a prose description. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...), state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing.
+Briefs, not restatements. A brief carries scope, assignment logistics, and citations of the evidence you have gathered - the files, symbols, and call sites the work touches. It never restates what the task requires: every worker holds the full task text in context and implements from it directly, and your paraphrase can only lose or distort it. Where you judge a passage risky or ambiguous, name the passage and require the worker to state the reading it chose in its report - do not hand it the reading. Before you spawn implementation workers, use the code-intelligence tools to map the code the task touches; a mandate that cites the exact functions, files, and call sites to change produces sharper work than a prose description.
 
-Batch composition: default to parallel batches, not a lone worker. Whenever the work has two or more independent parts, spawn one worker per part in the same batch and merge the results with the git tool; a single-worker turn is justified only when the next step genuinely depends on the last result. Enumerate the separable groups of files an implementation would touch before you spawn: when the work splits into such groups, spawn one worker per group in the same batch, land any file two groups would both edit in a precursor first, and aim the redundant pair (below) at the riskiest contract area - the densest edge surface or the requirement with the least repository evidence. Plan the split so the same files are not edited twice and merges stay clean. If independent parts share a file, land the shared file first in a quick precursor worker, then split from that checkpoint. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Deliberate redundancy is different: for the riskiest core of the contract - the densest edge surface, the most contested ambiguities - spawn two workers in the same batch to implement that same contract independently from different vantages you name (one from the spec's data model outward, one from the test cases inward), sharing your settled ambiguity resolutions with both. Their tests and behavior will diverge precisely on the edges nobody knew were ambiguous and on slips a single worker's self-tests cannot see. When siblings have implemented the same contract, harvest that divergence before resolving the batch: spawn a differential worker from one sibling's checkpoint that checks out the other sibling's test files directly from its commit (git checkout <sha> -- <paths>) and runs them against the implementation it is standing in. Every cross-sibling failure is an ambiguity two readings resolved differently - adjudicate it against the task text, never by majority or by trusting whichever implementation looks cleaner. Fact-finding stays cheap throughout: short workers that answer questions ("find how X is implemented; report file and line"), variants branched from a good checkpoint, losses cut early, instructions explicit and testable.
+Spec tests first: have two workers in the first batch write spec tests independently, each from the task text alone and neither from any reading you settled, before implementation exists. Where their two suites disagree about the same behavior, that disagreement is a divergence to adjudicate - found before any implementation exists to defend it. Implementation workers run the union of both suites, and your finalize evidence should show it passing.
+
+Adjudication is where your authority lives. When concrete artifacts disagree - a worker's report or diff against the brief it was given, one sibling against another on the same surface, code or tests against the task text or against repository precedent - resolve the divergence explicitly and cite the evidence you resolved it on: the passage of task text, the repository file, the command output. Do this before the affected work is saved, spawned from, or finalized. Your ruling binds every worker that carries the work forward.
+
+Targeted dual reading: on a surface you judge risky - the densest edge surface, the requirement with the least repository evidence, calling conventions and argument order - spawn a second worker for that component alone, from the raw task text, at a deliberately different vantage you name. The pair's divergence is what adjudication consumes. That is how a risky passage gets settled, not by settling it in advance.
+
+Budget modestly: a capped worker is normal, not a failure. Continuing one costs a single spawn from its own window (prefix_from that window), and the review you get in between is worth more than the steps it costs.
+
+Batch composition: default to parallel batches, not a lone worker. Whenever the work has two or more independent parts, spawn one worker per part in the same batch and merge the results with the git tool; a single-worker turn is justified only when the next step genuinely depends on the last result. Enumerate the separable groups of files an implementation would touch before you spawn: when the work splits into such groups, spawn one worker per group in the same batch, land any file two groups would both edit in a precursor first, and aim the redundant pair (below) at the riskiest contract area - the densest edge surface or the requirement with the least repository evidence. Plan the split so the same files are not edited twice and merges stay clean. If independent parts share a file, land the shared file first in a quick precursor worker, then split from that checkpoint. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Deliberate redundancy is different: for the riskiest core of the contract - the densest edge surface, the most contested ambiguities - spawn two workers in the same batch to implement that same contract independently from different vantages you name (one from the spec's data model outward, one from the test cases inward), each working from the task text itself. Their tests and behavior will diverge precisely on the edges nobody knew were ambiguous and on slips a single worker's self-tests cannot see. When siblings have implemented the same contract, harvest that divergence before resolving the batch: spawn a differential worker from one sibling's checkpoint that checks out the other sibling's test files directly from its commit (git checkout <sha> -- <paths>) and runs them against the implementation it is standing in. Every cross-sibling failure is an ambiguity two readings resolved differently - adjudicate it against the task text, never by majority or by trusting whichever implementation looks cleaner. Fact-finding stays cheap throughout: short workers that answer questions ("find how X is implemented; report file and line"), variants branched from a good checkpoint, losses cut early, instructions explicit and testable.
 
 Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written at the start. If that evidence does not exist yet, your prefinalize batch must produce it. A plant is only evidence after re-checking the expected behavior against the spec text or an existing reference implementation - a self-authored test that encodes your own misreading will catch the correct code as the bug. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
         workers = ASGARD_BATCH_CAP,
-        worker_steps = ASGARD_WORKER_MAX_STEPS
+        worker_ceiling = ASGARD_WORKER_MAX_STEPS_CEILING
     )
 }
 
@@ -225,7 +209,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: SPAWN_WORKERS_TOOL.to_string(),
-                description: "Fork a barrier batch of new workers from \"root\" or a saved checkpoint id like \"w3\" (or a pending reviewed worker's id, which saves it); each runs up to 10 steps in its own checkout, then the whole batch reports back together. A successful spawn ends your turn immediately.".to_string(),
+                description: format!("Fork a barrier batch of new workers from \"root\" or a saved checkpoint id like \"w3\" (or a pending reviewed worker's id, which saves it); each runs for the max_steps you give it in its own checkout, then the whole batch reports back together. Budgets are capped at {ASGARD_WORKER_MAX_STEPS_CEILING}; long serial work proceeds by continuation. A successful spawn ends your turn immediately."),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -238,7 +222,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["from", "instructions"],
+                                "required": ["from", "instructions", "max_steps"],
                                 "properties": {
                                     "from": { "type": "string" },
                                     "prefix_from": {
@@ -250,6 +234,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                                         "type": "string",
                                         "enum": allowed_models,
                                     },
+                                    "max_steps": max_steps_property(),
                                     "single_because": {
                                         "type": "string",
                                         "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
@@ -391,8 +376,20 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                 }),
             },
         },
-        supervisor_update_plan_tool_definition(),
+        crate::tools::update_plan_tool_definition(),
     ]
+}
+
+/// The required per-worker step budget, shared by spawn_workers and
+/// prefinalize. There is no harness default: an unbudgeted worker is a
+/// budgeting decision nobody made.
+fn max_steps_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
+        "description": format!("Required. Step budget for this worker (one step = one batch of tool calls), from 1 to {ASGARD_WORKER_MAX_STEPS_CEILING}. Budgets are capped at {ASGARD_WORKER_MAX_STEPS_CEILING}; long serial work proceeds by continuation - spawn again from the capped window."),
+    })
 }
 
 /// The `mutations` array shared by the two resolution tools: what each plant
@@ -419,60 +416,6 @@ fn mutations_property() -> serde_json::Value {
             },
         },
     })
-}
-
-/// The supervisor's `update_plan`: the shared agent tool plus an optional
-/// structured ambiguity register. The register is additive - the plan text
-/// itself keeps exactly the shape every other agent uses, and other agents
-/// never see the extra property.
-fn supervisor_update_plan_tool_definition() -> ToolDefinition {
-    let mut definition = crate::tools::update_plan_tool_definition();
-    if let Some(properties) = definition
-        .function
-        .parameters
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        properties.insert(
-            "resolutions".to_string(),
-            serde_json::json!({
-                "type": "array",
-                "description": "Your numbered ambiguity register (A1, A2, ...). Optional, additive, and separate from the plan text: one entry per detail of the task that admitted more than one reading, with the reading you settled on and what it rests on.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["id", "reading", "basis"],
-                    "properties": {
-                        "id": { "type": "string", "description": "the number you gave it, e.g. \"A3\"" },
-                        "reading": {
-                            "type": "string",
-                            "maxLength": ASGARD_RESOLUTION_READING_MAX_LENGTH,
-                            "description": "the settled reading, stated as behavior",
-                        },
-                        "basis": {
-                            "description": "What the reading rests on. quote: the exact task text that settles it - checked mechanically against the task, and downgraded to assumption if it is not literally there. precedent: an analogous implementation already in the repository. assumption: nothing in the task or the repository settles it and you chose.",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["quote"],
-                                    "properties": { "quote": { "type": "string" } },
-                                },
-                                {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["precedent"],
-                                    "properties": { "precedent": { "type": "string" } },
-                                },
-                                { "type": "string", "enum": ["assumption"] },
-                            ],
-                        },
-                    },
-                },
-            }),
-        );
-    }
-    definition
 }
 
 /// Maps a live Bifrost (`core` toolset) MCP client's advertised tools into
@@ -514,7 +457,7 @@ fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["from", "instructions"],
+                    "required": ["from", "instructions", "max_steps"],
                     "properties": {
                         "from": { "type": "string" },
                         "prefix_from": {
@@ -526,12 +469,7 @@ fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
                             "type": "string",
                             "enum": allowed_models,
                         },
-                        "max_steps": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
-                            "description": "Step budget for this worker (default 10). Give a worker pursuing a complete solution a large budget; keep quick probes small.",
-                        },
+                        "max_steps": max_steps_property(),
                         "single_because": {
                             "type": "string",
                             "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
@@ -716,8 +654,14 @@ fn parse_spawn_worker(
     {
         return Err(format!("workers[{index}].model {model:?} is not allowed"));
     }
+    // Required, with no harness default: an unbudgeted worker means nobody
+    // decided how long the window should be.
     let max_steps = match worker.get("max_steps") {
-        None | Some(serde_json::Value::Null) => None,
+        None | Some(serde_json::Value::Null) => {
+            return Err(format!(
+                "workers[{index}].max_steps is required: give this worker a step budget between 1 and {ASGARD_WORKER_MAX_STEPS_CEILING}"
+            ));
+        }
         Some(value) => {
             let steps = value
                 .as_u64()
@@ -727,7 +671,7 @@ fn parse_spawn_worker(
                     "workers[{index}].max_steps must be between 1 and {ASGARD_WORKER_MAX_STEPS_CEILING}"
                 ));
             }
-            Some(steps as usize)
+            steps as usize
         }
     };
     let single_because = match worker.get("single_because") {
@@ -904,83 +848,6 @@ pub(crate) fn parse_update_plan(
     let arguments = normalize_arguments(&call.function.arguments)?;
     serde_json::from_value::<crate::plan::UpdatePlanArgs>(arguments)
         .map_err(|error| format!("Invalid update_plan arguments: {error}"))
-}
-
-/// Parses `update_plan`'s optional ambiguity register. A call without a
-/// `resolutions` array yields an empty register - the plan itself is
-/// unaffected either way.
-pub(crate) fn parse_ambiguity_resolutions(
-    call: &ToolCall,
-) -> std::result::Result<Vec<AmbiguityResolution>, String> {
-    let arguments = normalize_arguments(&call.function.arguments)?;
-    let entries = match arguments.get("resolutions") {
-        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
-        Some(value) => value
-            .as_array()
-            .ok_or_else(|| "resolutions must be an array".to_string())?,
-    };
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let id = entry
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("resolutions[{index}].id must be a string"))?
-                .trim()
-                .to_string();
-            if id.is_empty() {
-                return Err(format!("resolutions[{index}].id must not be empty"));
-            }
-            let reading = entry
-                .get("reading")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("resolutions[{index}].reading must be a string"))?
-                .trim()
-                .to_string();
-            Ok(AmbiguityResolution {
-                id,
-                reading,
-                basis: parse_resolution_basis(entry.get("basis")),
-            })
-        })
-        .collect()
-}
-
-/// Basis parsing is deliberately lenient: anything the schema did not shape
-/// into a quote or a precedent counts as an assumption. Assumption is the
-/// conservative reading - it marks the entry as an attack target rather than
-/// letting a malformed basis pass as evidence.
-fn parse_resolution_basis(value: Option<&serde_json::Value>) -> ResolutionBasis {
-    match value {
-        Some(serde_json::Value::Object(object)) => {
-            if let Some(quote) = object.get("quote").and_then(serde_json::Value::as_str)
-                && !quote.trim().is_empty()
-            {
-                return ResolutionBasis::Quote(quote.to_string());
-            }
-            if let Some(precedent) = object.get("precedent").and_then(serde_json::Value::as_str)
-                && !precedent.trim().is_empty()
-            {
-                return ResolutionBasis::Precedent(precedent.to_string());
-            }
-            ResolutionBasis::Assumption
-        }
-        _ => ResolutionBasis::Assumption,
-    }
-}
-
-/// The single mechanical check the harness performs on the register: a quote
-/// basis holds only when the quoted string really is in the run's task text.
-/// Whitespace is collapsed on both sides - a model re-wrapping a quoted line
-/// is not a different quote - and nothing else is normalized, because any
-/// further leniency would start accepting paraphrase as citation.
-pub(crate) fn quote_supported_by(task_text: &str, quote: &str) -> bool {
-    fn collapse(value: &str) -> String {
-        value.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-    let quote = collapse(quote);
-    !quote.is_empty() && collapse(task_text).contains(&quote)
 }
 
 /// Parses the optional `mutations` array carried by a resolution call.
@@ -1235,6 +1102,7 @@ mod tests {
                 final_response: "saved result".to_string(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1272,9 +1140,9 @@ mod tests {
             SPAWN_WORKERS_TOOL,
             serde_json::json!({
                 "workers": [
-                    { "from": "root", "instructions": "bootstrap" },
-                    { "from": "w1", "instructions": "branch saved", "model": "model-a" },
-                    { "from": "w4", "instructions": "branch pending" }
+                    { "from": "root", "max_steps": 10, "instructions": "bootstrap" },
+                    { "from": "w1", "max_steps": 10, "instructions": "branch saved", "model": "model-a" },
+                    { "from": "w4", "max_steps": 10, "instructions": "branch pending" }
                 ]
             }),
         );
@@ -1302,7 +1170,7 @@ mod tests {
                 "workers": [
                     {
                         "from": "root",
-                        "instructions": "continue the fix",
+                        "max_steps": 10, "instructions": "continue the fix",
                         "single_because": "Only one plausible fix location remains after ruling out the other hypothesis.",
                     }
                 ]
@@ -1318,7 +1186,7 @@ mod tests {
         let without_reason = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }] }),
         );
         let spawns = parse_spawn_workers(&without_reason, &context).expect("valid spawn");
         assert_eq!(spawns[0].single_because, None);
@@ -1326,7 +1194,7 @@ mod tests {
         let blank_reason = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x", "single_because": "   " }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x", "single_because": "   " }] }),
         );
         let spawns = parse_spawn_workers(&blank_reason, &context).expect("valid spawn");
         assert_eq!(spawns[0].single_because, None);
@@ -1338,7 +1206,7 @@ mod tests {
             serde_json::json!({
                 "workers": [{
                     "from": "root",
-                    "instructions": "x",
+                    "max_steps": 10, "instructions": "x",
                     "single_because": "x".repeat(ASGARD_SINGLE_BECAUSE_MAX_LENGTH + 1),
                 }]
             }),
@@ -1366,6 +1234,7 @@ mod tests {
                 final_response: "child result".to_string(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1388,6 +1257,7 @@ mod tests {
                 final_response: "sibling result".to_string(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1403,7 +1273,7 @@ mod tests {
             "spawn",
             SPAWN_WORKERS_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "w2", "prefix_from": "w1", "instructions": "x" }]
+                "workers": [{ "from": "w2", "prefix_from": "w1", "max_steps": 10, "instructions": "x" }]
             }),
         );
         let spawns = parse_spawn_workers(&valid, &context).expect("valid prefix");
@@ -1416,7 +1286,7 @@ mod tests {
             "spawn",
             SPAWN_WORKERS_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "w2", "prefix_from": "none", "instructions": "x" }]
+                "workers": [{ "from": "w2", "prefix_from": "none", "max_steps": 10, "instructions": "x" }]
             }),
         );
         let spawns = parse_spawn_workers(&fresh, &context).expect("fresh prefix");
@@ -1426,7 +1296,7 @@ mod tests {
             "spawn",
             SPAWN_WORKERS_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "w2", "prefix_from": "w3", "instructions": "x" }]
+                "workers": [{ "from": "w2", "prefix_from": "w3", "max_steps": 10, "instructions": "x" }]
             }),
         );
         assert!(
@@ -1444,7 +1314,7 @@ mod tests {
             "prefinalize",
             PREFINALIZE_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "w1", "instructions": "verify", "runs_full_suite": true }]
+                "workers": [{ "from": "w1", "max_steps": 10, "instructions": "verify", "runs_full_suite": true }]
             }),
         );
         let parsed = parse_prefinalize(&call, &context).expect("prefinalize parses");
@@ -1468,11 +1338,11 @@ mod tests {
                 "workers": [
                     {
                         "from": "root",
-                        "instructions": "run the full suite",
+                        "max_steps": 10, "instructions": "run the full suite",
                         "runs_full_suite": true,
                         "attacks": ["  Belief: sorting is stable -> equal keys diffed  "],
                     },
-                    { "from": "w1", "instructions": "adversarial edges" }
+                    { "from": "w1", "max_steps": 10, "instructions": "adversarial edges" }
                 ],
                 "full_suite_skipped": "  not warranted: docs-only delivery  ",
             }),
@@ -1494,7 +1364,7 @@ mod tests {
         let without_reason = supervisor_tool_call(
             "pf",
             PREFINALIZE_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }] }),
         );
         let parsed = parse_prefinalize(&without_reason, &context).expect("valid prefinalize");
         assert_eq!(parsed.full_suite_skipped, None);
@@ -1505,7 +1375,7 @@ mod tests {
             "pf",
             PREFINALIZE_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "root", "instructions": "x" }],
+                "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }],
                 "full_suite_skipped": "   ",
             }),
         );
@@ -1529,7 +1399,7 @@ mod tests {
             serde_json::json!({
                 "workers": [{
                     "from": "root",
-                    "instructions": "x",
+                    "max_steps": 10, "instructions": "x",
                     "attacks": ["a".repeat(ASGARD_ATTACK_MAX_LENGTH + 1)],
                 }]
             }),
@@ -1544,7 +1414,7 @@ mod tests {
             "pf",
             PREFINALIZE_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "root", "instructions": "x" }],
+                "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }],
                 "full_suite_skipped": "b".repeat(ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH + 1),
             }),
         );
@@ -1558,7 +1428,7 @@ mod tests {
             "pf",
             PREFINALIZE_TOOL,
             serde_json::json!({
-                "workers": [{ "from": "root", "instructions": "x", "runs_full_suite": "yes" }]
+                "workers": [{ "from": "root", "max_steps": 10, "instructions": "x", "runs_full_suite": "yes" }]
             }),
         );
         assert!(
@@ -1587,7 +1457,7 @@ mod tests {
             serde_json::json!({
                 "workers": [{
                     "from": "root",
-                    "instructions": "x",
+                    "max_steps": 10, "instructions": "x",
                     "runs_full_suite": true,
                     "attacks": ["a".repeat(ASGARD_ATTACK_MAX_LENGTH + 100)],
                 }]
@@ -1639,6 +1509,120 @@ mod tests {
     }
 
     #[test]
+    fn both_worker_schemas_require_a_capped_max_steps() {
+        let tools = supervisor_tool_definitions(&["model-a".to_string()]);
+        for tool_name in [SPAWN_WORKERS_TOOL, PREFINALIZE_TOOL] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.function.name == tool_name)
+                .expect("tool");
+            let items = &tool.function.parameters["properties"]["workers"]["items"];
+            assert!(
+                items["required"]
+                    .as_array()
+                    .expect("required array")
+                    .iter()
+                    .any(|field| field == "max_steps"),
+                "{tool_name} must require max_steps"
+            );
+            let max_steps = &items["properties"]["max_steps"];
+            assert_eq!(max_steps["type"], "integer");
+            assert_eq!(max_steps["minimum"], 1);
+            assert_eq!(max_steps["maximum"], ASGARD_WORKER_MAX_STEPS_CEILING);
+        }
+    }
+
+    #[test]
+    fn spawn_parser_requires_max_steps_within_the_measured_ceiling() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            pending_parents: &[],
+            allowed_models: &[],
+        };
+
+        let missing = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [
+                    { "from": "root", "instructions": "budgeted", "max_steps": 5 },
+                    { "from": "root", "instructions": "unbudgeted" },
+                ]
+            }),
+        );
+        let error = parse_spawn_workers(&missing, &context).expect_err("missing max_steps");
+        assert!(
+            error.contains("workers[1].max_steps is required"),
+            "error must name the worker index: {error}"
+        );
+
+        let too_big = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "root",
+                    "instructions": "grind",
+                    "max_steps": ASGARD_WORKER_MAX_STEPS_CEILING + 1,
+                }]
+            }),
+        );
+        let error = parse_spawn_workers(&too_big, &context).expect_err("over the ceiling");
+        assert_eq!(
+            error,
+            format!("workers[0].max_steps must be between 1 and {ASGARD_WORKER_MAX_STEPS_CEILING}")
+        );
+
+        // The ceiling itself is accepted, and there is no harness default to
+        // fall back on.
+        let at_ceiling = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "root",
+                    "instructions": "long attempt",
+                    "max_steps": ASGARD_WORKER_MAX_STEPS_CEILING,
+                }]
+            }),
+        );
+        let spawns = parse_spawn_workers(&at_ceiling, &context).expect("ceiling accepted");
+        assert_eq!(spawns[0].max_steps, ASGARD_WORKER_MAX_STEPS_CEILING);
+    }
+
+    #[test]
+    fn prefinalize_parser_requires_max_steps_too() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            pending_parents: &[],
+            allowed_models: &[],
+        };
+        let call = supervisor_tool_call(
+            "prefinalize",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "w1", "instructions": "verify", "runs_full_suite": true }]
+            }),
+        );
+        assert!(
+            parse_prefinalize(&call, &context)
+                .expect_err("missing max_steps")
+                .contains("workers[0].max_steps is required")
+        );
+    }
+
+    /// The ceiling is not a taste call: it is half the measured p75
+    /// steps-to-solve of a vanilla agent on this corpus (147 / 2, rounded).
+    #[test]
+    fn worker_step_ceiling_is_half_the_measured_vanilla_p75() {
+        assert_eq!(ASGARD_WORKER_MAX_STEPS_CEILING, 75);
+    }
+
+    #[test]
     fn spawn_parser_rejects_bad_checkpoint_model_and_empty_instructions() {
         let dag = saved_dag();
         let allowed = vec!["model-a".to_string()];
@@ -1652,7 +1636,7 @@ mod tests {
         let bad_from = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "w99", "instructions": "x" }] }),
+            serde_json::json!({ "workers": [{ "from": "w99", "max_steps": 10, "instructions": "x" }] }),
         );
         assert!(
             parse_spawn_workers(&bad_from, &context)
@@ -1663,7 +1647,7 @@ mod tests {
         let bad_model = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x", "model": "model-b" }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x", "model": "model-b" }] }),
         );
         assert!(
             parse_spawn_workers(&bad_model, &context)
@@ -1674,7 +1658,7 @@ mod tests {
         let empty = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "  " }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "  " }] }),
         );
         assert!(
             parse_spawn_workers(&empty, &context)
@@ -1689,7 +1673,7 @@ mod tests {
                 "workers": (0..9)
                     .map(|index| serde_json::json!({
                         "from": "root",
-                        "instructions": format!("worker {index}")
+                        "max_steps": 10, "instructions": format!("worker {index}")
                     }))
                     .collect::<Vec<_>>()
             }),
@@ -1785,6 +1769,7 @@ mod tests {
                 final_response: "done".to_string(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
+                max_steps: 10,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1913,76 +1898,6 @@ mod tests {
     }
 
     #[test]
-    fn ambiguity_register_parses_bases_and_ignores_a_plan_without_one() {
-        let bare = supervisor_tool_call(
-            "plan",
-            UPDATE_PLAN_TOOL,
-            serde_json::json!({ "plan": [{ "step": "implement", "status": "pending" }] }),
-        );
-        assert!(parse_update_plan(&bare).is_ok());
-        assert_eq!(parse_ambiguity_resolutions(&bare), Ok(Vec::new()));
-
-        let registered = supervisor_tool_call(
-            "plan",
-            UPDATE_PLAN_TOOL,
-            serde_json::json!({
-                "plan": [{ "step": "implement", "status": "pending" }],
-                "resolutions": [
-                    { "id": "A1", "reading": "empty input yields []", "basis": { "quote": "return an empty list" } },
-                    { "id": "A2", "reading": "argument order is (needle, haystack)", "basis": { "precedent": "src/find.rs" } },
-                    { "id": "A3", "reading": "trailing separators are ignored", "basis": "assumption" },
-                    // An unrecognized basis shape is read as an assumption,
-                    // never as evidence.
-                    { "id": "A4", "reading": "ties break toward the first", "basis": { "vibes": "felt right" } },
-                ],
-            }),
-        );
-        assert!(parse_update_plan(&registered).is_ok());
-        let resolutions = parse_ambiguity_resolutions(&registered).expect("resolutions");
-        assert_eq!(
-            resolutions
-                .iter()
-                .map(|resolution| (resolution.id.as_str(), resolution.basis.label()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("A1", "quote"),
-                ("A2", "precedent"),
-                ("A3", "assumption"),
-                ("A4", "assumption"),
-            ]
-        );
-
-        let malformed = supervisor_tool_call(
-            "plan",
-            UPDATE_PLAN_TOOL,
-            serde_json::json!({
-                "plan": [],
-                "resolutions": [{ "reading": "no id" }],
-            }),
-        );
-        assert!(
-            parse_ambiguity_resolutions(&malformed)
-                .expect_err("missing id")
-                .contains("resolutions[0].id")
-        );
-    }
-
-    #[test]
-    fn quote_basis_holds_only_for_literal_task_text() {
-        let task =
-            "The parser must reject trailing commas\nand return an empty list for empty input.";
-        assert!(quote_supported_by(task, "reject trailing commas"));
-        // Re-wrapped whitespace is the same quote.
-        assert!(quote_supported_by(
-            task,
-            "trailing commas   and    return an empty list"
-        ));
-        // A paraphrase is not.
-        assert!(!quote_supported_by(task, "reject trailing separators"));
-        assert!(!quote_supported_by(task, "   "));
-    }
-
-    #[test]
     fn resolution_mutations_parse_and_reject_unknown_outcomes() {
         let absent = supervisor_tool_call("save", SAVE_CHECKPOINT_TOOL, serde_json::json!({}));
         assert_eq!(parse_mutations(&absent), Ok(None));
@@ -2074,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_tools_carry_mutations_and_update_plan_gains_only_the_supervisor_register() {
+    fn resolution_tools_carry_mutations_and_update_plan_is_the_shared_tool() {
         let tools = supervisor_tool_definitions(&["model-a".to_string()]);
         for tool in [SAVE_CHECKPOINT_TOOL, DISCARD_TOOL] {
             let definition = tools
@@ -2098,14 +2013,13 @@ mod tests {
             .iter()
             .find(|definition| definition.function.name == UPDATE_PLAN_TOOL)
             .expect("update_plan definition");
-        assert!(supervisor_plan.function.parameters["properties"]["resolutions"].is_object());
-        // The shared agent tool is untouched: only the supervisor's copy
-        // carries the register.
+        // The supervisor uses the shared agent tool verbatim: no register, no
+        // supervisor-only extension of any kind.
         let shared = crate::tools::update_plan_tool_definition();
-        assert!(shared.function.parameters["properties"]["resolutions"].is_null());
+        assert!(supervisor_plan.function.parameters["properties"]["resolutions"].is_null());
         assert_eq!(
-            shared.function.parameters["properties"]["plan"],
-            supervisor_plan.function.parameters["properties"]["plan"]
+            shared.function.parameters,
+            supervisor_plan.function.parameters
         );
     }
 
@@ -2119,7 +2033,7 @@ mod tests {
         let spawn_call = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }] }),
         );
         let git_call =
             supervisor_tool_call("git", GIT_TOOL, serde_json::json!({ "args": ["log"] }));
@@ -2178,25 +2092,66 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_supplement_requires_numbered_ambiguity_resolutions() {
+    fn supervisor_supplement_briefs_scope_and_never_restates_requirements() {
         let supplement = supervisor_supplement();
 
+        // A brief carries scope and evidence; the task text is the worker's
+        // own, and the supervisor's paraphrase of it is the failure channel
+        // this doctrine exists to close.
+        assert!(supplement.contains("Briefs, not restatements"));
+        assert!(supplement.contains("It never restates what the task requires"));
+        assert!(supplement.contains("do not hand it the reading"));
+        // Spec tests come from the task text, never from a settled reading.
+        assert!(supplement.contains(
+            "have two workers in the first batch write spec tests independently, each from the \
+             task text alone and neither from any reading you settled"
+        ));
+        // The old spec-pinning doctrine and its numbered register are gone.
         assert!(!supplement.contains("numbered obligations ledger"));
-        assert!(supplement.contains("For each numbered ambiguity (A1, A2, ...)"));
-        assert!(supplement.contains("state your resolution and a one-line rationale"));
-        assert!(supplement.contains("one test per resolution"));
+        assert!(!supplement.contains("First duty: pin the specification"));
+        assert!(!supplement.contains("(A1, A2, ...)"));
+        assert!(!supplement.contains("settled reading"));
+        assert!(!supplement.contains("resolutions array"));
+        assert!(!supplement.contains("intake"));
+
         assert!(supplement.contains("If independent parts share a file"));
         assert!(supplement.contains("Enumerate the separable groups of files"));
-        assert!(supplement.contains("two workers in that same batch write spec tests"));
-        // The supervisor now pins the spec itself: no upstream intake pass
-        // hands it contracts, so the prompt must never promise one.
-        assert!(!supplement.contains("intake"));
-        assert!(
-            supplement.contains("Calling conventions and argument order are always ambiguities")
-        );
         assert!(supplement.contains("A plant is only evidence after re-checking"));
         assert!(supplement.contains("code intelligence"));
         assert!(supplement.contains("cites the exact functions"));
+    }
+
+    #[test]
+    fn supervisor_supplement_puts_authority_in_adjudication_and_dual_reading() {
+        let supplement = supervisor_supplement();
+
+        assert!(supplement.contains("Adjudication is where your authority lives"));
+        assert!(supplement.contains(
+            "resolve the divergence explicitly and cite the evidence you resolved it on"
+        ));
+        assert!(
+            supplement.contains("before the affected work is saved, spawned from, or finalized")
+        );
+        assert!(
+            supplement.contains("Your ruling binds every worker that carries the work forward")
+        );
+
+        assert!(supplement.contains("Targeted dual reading"));
+        assert!(supplement.contains(
+            "spawn a second worker for that component alone, from the raw task text, at a \
+             deliberately different vantage you name"
+        ));
+        assert!(supplement.contains("not by settling it in advance"));
+    }
+
+    #[test]
+    fn supervisor_supplement_teaches_modest_budgets_and_continuation() {
+        let supplement = supervisor_supplement();
+
+        assert!(supplement.contains("the budget is required on every worker and capped at 75"));
+        assert!(supplement.contains("long serial work proceeds by continuation"));
+        assert!(supplement.contains("Budget modestly: a capped worker is normal, not a failure"));
+        assert!(supplement.contains("costs a single spawn from its own window (prefix_from"));
     }
 
     #[test]
@@ -2302,7 +2257,7 @@ mod tests {
         let spawn_call = supervisor_tool_call(
             "spawn",
             SPAWN_WORKERS_TOOL,
-            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+            serde_json::json!({ "workers": [{ "from": "root", "max_steps": 10, "instructions": "x" }] }),
         );
 
         let bifrost_payload = "fn foo() at src/lib.rs:12\nfn foo_bar() at src/x.rs:3".to_string();
