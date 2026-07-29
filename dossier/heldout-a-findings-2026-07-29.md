@@ -19,7 +19,7 @@ goal (beat the supervisor model working alone) is missed.
 
 Note the probe-35 comparison is not a regression: that set was ~98%
 vanilla-luna tasks where asgard scored 80% (0.82x ratio). Held-out A is a
-harder set where asgard scores 61.5% (1.14x vs luna). In ratio terms the
+harder set where asgard scores 63.0% (1.15x vs luna). In ratio terms the
 design generalized; the headline fell because the tasks got harder.
 
 ## The diagnostic cut
