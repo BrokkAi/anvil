@@ -10,9 +10,9 @@ luna@xhigh, runs=1.*
 
 | | rate |
 |---|---|
-| asgard (sol supervising luna) | 16/26 = 61.5% raw; 64% excluding one timeout |
-| vanilla luna @xhigh (published) | 53.8% → **1.14x** |
-| vanilla sol @high (published) | 70.2% → **0.88x** |
+| asgard (sol supervising luna) | 17/27 = 63.0% raw; 65.4% excluding one timeout |
+| vanilla luna @xhigh (published) | 54.6% → **1.15x** |
+| vanilla sol @high (published) | 71.3% → **0.88x** |
 
 The expectation bar (beat the worker model) is cleared modestly. The actual
 goal (beat the supervisor model working alone) is missed.
@@ -28,20 +28,23 @@ Grouping tasks by how well vanilla sol does on them alone:
 
 | vanilla sol | n | asgard | vanilla luna | vanilla sol |
 |---|---|---|---|---|
-| 4/4 | 12 | 67% | 56% | 100% |
+| 4/4 | 13 | 69% | 58% | 100% |
 | 3/4 | 4 | 100% | 69% | 75% |
 | <=2/4 | 10 | 40% | 45% | 32% |
 
 **Sol's competence does not transfer through supervision.** Where sol solves
-a task every time alone, asgard solves it two-thirds of the time: +11 points
-over luna-alone, -33 points against sol-alone. Where luna struggles, asgard
+a task every time alone, asgard solves it 69% of the time: +11 points
+over luna-alone, -31 points against sol-alone. Where luna struggles, asgard
 (40%) is at or below luna-alone (45%). The system behaves as *the worker plus
 a small boost*, uniformly — not as the supervisor's judgment executing
 through the worker's hands.
 
-Four tasks lost that vanilla sol solves 4/4: csstree-shorthand-expansion,
-claude-code-by-agents-recursive-delegation, koota-composite-trait-aspects,
-scriggo-method-declarations (timeout).
+Paired view: 4 tasks lost that vanilla sol solves 4/4 (csstree-shorthand-
+expansion, claude-code-by-agents-recursive-delegation,
+koota-composite-trait-aspects, scriggo-method-declarations/timeout) against
+2 won where vanilla sol scores <=1/4 (quill-shared-toolbar-focus,
+sqlfmt-create-table-ddl-formatting). Supervision trades 4 reliable
+supervisor solves for 2 wins in territory neither model owns.
 
 ## Falsifiable prediction for the reserved 24
 
