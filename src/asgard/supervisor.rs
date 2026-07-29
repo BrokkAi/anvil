@@ -388,7 +388,7 @@ fn max_steps_property() -> serde_json::Value {
         "type": "integer",
         "minimum": 1,
         "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
-        "description": format!("Required. Step budget for this worker (one step = one batch of tool calls), from 1 to {ASGARD_WORKER_MAX_STEPS_CEILING}. Budgets are capped at {ASGARD_WORKER_MAX_STEPS_CEILING}; long serial work proceeds by continuation - spawn again from the capped window."),
+        "description": format!("Required. Step budget for this worker (one step = one batch of tool calls), from 1 to {ASGARD_WORKER_MAX_STEPS_CEILING}. Budgets are capped at {ASGARD_WORKER_MAX_STEPS_CEILING}; long serial work proceeds by continuation - spawn again from the capped window. Measured calibration: recon/probe 5-10; spec-test authorship 20-25; verification 25-30; focused fix 30-40; component implementation 35-50. Workers consume every step you grant regardless of assignment size, so full usage is not evidence of need - budget modestly and continue."),
     })
 }
 
@@ -482,7 +482,7 @@ fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
                         "attacks": {
                             "type": "array",
                             "items": { "type": "string", "maxLength": ASGARD_ATTACK_MAX_LENGTH },
-                            "description": "Load-bearing beliefs this worker attacks. A belief is load-bearing when the delivery is wrong if the belief is: an ambiguity you resolved, a 'this cannot affect X' assumption, a compliance claim you have never seen fail-then-pass, any code or signature you dictated. An attack constructs the situation where a wrong belief breaks - it does not re-run tests that already pass. The belief you do not name is the one that fails the hidden suite.",
+                            "description": "Load-bearing beliefs this worker attacks. A belief is load-bearing when the delivery is wrong if the belief is: a divergence you adjudicated, a 'this cannot affect X' assumption, a compliance claim you have never seen fail-then-pass, any code or signature you dictated. An attack constructs the situation where a wrong belief breaks - it does not re-run tests that already pass. The belief you do not name is the one that fails the hidden suite.",
                         },
                     },
                 },

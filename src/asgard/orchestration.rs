@@ -738,7 +738,7 @@ async fn run_asgard_trajectory_loop_inner(
             dag.checkpoint_labels().is_empty(),
         ) {
             (false, true) => Some(
-                "No workers exist yet. Spawn 1 to 8 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading.",
+                "No workers exist yet. Spawn 1 to 8 workers from \"root\" to begin. Consider dedicating the first batch to spec tests: two workers writing tests independently from the task text alone, so their disagreements surface divergences before implementation exists.",
             ),
             (false, false) => Some("No worker is awaiting review. Spawn workers or finalize."),
             _ => None,
