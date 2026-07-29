@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
@@ -144,6 +144,7 @@ struct FinishedWorker {
     stop: WorkerStopReason,
     steps: usize,
     max_steps: usize,
+    max_minutes: usize,
     diffstat: String,
     oracles: WindowOracles,
     usage: TokenUsage,
@@ -166,6 +167,7 @@ impl FinishedWorker {
             stop: self.stop.clone(),
             steps: self.steps,
             max_steps: self.max_steps,
+            max_minutes: self.max_minutes,
             diffstat: self.diffstat.clone(),
             oracles: self.oracles.clone(),
             usage: self.usage,
@@ -196,6 +198,7 @@ enum AsgardExit {
         response: Option<String>,
         evidence: Vec<String>,
         abandoned: Vec<String>,
+        modified_pre_existing_tests: Vec<String>,
     },
     Failure(anyhow::Error),
     Cancelled,
@@ -212,6 +215,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     pending: &'ctx mut BTreeMap<usize, FinishedWorker>,
     pending_windows: BTreeMap<usize, TrajectoryWindow>,
     stage: &'ctx SnapshotStage,
+    base_commit: &'ctx str,
     spawned_batch: Vec<BoxFuture<'fut, FinishedWorker>>,
     idle_pool: &'ctx mut Vec<CandidateRepository>,
     /// The supervisor's own scratch worktree for the `git` tool, created
@@ -241,6 +245,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     /// whole turn's steps.
     mutations_bounced: &'ctx mut bool,
     finalize_lineage_bounced: &'ctx mut bool,
+    finalize_test_ack_bounced: &'ctx mut bool,
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
     /// Survived plants awaiting a closure, in the order they were reported.
@@ -264,6 +269,7 @@ struct SupervisorLoopResult<'fut> {
     finalizing: Option<(CheckpointId, Option<String>)>,
     finalizing_evidence: Vec<String>,
     finalizing_abandoned: Vec<String>,
+    finalizing_modified_pre_existing_tests: Vec<String>,
     plan: Option<UpdatePlanArgs>,
     usage: TokenUsage,
     steps: usize,
@@ -288,6 +294,7 @@ struct SupervisorTurnState {
     finalizing: Option<(CheckpointId, Option<String>)>,
     finalizing_evidence: Vec<String>,
     finalizing_abandoned: Vec<String>,
+    finalizing_modified_pre_existing_tests: Vec<String>,
     turn_ended: bool,
     /// A gate (prefinalize coverage, finalize lineage) bounced a call this
     /// step: the step is refunded so the resubmission is free.
@@ -307,6 +314,7 @@ struct FinalizeContext<'a> {
     prefinalize_workers: &'a [usize],
     /// Survived plants that were never closed. Recorded, never gating.
     open_mutations: &'a [SurvivedMutation],
+    modified_pre_existing_tests: &'a [String],
 }
 
 struct WorkerLaunch<'a> {
@@ -371,6 +379,8 @@ async fn launch_worker<'a>(
 
     let instructions = spawn.instructions.clone();
     let max_steps = spawn.max_steps;
+    let max_minutes = spawn.max_minutes;
+    let lease = Duration::from_secs((max_minutes as u64).saturating_mul(60));
     let parent_cwd_display = launch.parent_cwd.display();
     let instruction_message = ChatMessage::user(format!(
         "<supervisor_instructions>\n{instructions}\n</supervisor_instructions>\n\
@@ -444,6 +454,7 @@ async fn launch_worker<'a>(
             Some(tool_allowlist),
             None,
             true,
+            Some(lease),
             Some(turn_progress),
             context_length,
             context_prefix_len,
@@ -493,6 +504,9 @@ async fn launch_worker<'a>(
             "model": model,
             "steps": steps,
             "max_steps": max_steps,
+            "max_minutes": max_minutes,
+            "lease_millis": lease.as_millis().min(u128::from(u64::MAX)) as u64,
+            "time_capped": matches!(stop, WorkerStopReason::TimeLimit),
             "rendered_tokens": rendered_tokens,
             "prefix_from": prefix_from,
             "stop": stop.label(),
@@ -532,6 +546,7 @@ async fn launch_worker<'a>(
             stop,
             steps,
             max_steps,
+            max_minutes,
             diffstat,
             oracles,
             usage: outcome.usage,
@@ -708,6 +723,7 @@ async fn run_asgard_trajectory_loop_inner(
     let mut prefinalize_coverage_bounced = false;
     let mut mutations_bounced = false;
     let mut finalize_lineage_bounced = false;
+    let mut finalize_test_ack_bounced = false;
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
     let mut survived_mutations: Vec<SurvivedMutation> = Vec::new();
@@ -769,6 +785,7 @@ async fn run_asgard_trajectory_loop_inner(
                 idle_note,
                 parent_status: &parent_status,
                 survived_mutations: &survived_mutations,
+                usage_by_model: &usage_by_model,
             },
         );
         let ephemeral = vec![ChatMessage::user(status)];
@@ -785,6 +802,7 @@ async fn run_asgard_trajectory_loop_inner(
             pending: &mut pending_batch,
             pending_windows: pending_windows.clone(),
             stage: &stage,
+            base_commit: &base_commit,
             spawned_batch: Vec::new(),
             idle_pool: &mut idle_pool,
             git_scratch: &mut git_scratch,
@@ -816,6 +834,7 @@ async fn run_asgard_trajectory_loop_inner(
             prefinalize_coverage_bounced: &mut prefinalize_coverage_bounced,
             mutations_bounced: &mut mutations_bounced,
             finalize_lineage_bounced: &mut finalize_lineage_bounced,
+            finalize_test_ack_bounced: &mut finalize_test_ack_bounced,
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
             survived_mutations: &mut survived_mutations,
@@ -859,6 +878,7 @@ async fn run_asgard_trajectory_loop_inner(
                         response,
                         evidence: outcome.finalizing_evidence,
                         abandoned: outcome.finalizing_abandoned,
+                        modified_pre_existing_tests: outcome.finalizing_modified_pre_existing_tests,
                     };
                 }
                 if !outcome.spawned_batch.is_empty() {
@@ -887,6 +907,7 @@ async fn run_asgard_trajectory_loop_inner(
                                 response: None,
                                 evidence: Vec::new(),
                                 abandoned: Vec::new(),
+                                modified_pre_existing_tests: Vec::new(),
                             };
                         }
                         break AsgardExit::Failure(anyhow!(
@@ -981,6 +1002,7 @@ async fn run_asgard_trajectory_loop_inner(
                     response: None,
                     evidence: Vec::new(),
                     abandoned: Vec::new(),
+                    modified_pre_existing_tests: Vec::new(),
                 };
             }
         }
@@ -992,6 +1014,7 @@ async fn run_asgard_trajectory_loop_inner(
             response,
             evidence,
             abandoned,
+            modified_pre_existing_tests,
         } => finalize_asgard(
             FinalizeContext {
                 parent_cwd: parent_registry.cwd(),
@@ -1005,6 +1028,7 @@ async fn run_asgard_trajectory_loop_inner(
                 abandoned: &abandoned,
                 prefinalize_workers: &prefinalize_workers,
                 open_mutations: &survived_mutations,
+                modified_pre_existing_tests: &modified_pre_existing_tests,
             },
             checkpoint,
             response,
@@ -1073,6 +1097,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         finalizing: None,
         finalizing_evidence: Vec::new(),
         finalizing_abandoned: Vec::new(),
+        finalizing_modified_pre_existing_tests: Vec::new(),
         merged: Vec::new(),
         turn_ended: false,
         bounced_this_step: false,
@@ -1277,6 +1302,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         discarded: state.discarded,
         finalizing_evidence: state.finalizing_evidence,
         finalizing_abandoned: state.finalizing_abandoned,
+        finalizing_modified_pre_existing_tests: state.finalizing_modified_pre_existing_tests,
         merged: state.merged,
         permanent_append,
         spawned_batch: cx.spawned_batch,
@@ -1476,6 +1502,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             let response = parsed.response;
             let evidence = parsed.evidence;
             let abandoned = parsed.abandoned;
+            let modified_pre_existing_tests = parsed.modified_pre_existing_tests;
             if !*cx.prefinalize_issued {
                 state.turn_ended = true;
                 return Ok("error: finalize requires a prefinalize verification pass first: spawn verification workers via prefinalize, review their reports, then finalize.".to_string());
@@ -1504,6 +1531,16 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 return Ok(format!(
                     "error: the delivered checkpoint ({checkpoint}) is not the state your latest prefinalize verified; run prefinalize from {checkpoint} (or the checkpoint you intend to deliver), review it, then finalize."
                 ));
+            }
+            if let Some(message) = validate_modified_pre_existing_tests_ack(
+                cx.stage,
+                cx.base_commit,
+                checkpoint_commit,
+                &modified_pre_existing_tests,
+                cx.finalize_test_ack_bounced,
+            )? {
+                state.bounced_this_step = true;
+                return Ok(message);
             }
             let off_lineage = cx.dag.off_lineage_checkpoints_with_diffstat(&checkpoint);
             let unacknowledged = off_lineage
@@ -1538,6 +1575,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             state.finalizing = Some((checkpoint.clone(), response));
             state.finalizing_evidence = evidence.clone();
             state.finalizing_abandoned = abandoned;
+            state.finalizing_modified_pre_existing_tests = modified_pre_existing_tests.clone();
             let evidence_text = if evidence.is_empty() {
                 "no evidence named".to_string()
             } else {
@@ -2052,6 +2090,53 @@ fn prefinalize_source_covers(
         }
     }
     Ok(false)
+}
+
+fn validate_modified_pre_existing_tests_ack(
+    stage: &SnapshotStage,
+    base_commit: &str,
+    checkpoint_commit: &str,
+    supplied: &[String],
+    bounced: &mut bool,
+) -> Result<Option<String>> {
+    let actual = stage.modified_pre_existing_test_paths(base_commit, checkpoint_commit)?;
+    let mut acknowledged = supplied
+        .iter()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    acknowledged.sort();
+    acknowledged.dedup();
+    let missing = actual
+        .iter()
+        .filter(|path| !acknowledged.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = acknowledged
+        .iter()
+        .filter(|path| !actual.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let matches = missing.is_empty() && extra.is_empty();
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_finalize_test_ack",
+        "checkpoint_commit": checkpoint_commit,
+        "actual": actual,
+        "acknowledged": acknowledged,
+        "missing": missing,
+        "extra": extra,
+        "matched": matches,
+        "bounced": !matches && !*bounced,
+    }));
+    if matches || *bounced {
+        return Ok(None);
+    }
+    *bounced = true;
+    Ok(Some(format!(
+        "error: finalize modified_pre_existing_tests does not match delivered pre-existing test edits; missing: [{}]; extra: [{}]. Resubmit finalize with the exact list, or [] if none.",
+        missing.join(", "),
+        extra.join(", ")
+    )))
 }
 
 fn dedup_spawn_requests(
@@ -2674,6 +2759,7 @@ fn finalize_asgard(
         "evidence": context.evidence,
         "off_lineage_unmerged": off_lineage_unmerged,
         "abandoned": context.abandoned,
+        "modified_pre_existing_tests": context.modified_pre_existing_tests,
         "prefinalize_workers": context.prefinalize_workers,
         "open_survived_mutations": context
             .open_mutations
@@ -2984,6 +3070,7 @@ fn worker_stop_reason(stop: &LoopStop) -> WorkerStopReason {
     match stop {
         LoopStop::Completed { .. } => WorkerStopReason::Finished,
         LoopStop::MaxTurns { .. } => WorkerStopReason::StepLimit,
+        LoopStop::TimeLimit => WorkerStopReason::TimeLimit,
         LoopStop::Cancelled => WorkerStopReason::Cancelled,
         LoopStop::Failed(failure) => WorkerStopReason::Failed(failure.message.clone()),
     }
@@ -3022,6 +3109,7 @@ struct AsgardStatusState<'a> {
     idle_note: Option<&'a str>,
     parent_status: &'a [String],
     survived_mutations: &'a [SurvivedMutation],
+    usage_by_model: &'a BTreeMap<String, TokenUsage>,
 }
 
 fn render_asgard_status_block(
@@ -3055,6 +3143,10 @@ fn render_asgard_status_block(
     if let Some(line) = render_budget_calibration(dag.saved_windows().chain(pending.values())) {
         rendered.push_str(&line);
     }
+    rendered.push_str(&render_spend_line(
+        dag.saved_windows().chain(pending.values()),
+        state.usage_by_model,
+    ));
     // Survived plants are run state, not turn state: they stay here every
     // turn until close_mutation says what happened to them.
     for mutation in state.survived_mutations {
@@ -3078,6 +3170,33 @@ fn render_asgard_status_block(
         rendered.push('\n');
     }
     rendered
+}
+
+fn render_spend_line<'a>(
+    windows: impl Iterator<Item = &'a TrajectoryWindow>,
+    usage_by_model: &BTreeMap<String, TokenUsage>,
+) -> String {
+    let worker_wall_minutes = windows.map(|window| window.elapsed_millis).sum::<u64>() / 60_000;
+    let model_tokens = if usage_by_model.is_empty() {
+        "none".to_string()
+    } else {
+        usage_by_model
+            .iter()
+            .map(|(model, usage)| {
+                format!(
+                    "{} in={} out={} thought={} cached_read={} cached_write={}",
+                    model,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.thought_tokens,
+                    usage.cached_read_tokens,
+                    usage.cached_write_tokens
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    format!("spend: worker_wall_minutes={worker_wall_minutes}; tokens_by_model: {model_tokens}\n")
 }
 
 fn parent_worktree_status_rollup(root: &Path) -> Result<Vec<String>> {
@@ -3370,7 +3489,10 @@ mod tests {
         named_tool_call(
             id,
             "finalize",
-            serde_json::json!({ "checkpoint": checkpoint }),
+            serde_json::json!({
+                "checkpoint": checkpoint,
+                "modified_pre_existing_tests": [],
+            }),
         )
     }
 
@@ -3378,7 +3500,11 @@ mod tests {
         named_tool_call(
             id,
             "finalize",
-            serde_json::json!({ "checkpoint": checkpoint, "evidence": evidence }),
+            serde_json::json!({
+                "checkpoint": checkpoint,
+                "evidence": evidence,
+                "modified_pre_existing_tests": [],
+            }),
         )
     }
 
@@ -3394,7 +3520,8 @@ mod tests {
             serde_json::json!({
                 "checkpoint": checkpoint,
                 "evidence": evidence,
-                "abandoned": abandoned
+                "abandoned": abandoned,
+                "modified_pre_existing_tests": [],
             }),
         )
     }
@@ -3603,6 +3730,7 @@ mod tests {
             stop: WorkerStopReason::Finished,
             steps: 1,
             max_steps: 10,
+            max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
             diffstat: String::new(),
             usage,
             elapsed_millis: 0,
@@ -3664,6 +3792,7 @@ mod tests {
             instructions: "new work".to_string(),
             model: None,
             max_steps: 10,
+            max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -3720,6 +3849,7 @@ mod tests {
             instructions: "verify fresh".to_string(),
             model: None,
             max_steps: 10,
+            max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -3805,6 +3935,7 @@ mod tests {
             instructions: "continue merge".to_string(),
             model: None,
             max_steps: 10,
+            max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
             single_because: None,
             runs_full_suite: false,
             attacks: Vec::new(),
@@ -5182,6 +5313,107 @@ mod tests {
             outcome.response, "w1 report",
             "the run must not present the fallback-finalized trajectory as its answer"
         );
+    }
+
+    #[test]
+    fn finalize_modified_pre_existing_tests_ack_matches_bounces_then_allows_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("tests")).expect("create tests dir");
+        fs::create_dir_all(repo.join("src")).expect("create src dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("tests/existing_test.rs"), "old assertion\n").expect("write test");
+        fs::write(repo.join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n").expect("write src");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+        fs::write(repo.join("tests/existing_test.rs"), "changed assertion\n")
+            .expect("modify existing test");
+        fs::write(repo.join("tests/new_test.rs"), "new assertion\n").expect("write new test");
+        fs::write(repo.join("src/lib.rs"), "pub fn value() -> i32 { 2 }\n").expect("modify src");
+        let stage = SnapshotStage::new(&repo, &format!("test-{}", uuid::Uuid::new_v4()))
+            .expect("snapshot stage");
+        let checkpoint = stage.snapshot(&repo, "candidate").expect("snapshot");
+        let trace_path = temp.path().join("trace.jsonl");
+        let trace_run_id = format!("ack-{}", uuid::Uuid::new_v4());
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+        let _run_env = crate::openrouter_auth::test_support::EnvScope::set(
+            "ANVIL_TRACE_RUN_ID",
+            &trace_run_id,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (message, bounced, fresh_bounce) = runtime.block_on(
+            crate::trace_logging::with_trace_context_from_env(None, async {
+                let mut bounced = false;
+                let message = validate_modified_pre_existing_tests_ack(
+                    &stage,
+                    &base,
+                    &checkpoint,
+                    &["tests/other_test.rs".to_string()],
+                    &mut bounced,
+                )
+                .expect("validate")
+                .expect("mismatch bounces once");
+                assert!(
+                    validate_modified_pre_existing_tests_ack(
+                        &stage,
+                        &base,
+                        &checkpoint,
+                        &["tests/other_test.rs".to_string()],
+                        &mut bounced,
+                    )
+                    .expect("validate")
+                    .is_none(),
+                    "second mismatch is allowed after the one bounce is spent"
+                );
+
+                let mut fresh_bounce = false;
+                assert!(
+                    validate_modified_pre_existing_tests_ack(
+                        &stage,
+                        &base,
+                        &checkpoint,
+                        &["tests/existing_test.rs".to_string()],
+                        &mut fresh_bounce,
+                    )
+                    .expect("validate")
+                    .is_none(),
+                    "exact acknowledgment should pass"
+                );
+                (message, bounced, fresh_bounce)
+            }),
+        );
+
+        assert!(bounced);
+        assert!(message.contains("missing: [tests/existing_test.rs]"));
+        assert!(message.contains("extra: [tests/other_test.rs]"));
+        assert!(!fresh_bounce);
+
+        let records = fs::read_to_string(&trace_path)
+            .expect("trace jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .filter(|record| record["trace_run_id"] == trace_run_id)
+            .collect::<Vec<_>>();
+        assert!(records.iter().any(|record| {
+            record["type"] == "asgard_finalize_test_ack"
+                && record["actual"] == serde_json::json!(["tests/existing_test.rs"])
+                && record["bounced"] == serde_json::json!(true)
+        }));
+        assert!(records.iter().any(|record| {
+            record["type"] == "asgard_finalize_test_ack"
+                && record["matched"] == serde_json::json!(true)
+                && record["acknowledged"] == serde_json::json!(["tests/existing_test.rs"])
+        }));
     }
 
     /// The abort is keyed on the daily quota, not on "the supervisor errored".
@@ -6915,6 +7147,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -6940,6 +7173,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: crate::asgard::ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -6957,6 +7191,7 @@ mod tests {
                 idle_note: Some("No worker is awaiting review. Spawn workers or finalize."),
                 parent_status: &[],
                 survived_mutations: &[],
+                usage_by_model: &BTreeMap::new(),
             },
         );
 
@@ -7188,6 +7423,7 @@ mod tests {
                     target: "src/merge.rs boundary".to_string(),
                     worker: 7,
                 }],
+                usage_by_model: &BTreeMap::new(),
             },
         );
 
@@ -7224,7 +7460,18 @@ mod tests {
             test_window(4, CheckpointId::Root, "under review", TokenUsage::default());
         under_review.steps = 6;
         under_review.max_steps = 30;
+        under_review.elapsed_millis = 60_000;
         pending.insert(4, under_review);
+        let usage_by_model = BTreeMap::from([(
+            "worker-model".to_string(),
+            TokenUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                thought_tokens: 5,
+                cached_read_tokens: 3,
+                cached_write_tokens: 2,
+            },
+        )]);
 
         let rendered = render_asgard_status_block(
             &dag,
@@ -7236,6 +7483,7 @@ mod tests {
                 idle_note: None,
                 parent_status: &[],
                 survived_mutations: &[],
+                usage_by_model: &usage_by_model,
             },
         );
 
@@ -7244,6 +7492,12 @@ mod tests {
         assert!(
             rendered.contains("budgets: median 6/10 steps used across 4 windows; 2 capped\n"),
             "calibration line missing or wrong:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "spend: worker_wall_minutes=1; tokens_by_model: worker-model in=11 out=7 thought=5 cached_read=3 cached_write=2\n"
+            ),
+            "spend line missing or wrong:\n{rendered}"
         );
     }
 

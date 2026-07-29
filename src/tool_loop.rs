@@ -506,6 +506,9 @@ pub(crate) enum LoopStop {
     /// The loop used its entire `max_turns` budget without the model ending the
     /// turn -- the dominant "it just stopped" case for agentic work.
     MaxTurns { max_turns: usize },
+    /// A trajectory-window wall-clock lease expired. The loop gives the model
+    /// one final tool-free handoff turn after any in-flight tool batch returns.
+    TimeLimit,
     /// The session was cancelled (`session/cancel`) mid-turn.
     Cancelled,
     /// The turn ended because the LLM call or loop setup failed. Carries the
@@ -1795,6 +1798,7 @@ pub(crate) async fn run(
     tool_allowlist: Option<Arc<HashSet<String>>>,
     permission_override: Option<PermissionMode>,
     trajectory_window: bool,
+    trajectory_window_lease: Option<Duration>,
     turn_progress: Option<Arc<std::sync::atomic::AtomicUsize>>,
     context_length: Option<u32>,
     context_prefix_len: usize,
@@ -1906,6 +1910,8 @@ pub(crate) async fn run(
     let mut clean_exit: Option<LoopStop> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
+    let loop_started = Instant::now();
+    let mut time_limit_final_turn_used = false;
     if let Some(config) = p2t_config.as_ref() {
         p2t::append_prefix_messages(&mut messages, &prefix_steps);
         match p2t::reset_window_session_if_stale(
@@ -2002,6 +2008,13 @@ pub(crate) async fn run(
             clean_exit = Some(LoopStop::Cancelled);
             break;
         }
+        let time_limit_final_turn = trajectory_window_time_limit_notice(
+            trajectory_window,
+            p2t_config.is_some(),
+            time_limit_final_turn_used,
+            loop_started.elapsed(),
+            trajectory_window_lease,
+        );
         if let Some((config, forced_step)) = p2t_config
             .as_ref()
             .and_then(|config| config.forced_first_step.as_ref().map(|step| (config, step)))
@@ -2173,7 +2186,10 @@ pub(crate) async fn run(
         // (withholding tools would perturb the cached prefix), so a step
         // budget running out is instead flagged in-band as a harness user
         // message, one turn ahead of the deadline and again on it.
-        if let Some(notice) = trajectory_window_budget_notice(
+        if time_limit_final_turn {
+            messages.push(ChatMessage::user(TRAJECTORY_WINDOW_FINAL_NOTICE));
+            time_limit_final_turn_used = true;
+        } else if let Some(notice) = trajectory_window_budget_notice(
             trajectory_window,
             p2t_config.is_some(),
             turn,
@@ -2190,7 +2206,7 @@ pub(crate) async fn run(
             && p2t_config.is_none()
             && turn >= max_turns - 1
             && has_successful_file_change(&tool_exchanges);
-        let turn_tools = if !force_text_response && !tools.is_empty() {
+        let turn_tools = if !time_limit_final_turn && !force_text_response && !tools.is_empty() {
             Some(tools.clone())
         } else {
             None
@@ -2387,8 +2403,12 @@ pub(crate) async fn run(
                 // whole turn's visible output, not just this message, so a turn
                 // that streamed text before an earlier tool call isn't reported
                 // as a silent "empty completion".
-                clean_exit = Some(LoopStop::Completed {
-                    had_text: !full_response.trim().is_empty(),
+                clean_exit = Some(if time_limit_final_turn {
+                    LoopStop::TimeLimit
+                } else {
+                    LoopStop::Completed {
+                        had_text: !full_response.trim().is_empty(),
+                    }
                 });
                 break;
             }
@@ -2630,6 +2650,9 @@ pub(crate) async fn run(
             p2t_stop_reason.expect("checked above"),
             p2t_steps_executed,
         );
+    }
+    if time_limit_final_turn_used && clean_exit.is_none() && llm_failure.is_none() {
+        clean_exit = Some(LoopStop::TimeLimit);
     }
     if let Some(config) = p2t_config.as_ref() {
         p2t::append_debug_trace(
@@ -5021,6 +5044,19 @@ fn trajectory_window_budget_notice(
     }
 }
 
+fn trajectory_window_time_limit_notice(
+    trajectory_window: bool,
+    p2t_config_present: bool,
+    already_used: bool,
+    elapsed: Duration,
+    lease: Option<Duration>,
+) -> bool {
+    trajectory_window
+        && !p2t_config_present
+        && !already_used
+        && lease.is_some_and(|lease| elapsed >= lease)
+}
+
 fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     tool_exchanges.iter().any(|exchange| {
         matches!(exchange.tool_name.as_str(), "edit" | "write_file")
@@ -5714,6 +5750,7 @@ async fn execute_subagent(
         false,
         None,
         None,
+        None,
         usize::MAX,
         None,
     ))
@@ -5769,6 +5806,9 @@ fn subagent_failure_message(subagent_name: &str, stop: &LoopStop) -> Option<Stri
         LoopStop::MaxTurns { max_turns } => Some(format!(
             "Error: subagent '{subagent_name}' stopped after reaching its {max_turns}-turn \
              limit without returning a result."
+        )),
+        LoopStop::TimeLimit => Some(format!(
+            "Error: subagent '{subagent_name}' stopped after reaching its time limit without returning a result."
         )),
         LoopStop::Cancelled => Some(format!(
             "Error: subagent '{subagent_name}' was cancelled before returning a result."
@@ -6151,10 +6191,61 @@ mod tests {
     }
 
     #[test]
+    fn trajectory_window_time_limit_notice_triggers_once_after_lease() {
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(59),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            true,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+        ));
+    }
+
+    #[test]
+    fn trajectory_window_time_limit_notice_skips_non_windows_p2t_and_absent_lease() {
+        assert!(!trajectory_window_time_limit_notice(
+            false,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            true,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            None,
+        ));
+    }
+
+    #[test]
     fn loop_stop_exposes_failure_only_for_failed() {
         assert!(LoopStop::Completed { had_text: true }.failure().is_none());
         assert!(LoopStop::Completed { had_text: false }.failure().is_none());
         assert!(LoopStop::MaxTurns { max_turns: 5 }.failure().is_none());
+        assert!(LoopStop::TimeLimit.failure().is_none());
         assert!(LoopStop::Cancelled.failure().is_none());
 
         let failed = LoopStop::Failed(TurnFailure {

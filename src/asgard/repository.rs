@@ -819,6 +819,22 @@ impl SnapshotStage {
         self.finalize_patch_guarded(base_commit, checkpoint_commit, test_file_guard_enabled())
     }
 
+    pub(crate) fn modified_pre_existing_test_paths(
+        &self,
+        base_commit: &str,
+        checkpoint_commit: &str,
+    ) -> Result<Vec<String>> {
+        let mut paths = self
+            .touched_test_files(base_commit, checkpoint_commit)?
+            .into_iter()
+            .filter(|file| file.pre_existing)
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     /// [`finalize_patch`](Self::finalize_patch) with the env gate already
     /// resolved, so tests can exercise both sides without mutating the
     /// process environment.

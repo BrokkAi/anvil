@@ -362,7 +362,7 @@ fn acp_stop_reason(stop: &crate::tool_loop::LoopStop, cancelled: bool) -> StopRe
         return StopReason::Cancelled;
     }
     match stop {
-        LoopStop::MaxTurns { .. } => StopReason::MaxTurnRequests,
+        LoopStop::MaxTurns { .. } | LoopStop::TimeLimit => StopReason::MaxTurnRequests,
         // A `Failed` turn already streamed its `**Error:**` line to the user, so
         // `EndTurn` is the honest "the turn is over" signal; ACP has no generic
         // "errored" stop reason.
@@ -4642,6 +4642,7 @@ async fn run_model_turn_in_spawn(
                 None,
                 None,
                 false,
+                None,
                 None,
                 context_length,
                 context_prefix_len,

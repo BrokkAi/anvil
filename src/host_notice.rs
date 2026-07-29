@@ -27,6 +27,9 @@ pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
         LoopStop::Completed { had_text: false } => Some(format!(
             "{STOP_NOTICE_SENTINEL}Stopped: the model ended the turn without a final message.\n"
         )),
+        LoopStop::TimeLimit => Some(format!(
+            "{STOP_NOTICE_SENTINEL}Stopped: reached the time limit before the model finished. Send another message to continue.\n"
+        )),
         LoopStop::Completed { had_text: true } | LoopStop::Cancelled | LoopStop::Failed(_) => None,
     }
 }
@@ -58,6 +61,7 @@ fn describe_loop_stop_for_recap(stop: &LoopStop) -> String {
         LoopStop::MaxTurns { max_turns } => {
             format!("stopped at the {max_turns}-turn limit")
         }
+        LoopStop::TimeLimit => "stopped at the time limit".to_string(),
         LoopStop::Cancelled => "cancelled".to_string(),
         LoopStop::Failed(failure) if failure.retryable => "retryable model failure".to_string(),
         LoopStop::Failed(_) => "model failure".to_string(),

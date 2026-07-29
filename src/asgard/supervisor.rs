@@ -17,6 +17,13 @@ pub(crate) const ASGARD_BATCH_CAP: usize = 8;
 /// the capped window's own checkpoint (`prefix_from` that window), which costs
 /// one spawn and keeps the supervisor in the loop between windows.
 pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 75;
+/// Default wall-clock lease for a single worker window.
+///
+/// Probe sl3 timed out after workers burned 43 minutes inside 9 steps and
+/// 38 minutes inside 31 steps polling unfinishable suites; a step lease is
+/// not a time lease.
+pub(crate) const ASGARD_WORKER_DEFAULT_MAX_MINUTES: usize = 15;
+pub(crate) const ASGARD_WORKER_MAX_MINUTES_CEILING: usize = 30;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 pub(crate) const ASGARD_SINGLE_BECAUSE_MAX_LENGTH: usize = 300;
@@ -99,6 +106,9 @@ pub(crate) struct SpawnRequest {
     /// Required on every supervisor-issued worker spec: there is no harness
     /// default. Capped at [`ASGARD_WORKER_MAX_STEPS_CEILING`].
     pub(crate) max_steps: usize,
+    /// Optional in the supervisor schema; absent means
+    /// [`ASGARD_WORKER_DEFAULT_MAX_MINUTES`].
+    pub(crate) max_minutes: usize,
     /// When continuing width-1 after repeated width-1 turns: one sentence
     /// naming why exactly one continuation is live. See
     /// `ASGARD_SINGLE_BECAUSE_MAX_LENGTH` for the schema-enforced cap.
@@ -133,6 +143,7 @@ pub(crate) struct FinalizeRequest {
     pub(crate) response: Option<String>,
     pub(crate) evidence: Vec<String>,
     pub(crate) abandoned: Vec<String>,
+    pub(crate) modified_pre_existing_tests: Vec<String>,
 }
 
 pub(crate) struct SupervisorTurnContext<'a> {
@@ -163,9 +174,9 @@ pub(crate) fn supervisor_supplement() -> String {
         r#"# Asgard supervision
 
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
-- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs for exactly the max_steps you set it (one step = one batch of tool calls) - the budget is required on every worker and capped at {worker_ceiling}; long serial work proceeds by continuation, not by one enormous window. A worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
+- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs for exactly the max_steps you set it (one step = one batch of tool calls) - the budget is required on every worker and capped at {worker_ceiling}; long serial work proceeds by continuation, not by one enormous window. Each worker window also carries a wall-clock lease; a time-capped worker is a normal handoff, like a step-capped worker. A worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
 Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
-- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. When you resolve a prefinalize sibling (save_checkpoint or discard) you must pass mutations: one {{target, outcome}} entry per plant that worker made, or an empty array if it made none. A survived plant names a path in the delivery that no oracle checks; it stays in your status block as SURVIVED MUTANT until close_mutation records what happened to it, and finalize reports any still open. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
+- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. A full-suite run that has already timed out once is discharged as full_suite_skipped citing the observed output; never retry it with a longer timeout. When you resolve a prefinalize sibling (save_checkpoint or discard) you must pass mutations: one {{target, outcome}} entry per plant that worker made, or an empty array if it made none. A survived plant names a path in the delivery that no oracle checks; it stays in your status block as SURVIVED MUTANT until close_mutation records what happened to it, and finalize reports any still open. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
 - code intelligence - search_symbols, get_summaries, get_symbol_sources, usage_graph, scan_usages_by_location, get_definitions_by_location, semantic search, and more: read-only Bifrost tools indexing the repository at its base state. Use them to UNDERSTAND before you direct: find the symbols, files, and call sites your task touches so your worker mandates name exact functions and locations instead of describing them. activate_workspace switches Bifrost to another path (for example your git scratch worktree after you check out a checkpoint's hash) to analyze a specific candidate's code.
@@ -189,7 +200,7 @@ Budget modestly: a capped worker is normal, not a failure. Continuing one costs 
 
 Batch composition: default to parallel batches, not a lone worker. Whenever the work has two or more independent parts, spawn one worker per part in the same batch and merge the results with the git tool; a single-worker turn is justified only when the next step genuinely depends on the last result. Enumerate the separable groups of files an implementation would touch before you spawn: when the work splits into such groups, spawn one worker per group in the same batch, land any file two groups would both edit in a precursor first, and aim the redundant pair (below) at the riskiest contract area - the densest edge surface or the requirement with the least repository evidence. Plan the split so the same files are not edited twice and merges stay clean. If independent parts share a file, land the shared file first in a quick precursor worker, then split from that checkpoint. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Deliberate redundancy is different: for the riskiest core of the contract - the densest edge surface, the most contested ambiguities - spawn two workers in the same batch to implement that same contract independently from different vantages you name (one from the spec's data model outward, one from the test cases inward), each working from the task text itself. Their tests and behavior will diverge precisely on the edges nobody knew were ambiguous and on slips a single worker's self-tests cannot see. When siblings have implemented the same contract, harvest that divergence before resolving the batch: spawn a differential worker from one sibling's checkpoint that checks out the other sibling's test files directly from its commit (git checkout <sha> -- <paths>) and runs them against the implementation it is standing in. Every cross-sibling failure is an ambiguity two readings resolved differently - adjudicate it against the task text, never by majority or by trusting whichever implementation looks cleaner. Fact-finding stays cheap throughout: short workers that answer questions ("find how X is implemented; report file and line"), variants branched from a good checkpoint, losses cut early, instructions explicit and testable.
 
-Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written at the start. If that evidence does not exist yet, your prefinalize batch must produce it. A plant is only evidence after re-checking the expected behavior against the spec text or an existing reference implementation - a self-authored test that encodes your own misreading will catch the correct code as the bug. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
+Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written at the start. If that evidence does not exist yet, your prefinalize batch must produce it. A plant is only evidence after re-checking the expected behavior against the spec text or an existing reference implementation - a self-authored test that encodes your own misreading will catch the correct code as the bug. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the test targets that cover the changed code, or a stated reason they cannot be run; a monorepo root CI gate such as lint plus multi-version type builds is not a per-change obligation. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
         workers = ASGARD_BATCH_CAP,
         worker_ceiling = ASGARD_WORKER_MAX_STEPS_CEILING
@@ -235,6 +246,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                                         "enum": allowed_models,
                                     },
                                     "max_steps": max_steps_property(),
+                                    "max_minutes": max_minutes_property(),
                                     "single_because": {
                                         "type": "string",
                                         "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
@@ -312,7 +324,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["checkpoint"],
+                    "required": ["checkpoint", "modified_pre_existing_tests"],
                     "properties": {
                         "checkpoint": { "type": "string" },
                         "response": { "type": "string" },
@@ -325,6 +337,11 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "checkpoint ids you are deliberately leaving out of the delivered lineage",
+                        },
+                        "modified_pre_existing_tests": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Required acknowledgment of pre-existing test files modified by the delivered checkpoint; empty array when none.",
                         },
                     },
                 }),
@@ -389,6 +406,15 @@ fn max_steps_property() -> serde_json::Value {
         "minimum": 1,
         "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
         "description": format!("Required. Step budget for this worker (one step = one batch of tool calls), from 1 to {ASGARD_WORKER_MAX_STEPS_CEILING}. Budgets are capped at {ASGARD_WORKER_MAX_STEPS_CEILING}; long serial work proceeds by continuation - spawn again from the capped window. Measured calibration: recon/probe 5-10; spec-test authorship 20-25; verification 25-30; focused fix 30-40; component implementation 35-50. Workers consume every step you grant regardless of assignment size, so full usage is not evidence of need - budget modestly and continue."),
+    })
+}
+
+fn max_minutes_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": ASGARD_WORKER_MAX_MINUTES_CEILING,
+        "description": format!("Optional wall-clock lease for this worker window, in minutes, from 1 to {ASGARD_WORKER_MAX_MINUTES_CEILING}. Defaults to {ASGARD_WORKER_DEFAULT_MAX_MINUTES} when omitted. A time-capped worker reports exact state and can be continued from its checkpoint."),
     })
 }
 
@@ -470,6 +496,7 @@ fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
                             "enum": allowed_models,
                         },
                         "max_steps": max_steps_property(),
+                        "max_minutes": max_minutes_property(),
                         "single_because": {
                             "type": "string",
                             "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
@@ -690,6 +717,20 @@ fn parse_spawn_worker(
             if text.is_empty() { None } else { Some(text) }
         }
     };
+    let max_minutes = match worker.get("max_minutes") {
+        None | Some(serde_json::Value::Null) => ASGARD_WORKER_DEFAULT_MAX_MINUTES,
+        Some(value) => {
+            let minutes = value
+                .as_u64()
+                .ok_or_else(|| format!("workers[{index}].max_minutes must be an integer"))?;
+            if minutes < 1 || minutes > ASGARD_WORKER_MAX_MINUTES_CEILING as u64 {
+                return Err(format!(
+                    "workers[{index}].max_minutes must be between 1 and {ASGARD_WORKER_MAX_MINUTES_CEILING}"
+                ));
+            }
+            minutes as usize
+        }
+    };
     let runs_full_suite = if parse_coverage {
         match worker.get("runs_full_suite") {
             None | Some(serde_json::Value::Null) => false,
@@ -730,6 +771,7 @@ fn parse_spawn_worker(
         instructions,
         model,
         max_steps,
+        max_minutes,
         single_because,
         runs_full_suite,
         attacks,
@@ -809,11 +851,14 @@ pub(crate) fn parse_finalize(
         Some(_) => string_array_property(&arguments, "abandoned")?,
         None => Vec::new(),
     };
+    let modified_pre_existing_tests =
+        string_array_property(&arguments, "modified_pre_existing_tests")?;
     Ok(FinalizeRequest {
         checkpoint,
         response,
         evidence,
         abandoned,
+        modified_pre_existing_tests,
     })
 }
 
@@ -1103,6 +1148,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1235,6 +1281,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1258,6 +1305,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1489,6 +1537,7 @@ mod tests {
         // Prefinalize keeps the shared worker fields after the schema split.
         assert!(worker_properties.get("prefix_from").is_some());
         assert!(worker_properties.get("max_steps").is_some());
+        assert!(worker_properties.get("max_minutes").is_some());
         assert!(worker_properties.get("single_because").is_some());
 
         let spawn_workers = tools
@@ -1499,6 +1548,7 @@ mod tests {
         let spawn_worker_properties =
             &spawn_parameters["properties"]["workers"]["items"]["properties"];
         assert!(spawn_worker_properties.get("prefix_from").is_some());
+        assert!(spawn_worker_properties.get("max_minutes").is_some());
         assert!(spawn_worker_properties.get("runs_full_suite").is_none());
         assert!(spawn_worker_properties.get("attacks").is_none());
         assert!(
@@ -1529,6 +1579,18 @@ mod tests {
             assert_eq!(max_steps["type"], "integer");
             assert_eq!(max_steps["minimum"], 1);
             assert_eq!(max_steps["maximum"], ASGARD_WORKER_MAX_STEPS_CEILING);
+            let max_minutes = &items["properties"]["max_minutes"];
+            assert_eq!(max_minutes["type"], "integer");
+            assert_eq!(max_minutes["minimum"], 1);
+            assert_eq!(max_minutes["maximum"], ASGARD_WORKER_MAX_MINUTES_CEILING);
+            assert!(
+                !items["required"]
+                    .as_array()
+                    .expect("required array")
+                    .iter()
+                    .any(|field| field == "max_minutes"),
+                "{tool_name} must keep max_minutes optional"
+            );
         }
     }
 
@@ -1615,6 +1677,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spawn_parser_defaults_and_parses_max_minutes() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            pending_parents: &[],
+            allowed_models: &[],
+        };
+        let call = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [
+                    { "from": "root", "instructions": "default lease", "max_steps": 10 },
+                    { "from": "root", "instructions": "explicit lease", "max_steps": 10, "max_minutes": 7 }
+                ]
+            }),
+        );
+
+        let spawns = parse_spawn_workers(&call, &context).expect("valid leases");
+
+        assert_eq!(spawns[0].max_minutes, ASGARD_WORKER_DEFAULT_MAX_MINUTES);
+        assert_eq!(spawns[1].max_minutes, 7);
+    }
+
+    #[test]
+    fn prefinalize_parser_rejects_over_ceiling_max_minutes() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            pending_parents: &[],
+            allowed_models: &[],
+        };
+        let call = supervisor_tool_call(
+            "prefinalize",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "w1",
+                    "instructions": "verify",
+                    "max_steps": 10,
+                    "max_minutes": ASGARD_WORKER_MAX_MINUTES_CEILING + 1,
+                    "runs_full_suite": true
+                }]
+            }),
+        );
+
+        let error = parse_prefinalize(&call, &context).expect_err("over ceiling");
+
+        assert_eq!(
+            error,
+            format!(
+                "workers[0].max_minutes must be between 1 and {ASGARD_WORKER_MAX_MINUTES_CEILING}"
+            )
+        );
+    }
+
     /// The ceiling is not a taste call: it is half the measured p75
     /// steps-to-solve of a vanilla agent on this corpus (147 / 2, rounded).
     #[test]
@@ -1694,7 +1815,8 @@ mod tests {
             serde_json::json!({
                 "checkpoint": "w4",
                 "response": "done",
-                "abandoned": ["w1"]
+                "abandoned": ["w1"],
+                "modified_pre_existing_tests": ["tests/existing_test.rs"]
             }),
         );
 
@@ -1704,6 +1826,10 @@ mod tests {
         assert_eq!(parsed.response.as_deref(), Some("done"));
         assert!(parsed.evidence.is_empty());
         assert_eq!(parsed.abandoned, vec!["w1".to_string()]);
+        assert_eq!(
+            parsed.modified_pre_existing_tests,
+            vec!["tests/existing_test.rs".to_string()]
+        );
     }
 
     fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1770,6 +1896,7 @@ mod tests {
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 max_steps: 10,
+                max_minutes: ASGARD_WORKER_DEFAULT_MAX_MINUTES,
                 diffstat: String::new(),
                 oracles: WindowOracles::default(),
                 usage: TokenUsage::default(),
@@ -1781,15 +1908,18 @@ mod tests {
         .unwrap();
         let ctx = context(&dag, &[]);
 
-        let by_full_sha =
-            supervisor_tool_call("f1", FINALIZE_TOOL, serde_json::json!({ "checkpoint": c1 }));
+        let by_full_sha = supervisor_tool_call(
+            "f1",
+            FINALIZE_TOOL,
+            serde_json::json!({ "checkpoint": c1, "modified_pre_existing_tests": [] }),
+        );
         let parsed = parse_finalize(&by_full_sha, &ctx).expect("full sha resolves");
         assert_eq!(parsed.checkpoint, CheckpointId::Worker(1));
 
         let by_short_sha = supervisor_tool_call(
             "f2",
             FINALIZE_TOOL,
-            serde_json::json!({ "checkpoint": &c1[..10] }),
+            serde_json::json!({ "checkpoint": &c1[..10], "modified_pre_existing_tests": [] }),
         );
         let parsed = parse_finalize(&by_short_sha, &ctx).expect("short sha resolves");
         assert_eq!(
@@ -1801,7 +1931,7 @@ mod tests {
         let unknown = supervisor_tool_call(
             "f3",
             FINALIZE_TOOL,
-            serde_json::json!({ "checkpoint": "not-a-known-ref" }),
+            serde_json::json!({ "checkpoint": "not-a-known-ref", "modified_pre_existing_tests": [] }),
         );
         assert!(parse_finalize(&unknown, &ctx).is_err());
     }
@@ -2149,6 +2279,8 @@ mod tests {
         let supplement = supervisor_supplement();
 
         assert!(supplement.contains("the budget is required on every worker and capped at 75"));
+        assert!(supplement.contains("window also carries a wall-clock lease"));
+        assert!(supplement.contains("a time-capped worker is a normal handoff"));
         assert!(supplement.contains("long serial work proceeds by continuation"));
         assert!(supplement.contains("Budget modestly: a capped worker is normal, not a failure"));
         assert!(supplement.contains("costs a single spawn from its own window (prefix_from"));
@@ -2184,6 +2316,8 @@ mod tests {
         assert!(supplement.contains("mark your full-suite worker with runs_full_suite"));
         assert!(supplement.contains("broadest attack"));
         assert!(supplement.contains("or state full_suite_skipped"));
+        assert!(supplement.contains("already timed out once is discharged as full_suite_skipped"));
+        assert!(supplement.contains("never retry it with a longer timeout"));
         assert!(supplement.contains("Refutations name attacks, not reassurance"));
         assert!(supplement.contains("Dictated code is a belief too"));
     }
@@ -2202,6 +2336,15 @@ mod tests {
         assert!(description.contains("confirmed by inspecting the diff"));
         assert!(description.contains("hung or timed-out verification run is a blocker"));
         assert!(description.contains("Never substitute a weaker ad-hoc check"));
+    }
+
+    #[test]
+    fn supervisor_supplement_scopes_completion_evidence_to_changed_code_targets() {
+        let supplement = supervisor_supplement();
+
+        assert!(supplement.contains("test targets that cover the changed code"));
+        assert!(supplement.contains("a monorepo root CI gate"));
+        assert!(supplement.contains("is not a per-change obligation"));
     }
 
     #[test]

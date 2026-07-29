@@ -94,6 +94,7 @@ impl FromStr for CheckpointId {
 pub(crate) enum WorkerStopReason {
     Finished,
     StepLimit,
+    TimeLimit,
     Failed(String),
     Cancelled,
 }
@@ -103,10 +104,17 @@ impl WorkerStopReason {
         match self {
             Self::Finished => "finished",
             Self::StepLimit => "step_limit",
+            Self::TimeLimit => "time_limit",
             Self::Failed(_) => "failed",
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowCap {
+    Step,
+    Time,
 }
 
 /// Whether a window ended because its budget ran out rather than because the
@@ -129,12 +137,17 @@ impl WorkerStopReason {
 /// `Failed` and `Cancelled` windows ended for their own reasons and are never
 /// reported as capped.
 pub(crate) fn window_capped(window: &TrajectoryWindow) -> bool {
+    window_cap(window).is_some()
+}
+
+pub(crate) fn window_cap(window: &TrajectoryWindow) -> Option<WindowCap> {
     match window.stop {
-        WorkerStopReason::StepLimit => true,
-        WorkerStopReason::Finished => {
-            window.max_steps > 0 && window.steps.saturating_add(1) >= window.max_steps
-        }
-        WorkerStopReason::Failed(_) | WorkerStopReason::Cancelled => false,
+        WorkerStopReason::StepLimit => Some(WindowCap::Step),
+        WorkerStopReason::TimeLimit => Some(WindowCap::Time),
+        WorkerStopReason::Finished => (window.max_steps > 0
+            && window.steps.saturating_add(1) >= window.max_steps)
+            .then_some(WindowCap::Step),
+        WorkerStopReason::Failed(_) | WorkerStopReason::Cancelled => None,
     }
 }
 
@@ -154,6 +167,8 @@ pub(crate) struct TrajectoryWindow {
     /// The step budget the supervisor gave this worker. Always set: the
     /// supervisor must budget every worker it spawns.
     pub(crate) max_steps: usize,
+    /// The wall-clock lease the supervisor gave this worker, in minutes.
+    pub(crate) max_minutes: usize,
     pub(crate) diffstat: String,
     /// What this window did to test files (see [`WindowOracles`]).
     pub(crate) oracles: WindowOracles,
@@ -722,20 +737,31 @@ pub(crate) fn render_fragment(
         rendered.push_str(&format!(" parent_commit=\"{}\"", short_sha(parent_commit)));
     }
     rendered.push_str(&format!(
-        " model=\"{}\" stop=\"{}\" steps=\"{}\" budget=\"{}\">\n",
+        " model=\"{}\" stop=\"{}\" steps=\"{}\" budget=\"{}\" max_minutes=\"{}\">\n",
         escape_attribute(&window.model),
         window.stop.label(),
         window.steps,
-        window.max_steps
+        window.max_steps,
+        window.max_minutes
     ));
     // Loud on its own line, not an attribute: a window that ran out of budget
     // is a handoff, and reading its forced report as a finished result is the
     // single most expensive mistake available here.
-    if window_capped(window) {
-        rendered.push_str(&format!(
-            "CAPPED: this window used its whole step budget ({}/{}; the last step is reserved for the report). The report below was forced by the budget, not volunteered - read it as a handoff and continue this trajectory if the work is unfinished.\n",
-            window.steps, window.max_steps
-        ));
+    match window_cap(window) {
+        Some(WindowCap::Step) => {
+            rendered.push_str(&format!(
+                "CAPPED (step): this window used its whole step budget ({}/{}; the last step is reserved for the report). The report below was forced by the budget, not volunteered - read it as a handoff and continue this trajectory if the work is unfinished.\n",
+                window.steps, window.max_steps
+            ));
+        }
+        Some(WindowCap::Time) => {
+            rendered.push_str(&format!(
+                "CAPPED (time): this window exceeded its wall-clock lease ({} minute{}). The report below was forced by the lease, not volunteered - read it as a handoff and continue this trajectory if the work is unfinished.\n",
+                window.max_minutes,
+                if window.max_minutes == 1 { "" } else { "s" }
+            ));
+        }
+        None => {}
     }
     rendered.push_str(&format!(
         "<instructions>{}</instructions>\n",
@@ -1085,6 +1111,7 @@ mod tests {
             stop: WorkerStopReason::Finished,
             steps: 2,
             max_steps: 10,
+            max_minutes: 15,
             diffstat: String::new(),
             oracles: WindowOracles::default(),
             usage: TokenUsage::default(),
@@ -1284,7 +1311,7 @@ mod tests {
         trajectory.diffstat = " src/lib.rs | 2 +".to_string();
         let rendered = render_fragment(&trajectory, None, None);
         assert!(rendered.contains(
-            r#"<worker_trajectory id="w3" continues_from="root" model="model-a" stop="finished" steps="2" budget="10">"#
+            r#"<worker_trajectory id="w3" continues_from="root" model="model-a" stop="finished" steps="2" budget="10" max_minutes="15">"#
         ));
         assert!(rendered.contains("<diffstat> src/lib.rs | 2 +</diffstat>"));
         assert!(rendered.contains(&trajectory.final_response));
@@ -1316,7 +1343,7 @@ mod tests {
         hard_limit.max_steps = 10;
         hard_limit.stop = WorkerStopReason::StepLimit;
         let rendered = render_fragment(&hard_limit, None, None);
-        assert!(rendered.contains("CAPPED: this window used its whole step budget (10/10;"));
+        assert!(rendered.contains("CAPPED (step): this window used its whole step budget (10/10;"));
 
         // Obeyed the final-step notice and reported instead of calling tools:
         // the stop reason says "finished", but the budget is what ended it.
@@ -1325,7 +1352,17 @@ mod tests {
         forced_report.max_steps = 10;
         forced_report.stop = WorkerStopReason::Finished;
         let rendered = render_fragment(&forced_report, None, None);
-        assert!(rendered.contains("CAPPED: this window used its whole step budget (9/10;"));
+        assert!(rendered.contains("CAPPED (step): this window used its whole step budget (9/10;"));
+
+        let mut time_limit = window(7, CheckpointId::Root, "time limit");
+        time_limit.max_minutes = 3;
+        time_limit.stop = WorkerStopReason::TimeLimit;
+        let rendered = render_fragment(&time_limit, None, None);
+        assert!(
+            rendered
+                .contains("CAPPED (time): this window exceeded its wall-clock lease (3 minutes).")
+        );
+        assert!(!rendered.contains("CAPPED (step):"));
 
         // A window that failed or was cancelled ended for its own reason.
         let mut failed = window(6, CheckpointId::Root, "failed");
@@ -1350,10 +1387,11 @@ mod tests {
         add(1, 3, 12, WorkerStopReason::Finished);
         add(2, 40, 40, WorkerStopReason::StepLimit);
         add(3, 4, 20, WorkerStopReason::Finished);
+        add(4, 5, 30, WorkerStopReason::TimeLimit);
 
         assert_eq!(
             render_budget_calibration(windows.iter()).as_deref(),
-            Some("budgets: median 4/20 steps used across 3 windows; 1 capped\n")
+            Some("budgets: median 4/20 steps used across 4 windows; 2 capped\n")
         );
 
         // One window reads in the singular.
