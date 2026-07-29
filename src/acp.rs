@@ -4903,15 +4903,20 @@ fn build_system_prompt(
     let mode_prompt = match mode {
         SessionMode::Lutz => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering, but you can help with any task the user brings to you. Work the task \
-             to completion: investigate with your tools, make the changes, verify them, and \
-             report the result."
+             software engineering, but you can help with any task the user brings to you. You and the \
+             user share this workspace and collaborate on the project in it. Treat the working directory \
+             as the primary project context. Inspect the repository and its instructions, configuration, \
+             and existing conventions before making assumptions about how it works. Work the task to \
+             completion: investigate with your tools, make the changes, verify them, and report the result."
         }
         SessionMode::Plan => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering, but you can help with any task the user brings to you. In this mode, \
-             focus on planning: analyze requirements, design solutions, and create implementation \
-             plans. Do not write code directly."
+             software engineering, but you can help with any task the user brings to you. You and the \
+             user share this workspace and collaborate on the project in it. Treat the working directory \
+             as the primary project context. Inspect the repository and its instructions, configuration, \
+             and existing conventions before making assumptions about how it works. In this mode, focus \
+             on planning: analyze requirements, design solutions, and create implementation plans. Do not \
+             write code directly."
         }
     };
 
@@ -10615,6 +10620,12 @@ mod tests {
             assert!(
                 prompt.contains("any task the user brings to you"),
                 "system prompt for {mode:?} must use the general-purpose identity opening, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("share this workspace")
+                    && prompt.contains("primary project context")
+                    && prompt.contains("Inspect the repository"),
+                "system prompt for {mode:?} must explain the shared project workspace, got: {prompt}"
             );
             assert!(
                 !prompt.contains("AI coding assistant"),
