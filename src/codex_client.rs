@@ -864,8 +864,14 @@ fn chatgpt_http_error(status: reqwest::StatusCode, body: String) -> anyhow::Erro
             .context(message);
     }
     if crate::http_retry::contains_standard_transient_marker(&body) {
+        // Same tier as the Responses path and the status path: these markers
+        // are body-borne 5xx/429 equivalents. Keeping this on Fast was the
+        // tier inconsistency where one error string meant different patience
+        // depending on which provider path produced it.
         return error
-            .context(RetryableLlmError::fast("standard transient response body"))
+            .context(RetryableLlmError::gateway_transient(
+                "standard transient response body",
+            ))
             .context(message);
     }
     error

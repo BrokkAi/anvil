@@ -2541,13 +2541,16 @@ mod tests {
         );
         assert!(is_retryable_llm_error(&gateway));
 
+        // Body-borne 5xx/429 equivalents earn the patient tier, same as the
+        // status path and the codex path: one error string must not mean
+        // different patience depending on which provider path produced it.
         let standard = crate::http_retry::retryable_llm_error_for_responses_failure(
             "Responses stream failed: server_error: overloaded",
             "server_error: overloaded",
         );
         assert_eq!(
             llm_retry_tier(&standard),
-            Some(crate::http_retry::LlmRetryTier::Fast)
+            Some(crate::http_retry::LlmRetryTier::GatewayTransient)
         );
 
         let validation =

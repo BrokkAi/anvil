@@ -221,9 +221,16 @@ pub(crate) fn retryable_llm_error_for_responses_failure(
         return error;
     }
     if contains_standard_transient_marker(failure) {
+        // These markers are the body-borne equivalent of a 5xx/429 status
+        // (see `contains_standard_transient_marker`), so they earn the same
+        // patient tier the status path already gets. Measured 2026-07-30 on a
+        // sol-primary sweep: transient `server_error` streams exhausted the
+        // Fast budget (~1.4s across 4 attempts), killed attempts nine turns
+        // deep, and surfaced as harness-level infra restarts on 16 of 24
+        // tasks — a provider blip should not discard an hour of work.
         return retryable_llm_error(
             message,
-            RetryableLlmError::fast("Responses stream transient failure"),
+            RetryableLlmError::gateway_transient("Responses stream transient failure"),
         );
     }
     anyhow::anyhow!(message)
