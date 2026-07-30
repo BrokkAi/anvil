@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use crate::llm_client::{
     ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
     StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
-    is_retryable_llm_error, llm_retry_tier, messages_include_images,
-    rewrite_image_prompt_provider_error,
+    is_output_budget_exhausted_error, is_retryable_llm_error, llm_retry_tier,
+    messages_include_images, rewrite_image_prompt_provider_error,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 
@@ -53,6 +53,19 @@ pub(crate) const TRAJECTORY_WINDOW_FINAL_NOTICE: &str = "Budget notice: this is 
     output, what remains, and precisely where you stopped. Unfinished is normal and expected; \
     the supervisor can continue this trajectory from its checkpoint, and only your report tells \
     it where to resume. Do not call tools; results from this step would never be seen.";
+/// Injected after a response that spent its entire output allowance on
+/// thinking without emitting a tool call -- see
+/// [`should_recover_output_budget`].
+pub(crate) const OUTPUT_BUDGET_RECOVERY_NOTICE: &str = "Your previous response reached the \
+    output token limit before it produced a tool call, so it was discarded and you are seeing \
+    none of its work. Respond more concisely and end this response with a tool call. If you \
+    need to think further, do so briefly, and take the next concrete step rather than planning \
+    the whole remaining task in one response.";
+/// How many consecutive output-budget recoveries a turn will attempt before
+/// giving up and failing. A model in a deliberation spiral usually breaks out
+/// after one nudge; an unbounded retry would instead spend the whole turn
+/// budget on responses that are never seen.
+const MAX_OUTPUT_BUDGET_RECOVERIES: usize = 3;
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 const MAX_PARALLEL_SAFE_TOOL_CALLS: usize = 6;
@@ -1910,6 +1923,9 @@ pub(crate) async fn run(
     let mut clean_exit: Option<LoopStop> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
+    // Consecutive output-budget recoveries. Reset by any usable response, so
+    // the cap bounds a spiral rather than the whole turn.
+    let mut output_budget_recovery_count = 0usize;
     let loop_started = Instant::now();
     let mut time_limit_final_turn_used = false;
     if let Some(config) = p2t_config.as_ref() {
@@ -2266,6 +2282,9 @@ pub(crate) async fn run(
                 reasoning_content,
                 usage,
             }) => {
+                // A usable response ends any spiral, so the recovery budget
+                // bounds consecutive failures rather than the whole turn.
+                output_budget_recovery_count = 0;
                 trace_llm_text_response(turn, &text, usage);
                 let assistant_message =
                     ChatMessage::assistant_with_reasoning(text.clone(), reasoning_content);
@@ -2418,6 +2437,7 @@ pub(crate) async fn run(
                 calls,
                 usage,
             }) => {
+                output_budget_recovery_count = 0;
                 let calls = normalize_llm_tool_calls(calls);
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 if let Some(config) = p2t_config.as_ref() {
@@ -2607,6 +2627,38 @@ pub(crate) async fn run(
                     }
                     clean_exit = Some(LoopStop::Cancelled);
                     break;
+                }
+                // The model spent its whole output allowance on thinking and
+                // never reached a tool call, so the response was discarded.
+                // That is a deliberation spiral, not an outage: the request
+                // was well-formed and the provider was healthy, and a plain
+                // retry would reproduce it exactly (which is why the backends
+                // classify it non-retryable). Tell the model its work was
+                // thrown away and ask for a terser step, then spend another
+                // turn -- the same recovery mini-swe-agent performs on
+                // `finish_reason == "length"`. Bounded, so a model that never
+                // converges fails the turn instead of burning every turn on
+                // responses no one ever sees.
+                if should_recover_output_budget(&e, output_budget_recovery_count) {
+                    output_budget_recovery_count += 1;
+                    append_trace_record(serde_json::json!({
+                        "type": "output_budget_recovery",
+                        "turn": turn,
+                        "recovery_count": output_budget_recovery_count,
+                        "max_recoveries": MAX_OUTPUT_BUDGET_RECOVERIES,
+                    }));
+                    if let Some(config) = p2t_config.as_ref() {
+                        p2t::append_debug_trace(
+                            &config.step_trace_out,
+                            "output_budget_recovery",
+                            serde_json::json!({
+                                "turn": turn,
+                                "recovery_count": output_budget_recovery_count,
+                            }),
+                        );
+                    }
+                    messages.push(ChatMessage::user(OUTPUT_BUDGET_RECOVERY_NOTICE));
+                    continue;
                 }
                 trace_llm_error(turn, &e);
                 if let Some(config) = p2t_config.as_ref() {
@@ -5221,6 +5273,18 @@ async fn build_train_bifrost_nudge(
     .await
 }
 
+/// Whether a failed LLM call should be recovered with a terseness nudge
+/// instead of failing the turn.
+///
+/// True only for output-budget exhaustion -- the model burned its whole
+/// output allowance on thinking and never reached a tool call -- and only
+/// while the consecutive-recovery budget remains. Every other error, including
+/// a retryable outage, is left to the existing failure path: the stream-level
+/// retry has already had its say by the time an error reaches the turn loop.
+fn should_recover_output_budget(error: &anyhow::Error, recoveries_used: usize) -> bool {
+    is_output_budget_exhausted_error(error) && recoveries_used < MAX_OUTPUT_BUDGET_RECOVERIES
+}
+
 fn should_emit_no_edit_progress_nudge(
     permission_mode: PermissionMode,
     turn: usize,
@@ -7604,6 +7668,41 @@ mod tests {
         assert!(crate::llm_client::is_output_budget_exhausted_error(&err));
         assert!(!is_retryable_llm_error(&err));
         assert!(output.lock().unwrap().is_empty());
+    }
+
+    // The stream layer refuses to retry budget exhaustion (above) because a
+    // byte-identical replay hits the identical cap. The turn loop recovers it
+    // differently: it changes the request first, by telling the model its work
+    // was discarded and asking for a terser step.
+    #[test]
+    fn output_budget_recovery_is_bounded_and_specific() {
+        let exhausted = anyhow::Error::new(OutputBudgetExhaustedError);
+        for used in 0..MAX_OUTPUT_BUDGET_RECOVERIES {
+            assert!(
+                should_recover_output_budget(&exhausted, used),
+                "recovery {used} is inside the budget and must be attempted"
+            );
+        }
+        assert!(
+            !should_recover_output_budget(&exhausted, MAX_OUTPUT_BUDGET_RECOVERIES),
+            "a model that never converges must fail the turn, not consume every turn"
+        );
+
+        // Everything else keeps the existing fail-the-turn path -- including a
+        // retryable outage, which the stream layer has already given up on by
+        // the time the error reaches the turn loop.
+        let outage = anyhow::anyhow!("error sending request: connection reset by peer");
+        assert!(!should_recover_output_budget(&outage, 0));
+    }
+
+    #[test]
+    fn output_budget_recovery_notice_asks_for_a_terser_tool_call() {
+        let notice = OUTPUT_BUDGET_RECOVERY_NOTICE.to_ascii_lowercase();
+        // Without "discarded" the model assumes its thinking carried over and
+        // resumes mid-plan, which reproduces the spiral it was nudged out of.
+        assert!(notice.contains("discarded"), "notice: {notice}");
+        assert!(notice.contains("concise"), "notice: {notice}");
+        assert!(notice.contains("tool call"), "notice: {notice}");
     }
 
     #[tokio::test]
