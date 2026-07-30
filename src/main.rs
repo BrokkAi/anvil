@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
 use clap::builder::RangedU64ValueParser;
+use clap::{Parser, Subcommand};
 
 mod acp;
 mod agents;
@@ -23,6 +23,7 @@ mod discovery;
 mod goal;
 mod host_notice;
 mod http_retry;
+mod installer;
 mod kimi_auth;
 mod llm_client;
 mod mcp;
@@ -66,6 +67,9 @@ use crate::multi_backend::{BackendRegistration, MultiBackend};
 #[derive(Parser)]
 #[command(name = "anvil", version, about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Override the default model id for new sessions. Accepts a wire
     /// form (`codex::<id>`, `ollama::llama3:latest`) or a bare id
     /// that routes to the preferred backend (Codex if available, else
@@ -197,9 +201,16 @@ struct Args {
     no_wasm_sandbox: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install Anvil as an ACP agent in a supported editor.
+    Install(installer::InstallArgs),
+}
+
 impl std::fmt::Debug for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Args")
+            .field("command", &self.command)
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
@@ -577,6 +588,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if let Some(Command::Install(install_args)) = &args.command {
+        installer::install(install_args)?;
+        return Ok(());
+    }
 
     // Install the parser sandbox before any code that might load a SKILL.md
     // (or, eventually, parse AGENTS.md / session zips / regex queries) so

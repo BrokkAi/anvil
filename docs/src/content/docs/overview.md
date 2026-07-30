@@ -24,7 +24,7 @@ ACP session options are client-owned. Model, behavior, reasoning effort, service
 
 ## Supported Surfaces
 
-- [Zed](/zed/) and [JetBrains](/jetbrains/) have repository-backed configuration helpers.
+- [Zed](/zed/), [JetBrains](/jetbrains/), and [Neovim](/neovim/) have direct configuration installers.
 - Any compatible client can use the [custom ACP client contract](/other-acp-clients/).
 - The Rust [client examples](/build-acp-client/) demonstrate issue triage, code review, and issue drafting.
 

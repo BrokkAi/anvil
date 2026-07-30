@@ -531,7 +531,7 @@ fn reasoning_effort_config_option(
             "Controls how much chain-of-thought the model spends on each turn. \
              Higher levels are deeper but slower and cost more against your plan's quota.",
         )
-        .category(SessionConfigOptionCategory::Model),
+        .category(SessionConfigOptionCategory::ThoughtLevel),
     )
 }
 
@@ -579,7 +579,7 @@ fn service_tier_config_option(
             "Controls the provider service tier for this session. Fast tiers can respond \
                  sooner but consume more subscription quota.",
         )
-        .category(SessionConfigOptionCategory::Model),
+        .category(SessionConfigOptionCategory::ModelConfig),
     )
 }
 
@@ -4948,15 +4948,20 @@ fn build_system_prompt(
     let mode_prompt = match mode {
         SessionMode::Lutz => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering, but you can help with any task the user brings to you. Work the task \
-             to completion: investigate with your tools, make the changes, verify them, and \
-             report the result."
+             software engineering, but you can help with any task the user brings to you. You and the \
+             user share this workspace and collaborate on the project in it. Treat the working directory \
+             as the primary project context. Inspect the repository and its instructions, configuration, \
+             and existing conventions before making assumptions about how it works. Work the task to \
+             completion: investigate with your tools, make the changes, verify them, and report the result."
         }
         SessionMode::Plan => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering, but you can help with any task the user brings to you. In this mode, \
-             focus on planning: analyze requirements, design solutions, and create implementation \
-             plans. Do not write code directly."
+             software engineering, but you can help with any task the user brings to you. You and the \
+             user share this workspace and collaborate on the project in it. Treat the working directory \
+             as the primary project context. Inspect the repository and its instructions, configuration, \
+             and existing conventions before making assumptions about how it works. In this mode, focus \
+             on planning: analyze requirements, design solutions, and create implementation plans. Do not \
+             write code directly."
         }
     };
 
@@ -10725,6 +10730,12 @@ mod tests {
                 "system prompt for {mode:?} must use the general-purpose identity opening, got: {prompt}"
             );
             assert!(
+                prompt.contains("share this workspace")
+                    && prompt.contains("primary project context")
+                    && prompt.contains("Inspect the repository"),
+                "system prompt for {mode:?} must explain the shared project workspace, got: {prompt}"
+            );
+            assert!(
                 !prompt.contains("AI coding assistant"),
                 "system prompt for {mode:?} must not revive the 'AI coding assistant' wording, got: {prompt}"
             );
@@ -12272,6 +12283,40 @@ mod tests {
                 "expected select option value {expected:?}; got {option_values:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_related_config_options_use_distinct_acp_categories() {
+        use crate::llm_client::{ModelServiceTier, ReasoningLevelPreset};
+
+        let model_id = "codex::test-model";
+        let catalog = vec![ModelMetadata {
+            id: model_id.into(),
+            default_reasoning_level: Some("high".into()),
+            supported_reasoning_levels: vec![ReasoningLevelPreset {
+                effort: "high".into(),
+                description: "High".into(),
+            }],
+            service_tiers: vec![ModelServiceTier {
+                id: CODEX_FAST_SERVICE_TIER_ID.into(),
+                name: "Fast".into(),
+                description: "Higher throughput".into(),
+            }],
+            supports_images: None,
+            context_length: None,
+            pricing: None,
+        }];
+        let model_ids = vec![model_id.to_string()];
+
+        let model = model_config_option(model_id, &model_ids).expect("model option");
+        let reasoning =
+            reasoning_effort_config_option(None, &catalog, model_id).expect("reasoning option");
+        let service =
+            service_tier_config_option(None, &catalog, model_id).expect("service tier option");
+
+        assert_eq!(config_option_json(&model)["category"], "model");
+        assert_eq!(config_option_json(&reasoning)["category"], "thought_level");
+        assert_eq!(config_option_json(&service)["category"], "model_config");
     }
 
     #[test]

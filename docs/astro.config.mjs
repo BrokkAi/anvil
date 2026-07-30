@@ -120,6 +120,7 @@ export default defineConfig({
           items: [
             { label: 'Zed', slug: 'zed' },
             { label: 'JetBrains', slug: 'jetbrains' },
+            { label: 'Neovim', slug: 'neovim' },
             { label: 'Other ACP Clients', slug: 'other-acp-clients' },
             { label: 'Model Providers and Setup', slug: 'providers' },
             { label: 'Permissions and Sandboxing', slug: 'permissions-sandboxing' },

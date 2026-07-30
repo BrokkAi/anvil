@@ -5,6 +5,19 @@ description: Install, configure, validate, and troubleshoot Anvil in Zed.
 
 Zed can launch Anvil as a custom ACP agent. Use an absolute executable path so editor startup does not depend on shell `PATH` configuration.
 
+## Automatic Configuration
+
+Run the installed Anvil binary:
+
+```bash
+anvil install zed
+```
+
+Anvil detects its own executable path and merges an `Anvil` agent into Zed's
+existing settings. It preserves unrelated properties and leading JSONC
+comments. If an `Anvil` entry already exists, review it and then pass `--force`
+to replace only that entry.
+
 ## Manual Configuration
 
 Install Anvil first, then add an entry to `~/.config/zed/settings.json`:
