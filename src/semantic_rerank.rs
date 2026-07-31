@@ -38,6 +38,7 @@ const MAX_FINAL_K: usize = 20;
 const OVERFETCH_MULTIPLIER: usize = 2;
 const MAX_CANDIDATE_CONTEXT_BYTES: usize = 8_000;
 const MAX_TOTAL_CONTEXT_BYTES: usize = 120_000;
+const CONTEXT_FETCH_BATCH: usize = 8;
 const RRF_RANK_CONSTANT: f64 = 60.0;
 
 /// Reasoning effort for the disposable turn. "low" (not "minimal", which some
@@ -398,32 +399,87 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
 /// or total failure is non-fatal: a candidate without context still appears by
 /// name in the rerank prompt.
 async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
-    let symbols: Vec<String> = candidates
-        .iter()
-        .filter(|c| c.kind == CandidateKind::Symbol)
-        .map(|c| c.name.clone())
-        .collect();
-    let files: Vec<String> = candidates
-        .iter()
-        .filter(|c| c.kind == CandidateKind::File)
-        .map(|c| c.name.clone())
-        .collect();
+    for start in (0..candidates.len()).step_by(CONTEXT_FETCH_BATCH) {
+        let end = (start + CONTEXT_FETCH_BATCH).min(candidates.len());
+        let symbols: Vec<String> = candidates[start..end]
+            .iter()
+            .filter(|candidate| candidate.kind == CandidateKind::Symbol)
+            .map(|candidate| candidate.name.clone())
+            .collect();
+        let files: Vec<String> = candidates[start..end]
+            .iter()
+            .filter(|candidate| candidate.kind == CandidateKind::File)
+            .map(|candidate| candidate.name.clone())
+            .collect();
 
-    if !symbols.is_empty()
-        && let Ok(value) = registry
-            .call_bifrost_tool_raw("get_symbol_sources", json!({ "symbols": symbols }))
-            .await
-    {
-        attach_symbol_sources(candidates, &value);
+        fetch_symbol_context(registry, candidates, &symbols).await;
+        fetch_file_context(registry, candidates, &files).await;
+        if available_context_bytes(candidates) >= MAX_TOTAL_CONTEXT_BYTES {
+            break;
+        }
     }
+}
 
-    if !files.is_empty()
-        && let Ok(value) = registry
-            .call_bifrost_tool_raw("get_summaries", json!({ "targets": files }))
-            .await
-    {
-        attach_summaries(candidates, &value);
+async fn fetch_symbol_context(
+    registry: &ToolRegistry,
+    candidates: &mut [Candidate],
+    symbols: &[String],
+) {
+    if symbols.is_empty() {
+        return;
     }
+    match registry
+        .call_bifrost_tool_raw("get_symbol_sources", json!({ "symbols": symbols }))
+        .await
+    {
+        Ok(value) => attach_symbol_sources(candidates, &value),
+        Err(_) if symbols.len() > 1 => {
+            for symbol in symbols {
+                if let Ok(value) = registry
+                    .call_bifrost_tool_raw("get_symbol_sources", json!({ "symbols": [symbol] }))
+                    .await
+                {
+                    attach_symbol_sources(candidates, &value);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+async fn fetch_file_context(
+    registry: &ToolRegistry,
+    candidates: &mut [Candidate],
+    files: &[String],
+) {
+    if files.is_empty() {
+        return;
+    }
+    match registry
+        .call_bifrost_tool_raw("get_summaries", json!({ "targets": files }))
+        .await
+    {
+        Ok(value) => attach_summaries(candidates, &value),
+        Err(_) if files.len() > 1 => {
+            for file in files {
+                if let Ok(value) = registry
+                    .call_bifrost_tool_raw("get_summaries", json!({ "targets": [file] }))
+                    .await
+                {
+                    attach_summaries(candidates, &value);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+fn available_context_bytes(candidates: &[Candidate]) -> usize {
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.context.as_ref())
+        .map(|context| context.len().min(MAX_CANDIDATE_CONTEXT_BYTES))
+        .sum()
 }
 
 /// Enforce the disposable-turn source/summary budget without ever removing a
@@ -494,17 +550,16 @@ fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
 /// Attach rendered, truncated summaries to file candidates from a
 /// `get_summaries` result (`{ summaries: [{label,path,preamble,elements:[{text}]}] }`).
 fn attach_summaries(candidates: &mut [Candidate], result: &Value) {
-    let Some(summaries) = result.get("summaries").and_then(Value::as_array) else {
-        return;
-    };
     let mut by_path: HashMap<&str, &Value> = HashMap::new();
-    for block in summaries {
-        let key = block
-            .get("path")
-            .and_then(Value::as_str)
-            .or_else(|| block.get("label").and_then(Value::as_str));
-        if let Some(key) = key {
-            by_path.entry(key).or_insert(block);
+    if let Some(summaries) = result.get("summaries").and_then(Value::as_array) {
+        for block in summaries {
+            let key = block
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| block.get("label").and_then(Value::as_str));
+            if let Some(key) = key {
+                by_path.entry(key).or_insert(block);
+            }
         }
     }
     for candidate in candidates
@@ -513,6 +568,42 @@ fn attach_summaries(candidates: &mut [Candidate], result: &Value) {
     {
         if let Some(block) = by_path.get(candidate.name.as_str()) {
             candidate.context = Some(sample_summary(&render_summary_block(block)));
+        }
+    }
+
+    let Some(files) = result
+        .get("compact_symbols")
+        .and_then(|compact| compact.get("files"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for file in files {
+        let Some(path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.kind == CandidateKind::File && candidate.name == path)
+        else {
+            continue;
+        };
+        if candidate.context.is_some() {
+            continue;
+        }
+        let loc = file.get("loc").and_then(Value::as_u64);
+        let lines = file
+            .get("lines")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            candidate.context = Some(match loc {
+                Some(loc) => format!("{path} ({loc} lines)\n{}", lines.join("\n")),
+                None => lines.join("\n"),
+            });
         }
     }
 }
@@ -1021,6 +1112,34 @@ mod tests {
         for candidate in &candidates {
             assert!(prompt.contains(&candidate.name));
         }
+    }
+
+    #[test]
+    fn compact_file_outlines_are_valid_reranker_context() {
+        let mut candidates = parse_candidates(&json!({
+            "coedit_ranked": [{ "path": "src/config.rs", "score": 1.0 }]
+        }));
+        attach_summaries(
+            &mut candidates,
+            &json!({
+                "summaries": [],
+                "compact_symbols": {
+                    "files": [{
+                        "path": "src/config.rs",
+                        "loc": 42,
+                        "lines": ["- Config", "  - load"]
+                    }]
+                },
+                "degraded": true
+            }),
+        );
+
+        let context = candidates[0]
+            .context
+            .as_deref()
+            .expect("compact outline is attached");
+        assert_eq!(context, "src/config.rs (42 lines)\n- Config\n  - load");
+        assert_eq!(available_context_bytes(&candidates), context.len());
     }
 
     fn live_candidate(
