@@ -32,6 +32,7 @@ const OPENAI_GPT_REASONING_PRESETS: &[(&str, &str)] = &[
     ("medium", "Balanced reasoning for moderate complexity."),
     ("high", "Deep reasoning for complex problems."),
     ("xhigh", "Extra-high reasoning for the hardest problems."),
+    ("max", "Maximum reasoning with no effort constraint."),
 ];
 
 const OPENAI_GPT_OSS_REASONING_PRESETS: &[(&str, &str)] = &[
@@ -3073,7 +3074,7 @@ mod tests {
 
         assert_eq!(
             efforts("openai.gpt-5.5"),
-            ["none", "low", "medium", "high", "xhigh"]
+            ["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(efforts("openai.gpt-oss-120b"), ["low", "medium", "high"]);
         assert_eq!(
@@ -3263,7 +3264,7 @@ mod tests {
                 .iter()
                 .map(|p| p.effort.as_str())
                 .collect::<Vec<_>>(),
-            ["none", "low", "medium", "high", "xhigh"]
+            ["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             by_id("openai.gpt-oss-20b")
