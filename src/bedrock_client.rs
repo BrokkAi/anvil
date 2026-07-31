@@ -540,6 +540,21 @@ impl ResponsesChainCache {
         self.entries.remove(&key);
         self.order.retain(|k| *k != key);
     }
+
+    fn evict_context_prefixes(&mut self, messages: &[ChatMessage]) -> usize {
+        let mut evicted = 0;
+        for a in (0..messages.len()).rev() {
+            if messages[a].role != "assistant" {
+                continue;
+            }
+            let key = hash_responses_context(&messages[..a]);
+            if self.entries.contains_key(&key) {
+                self.evict(key);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
 }
 
 /// Hashes an ordered Responses API message context (role + normalized
@@ -630,13 +645,15 @@ fn looks_like_expired_previous_response_id(status: reqwest::StatusCode, body: &s
         return false;
     }
     let lower = body.to_ascii_lowercase();
-    lower.contains("previous_response_id")
+    (lower.contains("previous_response_id")
         && (lower.contains("not found")
             || lower.contains("not exist")
             || lower.contains("expired")
             || lower.contains("invalid")
             || lower.contains("unknown")
-            || lower.contains("no longer"))
+            || lower.contains("no longer")))
+        || lower.contains("not_found_error")
+        || (lower.contains("response") && lower.contains("not found"))
 }
 
 /// Which Anthropic extended-thinking request shape a Bedrock model accepts.
@@ -1199,8 +1216,31 @@ impl BedrockClient {
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
-        let outcome =
-            drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await?;
+        let outcome = match drive_responses_sse_stream(
+            stream,
+            on_token,
+            on_thought,
+            cancel,
+            idle_timeouts,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if continuation.is_some() {
+                    let evicted = self
+                        .responses_chain
+                        .lock()
+                        .expect("responses_chain mutex poisoned")
+                        .evict_context_prefixes(&messages);
+                    tracing::warn!(
+                        evicted,
+                        "Bedrock Responses API stream failed on chained call; evicting cached prefixes before outer retry"
+                    );
+                }
+                return Err(err);
+            }
+        };
 
         if let Some(response_id) = outcome.response_id {
             let key = hash_responses_context(&messages);
@@ -4380,7 +4420,155 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_api_self_heals_on_expired_previous_response_id() {
+    async fn responses_api_stream_failure_evicts_all_cached_prefixes_for_context() {
+        struct FailingChainedResponsesResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        fn successful_responses_sse(response_id: &str, text: &str) -> ResponseTemplate {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
+                     data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n",
+                ))
+        }
+
+        impl Respond for FailingChainedResponsesResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("request body is JSON");
+                let previous_response_id = body
+                    .get("previous_response_id")
+                    .and_then(serde_json::Value::as_str);
+                let body_str = body.to_string();
+
+                match attempt {
+                    0 => {
+                        assert_eq!(previous_response_id, None);
+                        assert!(body_str.contains("turn1 question"), "{body_str}");
+                        successful_responses_sse("resp_turn0", "turn1 answer")
+                    }
+                    1 => {
+                        assert_eq!(previous_response_id, Some("resp_turn0"));
+                        assert!(!body_str.contains("turn1 question"), "{body_str}");
+                        assert!(body_str.contains("turn2 question"), "{body_str}");
+                        successful_responses_sse("resp_turn1", "turn2 answer")
+                    }
+                    2 => {
+                        assert_eq!(previous_response_id, Some("resp_turn1"));
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n\
+                                 data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"overloaded\"}}}\n\n",
+                            )
+                    }
+                    3 => {
+                        assert_eq!(
+                            previous_response_id, None,
+                            "after stream failure, every cached prefix for this context must be evicted"
+                        );
+                        assert!(body_str.contains("turn1 question"), "{body_str}");
+                        assert!(body_str.contains("turn2 question"), "{body_str}");
+                        assert!(body_str.contains("turn3 question"), "{body_str}");
+                        successful_responses_sse("resp_recovered", "recovered")
+                    }
+                    other => panic!("unexpected Responses request #{other}: {body_str}"),
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(FailingChainedResponsesResponder {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+
+        let request = |messages: Vec<ChatMessage>| StreamChatRequest {
+            model: "openai.gpt-5.5".to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: None,
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: CancellationToken::new(),
+            idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+        };
+
+        let turn0_messages = vec![ChatMessage::user("turn1 question")];
+        client
+            .stream_chat(request(turn0_messages.clone()))
+            .await
+            .expect("turn 1 should seed the first chain link");
+
+        let mut turn1_messages = turn0_messages.clone();
+        turn1_messages.push(ChatMessage::assistant("turn1 answer"));
+        turn1_messages.push(ChatMessage::user("turn2 question"));
+        client
+            .stream_chat(request(turn1_messages.clone()))
+            .await
+            .expect("turn 2 should seed the second chain link");
+
+        let mut turn2_messages = turn1_messages.clone();
+        turn2_messages.push(ChatMessage::assistant("turn2 answer"));
+        turn2_messages.push(ChatMessage::user("turn3 question"));
+
+        let err = client
+            .stream_chat(request(turn2_messages.clone()))
+            .await
+            .expect_err("stream-borne response.failed should propagate to the outer retry loop");
+        assert!(
+            format!("{err:#}").contains("Responses stream failed: server_error: overloaded"),
+            "{err:#}"
+        );
+
+        {
+            let cache = client
+                .responses_chain
+                .lock()
+                .expect("responses_chain mutex poisoned");
+            assert!(
+                find_responses_continuation(&turn2_messages, |h| cache.get(h)).is_none(),
+                "stream failure on a chained call must leave no usable cached prefix for the same context"
+            );
+        }
+
+        client
+            .stream_chat(request(turn2_messages))
+            .await
+            .expect("after eviction, the next identical invocation should send full input");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 4);
+        let retry_body: serde_json::Value =
+            serde_json::from_slice(&requests[3].body).expect("retry body is JSON");
+        assert!(
+            retry_body.get("previous_response_id").is_none(),
+            "post-eviction retry must not fall back to an older cached prefix: {retry_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_api_self_heals_on_not_found_previous_response_id() {
         use wiremock::{Match, Request};
 
         struct HasPreviousResponseId;
@@ -4423,8 +4611,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/openai/v1/responses"))
             .and(HasPreviousResponseId)
-            .respond_with(ResponseTemplate::new(400).set_body_string(
-                "{\"error\":{\"message\":\"previous_response_id 'resp_turn1' not found\"}}",
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "{\"error\":{\"code\":\"not_found_error\",\"message\":\"Response 'resp_akkecf7gb36b3mffg2eifdikhj3cmi6fn7p3mh3muslnh6fbryxa' not found.\",\"param\":null,\"type\":\"invalid_request_error\"}}",
             ))
             .mount(&server)
             .await;
@@ -5969,6 +6157,50 @@ mod tests {
     }
 
     #[test]
+    fn responses_chain_cache_evict_context_prefixes_removes_lookup_keys() {
+        let turn0 = vec![ChatMessage::user("q1")];
+        let turn1 = {
+            let mut m = turn0.clone();
+            m.push(ChatMessage::assistant("a1"));
+            m.push(ChatMessage::user("q2"));
+            m
+        };
+        let turn2 = {
+            let mut m = turn1.clone();
+            m.push(ChatMessage::assistant("a2"));
+            m.push(ChatMessage::user("q3"));
+            m
+        };
+
+        let mut cache = ResponsesChainCache::new(8);
+        cache.insert(
+            hash_responses_context(&turn0),
+            "resp_after_turn0".to_string(),
+        );
+        cache.insert(
+            hash_responses_context(&turn1),
+            "resp_after_turn1".to_string(),
+        );
+        cache.insert(42, "unrelated".to_string());
+
+        let (boundary, previous_response_id) =
+            find_responses_continuation(&turn2, |h| cache.get(h))
+                .expect("largest cached prefix should be usable before eviction");
+        assert_eq!(previous_response_id, "resp_after_turn1");
+
+        let lookup_key = hash_responses_context(&turn2[..boundary]);
+        assert_eq!(cache.get(lookup_key), Some("resp_after_turn1".to_string()));
+
+        assert_eq!(cache.evict_context_prefixes(&turn2), 2);
+        assert_eq!(cache.get(lookup_key), None);
+        assert_eq!(cache.get(42), Some("unrelated".to_string()));
+        assert!(
+            find_responses_continuation(&turn2, |h| cache.get(h)).is_none(),
+            "all usable cached prefixes for this context should be gone"
+        );
+    }
+
+    #[test]
     fn looks_like_expired_previous_response_id_matches_defensively() {
         assert!(looks_like_expired_previous_response_id(
             reqwest::StatusCode::BAD_REQUEST,
@@ -5981,6 +6213,10 @@ mod tests {
         assert!(looks_like_expired_previous_response_id(
             reqwest::StatusCode::BAD_REQUEST,
             "{\"error\":{\"message\":\"previous_response_id has expired\"}}"
+        ));
+        assert!(looks_like_expired_previous_response_id(
+            reqwest::StatusCode::NOT_FOUND,
+            "{\"error\":{\"code\":\"not_found_error\",\"message\":\"Response 'resp_akkecf7gb36b3mffg2eifdikhj3cmi6fn7p3mh3muslnh6fbryxa' not found.\",\"param\":null,\"type\":\"invalid_request_error\"}}"
         ));
 
         // Not client errors, or no mention of previous_response_id, or no
