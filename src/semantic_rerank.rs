@@ -16,12 +16,12 @@
 //! long history stays a provider-cache hit and the only genuinely new tokens
 //! are the candidate sources themselves.
 //!
-//! Every failure mode degrades to passing through bifrost's raw result, so the
-//! wrapper can only improve search, never break it.
+//! Provider and structured-output failures degrade to deterministic reciprocal
+//! rank fusion. Bifrost's raw three-list payload is never exposed to the model.
 
 use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,12 +31,14 @@ use crate::llm_client::{
 };
 use crate::structured_output::StructuredOutputRequest;
 use crate::tools::ToolRegistry;
+use crate::trace_logging::append_trace_record;
 
-/// Cap on how many symbol / file candidates we fetch context for and feed to
-/// the rerank turn. `semantic_search` returns at most `k` per leg (model
-/// chooses `k`, up to 100); these bound the disposable-turn cost regardless.
-const MAX_SYMBOL_CANDIDATES: usize = 30;
-const MAX_FILE_CANDIDATES: usize = 20;
+const DEFAULT_FINAL_K: usize = 20;
+const MAX_FINAL_K: usize = 20;
+const OVERFETCH_MULTIPLIER: usize = 2;
+const MAX_CANDIDATE_CONTEXT_BYTES: usize = 8_000;
+const MAX_TOTAL_CONTEXT_BYTES: usize = 120_000;
+const RRF_RANK_CONSTANT: f64 = 60.0;
 
 /// Reasoning effort for the disposable turn. "low" (not "minimal", which some
 /// backends don't support and which is too aggressive where they do) keeps the
@@ -71,7 +73,7 @@ impl RerankOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CandidateKind {
     Symbol,
     File,
@@ -91,6 +93,10 @@ struct Candidate {
     location: Option<String>,
     /// Truncated source (symbols) or rendered summary (files), if fetched.
     context: Option<String>,
+    /// Reciprocal-rank score accumulated across the active retrieval legs.
+    rrf_score: f64,
+    /// First raw-list position, used to make equal RRF scores deterministic.
+    first_seen: usize,
 }
 
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
@@ -105,34 +111,57 @@ pub(crate) async fn rerank_semantic_search(
     idle_timeout: IdleTimeouts,
     cancel: &CancellationToken,
 ) -> RerankOutcome {
+    let final_k = match parse_final_k(args) {
+        Ok(k) => k,
+        Err(message) => return RerankOutcome::error(message),
+    };
     let query = args
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let (bifrost_args, base_k) = prepare_bifrost_args(args, final_k);
 
     // 1. Underlying search. A hard failure here is the model's to see.
     let raw = match registry
-        .call_bifrost_tool_raw("semantic_search", args.clone())
+        .call_bifrost_tool_raw("semantic_search", bifrost_args)
         .await
     {
         Ok(value) => value,
         Err(err) => return RerankOutcome::error(format!("Error: {err}")),
     };
-    let raw_pretty = serde_json::to_string_pretty(&raw).unwrap_or_else(|_| raw.to_string());
 
-    // 2. Candidates. Nothing to rerank -> pass the raw payload through.
+    // 2. Parse the entire realized pool. An empty search is a valid final result.
     let mut candidates = parse_candidates(&raw);
     if candidates.is_empty() {
-        return RerankOutcome::passthrough(raw_pretty, TokenUsage::default());
+        trace_rerank(RerankTrace {
+            raw: &raw,
+            final_k,
+            base_k,
+            deduplicated_count: 0,
+            context_bytes: 0,
+            selected_count: 0,
+            final_count: 0,
+            fallback_reason: None,
+            usage: TokenUsage::default(),
+        });
+        return RerankOutcome::passthrough(
+            render_unified(&query, &[], 0, notes(&raw)),
+            TokenUsage::default(),
+        );
     }
 
     // 3. Fetch source / summaries for the candidates (best effort).
     fetch_context(registry, &mut candidates).await;
+    let context_bytes = bound_candidate_context(&mut candidates);
 
     // 4. Disposable relevance turn on top of the live conversation.
     let mut messages = prefix_for_rerank(prior_messages);
-    messages.push(ChatMessage::user(build_rerank_prompt(&query, &candidates)));
+    messages.push(ChatMessage::user(build_rerank_prompt(
+        &query,
+        &candidates,
+        final_k,
+    )));
     let structured = StructuredOutputRequest {
         schema_name: "semantic_rerank".to_string(),
         schema: rerank_schema(),
@@ -165,9 +194,24 @@ pub(crate) async fn rerank_semantic_search(
         Err(err) => {
             tracing::warn!(
                 error = format!("{err:#}"),
-                "semantic_search rerank turn failed; passing through raw results"
+                "semantic_search rerank turn failed; using reciprocal-rank fusion"
             );
-            return RerankOutcome::passthrough(raw_pretty, TokenUsage::default());
+            let ordered = rrf_fallback(&candidates, final_k);
+            trace_rerank(RerankTrace {
+                raw: &raw,
+                final_k,
+                base_k,
+                deduplicated_count: candidates.len(),
+                context_bytes,
+                selected_count: 0,
+                final_count: ordered.len(),
+                fallback_reason: Some("provider_failure"),
+                usage: TokenUsage::default(),
+            });
+            return RerankOutcome::passthrough(
+                render_unified(&query, &ordered, candidates.len(), notes(&raw)),
+                TokenUsage::default(),
+            );
         }
     };
     let usage = response.usage();
@@ -175,15 +219,33 @@ pub(crate) async fn rerank_semantic_search(
         LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
     };
 
-    // 5. Map the selection back to candidates; empty/garbage -> raw passthrough.
-    let selected = parse_selected_ids(&text).unwrap_or_default();
-    let ordered = order_candidates(&candidates, &selected);
-    if ordered.is_empty() {
-        tracing::warn!(
-            "semantic_search rerank returned no usable selection; passing through raw results"
-        );
-        return RerankOutcome::passthrough(raw_pretty, usage);
-    }
+    // 5. A well-formed empty or all-unknown selection is valid and final. Only
+    // malformed structured output invokes fallback.
+    let selected = match parse_selected_ids(&text) {
+        Some(selected) => selected,
+        None => {
+            tracing::warn!(
+                "semantic_search rerank returned malformed output; using reciprocal-rank fusion"
+            );
+            let ordered = rrf_fallback(&candidates, final_k);
+            trace_rerank(RerankTrace {
+                raw: &raw,
+                final_k,
+                base_k,
+                deduplicated_count: candidates.len(),
+                context_bytes,
+                selected_count: 0,
+                final_count: ordered.len(),
+                fallback_reason: Some("malformed_output"),
+                usage,
+            });
+            return RerankOutcome::passthrough(
+                render_unified(&query, &ordered, candidates.len(), notes(&raw)),
+                usage,
+            );
+        }
+    };
+    let ordered = order_candidates(&candidates, &selected, final_k);
 
     tracing::debug!(
         query = %query,
@@ -193,74 +255,140 @@ pub(crate) async fn rerank_semantic_search(
         input_tokens = usage.input_tokens,
         "semantic_search reranked"
     );
+    trace_rerank(RerankTrace {
+        raw: &raw,
+        final_k,
+        base_k,
+        deduplicated_count: candidates.len(),
+        context_bytes,
+        selected_count: selected.len(),
+        final_count: ordered.len(),
+        fallback_reason: None,
+        usage,
+    });
     let output = render_unified(&query, &ordered, candidates.len(), notes(&raw));
     RerankOutcome::passthrough(output, usage)
 }
 
-/// Parse `semantic_search`'s three legs into a deduplicated candidate list:
-/// symbols (vector ∪ bm25, max score, unioned signals) then files (coedit).
+fn parse_final_k(args: &Value) -> Result<usize, String> {
+    let Some(object) = args.as_object() else {
+        return Err("Invalid arguments for `semantic_search`: expected an object".to_string());
+    };
+    let Some(value) = object.get("k") else {
+        return Ok(DEFAULT_FINAL_K);
+    };
+    let Some(k) = value.as_u64() else {
+        return Err(
+            "Invalid arguments for `semantic_search`: k must be an integer from 1 through 20"
+                .to_string(),
+        );
+    };
+    if !(1..=MAX_FINAL_K as u64).contains(&k) {
+        return Err(
+            "Invalid arguments for `semantic_search`: k must be an integer from 1 through 20"
+                .to_string(),
+        );
+    }
+    Ok(k as usize)
+}
+
+fn prepare_bifrost_args(args: &Value, final_k: usize) -> (Value, usize) {
+    let base_k = final_k * OVERFETCH_MULTIPLIER;
+    let mut bifrost_args = args.clone();
+    let object = bifrost_args
+        .as_object_mut()
+        .expect("parse_final_k established that semantic_search arguments are an object");
+    object.insert("k".to_string(), json!(base_k));
+    (bifrost_args, base_k)
+}
+
+/// Parse every realized item from `semantic_search`'s three legs into one
+/// identity-deduplicated candidate list. The order is deterministic RRF order,
+/// which is also the provider-failure fallback order.
 fn parse_candidates(raw: &Value) -> Vec<Candidate> {
-    let mut symbols: Vec<(String, f32, Vec<&'static str>)> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut index: HashMap<(CandidateKind, String), usize> = HashMap::new();
+    let mut first_seen = 0;
     for (key, signal) in [("vector_ranked", "vector"), ("bm25_ranked", "bm25")] {
         let Some(array) = raw.get(key).and_then(Value::as_array) else {
             continue;
         };
-        for item in array {
+        for (rank, item) in array.iter().enumerate() {
             let Some(fqfn) = item.get("fqfn").and_then(Value::as_str) else {
                 continue;
             };
-            let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            match index.get(fqfn) {
+            let identity = (CandidateKind::Symbol, fqfn.to_string());
+            match index.get(&identity) {
                 Some(&i) => {
-                    symbols[i].1 = symbols[i].1.max(score);
-                    if !symbols[i].2.contains(&signal) {
-                        symbols[i].2.push(signal);
+                    candidates[i].rrf_score += 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0);
+                    if !candidates[i].signals.contains(&signal) {
+                        candidates[i].signals.push(signal);
                     }
                 }
                 None => {
-                    index.insert(fqfn.to_string(), symbols.len());
-                    symbols.push((fqfn.to_string(), score, vec![signal]));
+                    index.insert(identity, candidates.len());
+                    candidates.push(Candidate {
+                        id: String::new(),
+                        kind: CandidateKind::Symbol,
+                        name: fqfn.to_string(),
+                        signals: vec![signal],
+                        location: None,
+                        context: None,
+                        rrf_score: 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0),
+                        first_seen,
+                    });
+                    first_seen += 1;
                 }
             }
         }
     }
-    symbols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    symbols.truncate(MAX_SYMBOL_CANDIDATES);
-
-    let mut files: Vec<(String, f32)> = Vec::new();
     if let Some(array) = raw.get("coedit_ranked").and_then(Value::as_array) {
-        for item in array {
+        for (rank, item) in array.iter().enumerate() {
             let Some(path) = item.get("path").and_then(Value::as_str) else {
                 continue;
             };
-            let score = item.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            files.push((path.to_string(), score));
+            let identity = (CandidateKind::File, path.to_string());
+            match index.get(&identity) {
+                Some(&i) => {
+                    candidates[i].rrf_score += 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0)
+                }
+                None => {
+                    index.insert(identity, candidates.len());
+                    candidates.push(Candidate {
+                        id: String::new(),
+                        kind: CandidateKind::File,
+                        name: path.to_string(),
+                        signals: vec!["coedit"],
+                        location: None,
+                        context: None,
+                        rrf_score: 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0),
+                        first_seen,
+                    });
+                    first_seen += 1;
+                }
+            }
         }
     }
-    files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    files.truncate(MAX_FILE_CANDIDATES);
-
-    let mut candidates = Vec::with_capacity(symbols.len() + files.len());
-    for (i, (name, _score, signals)) in symbols.into_iter().enumerate() {
-        candidates.push(Candidate {
-            id: format!("s{}", i + 1),
-            kind: CandidateKind::Symbol,
-            name,
-            signals,
-            location: None,
-            context: None,
-        });
-    }
-    for (i, (name, _score)) in files.into_iter().enumerate() {
-        candidates.push(Candidate {
-            id: format!("f{}", i + 1),
-            kind: CandidateKind::File,
-            name,
-            signals: vec!["coedit"],
-            location: None,
-            context: None,
-        });
+    candidates.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.first_seen.cmp(&b.first_seen))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut symbol_id = 0;
+    let mut file_id = 0;
+    for candidate in &mut candidates {
+        candidate.id = match candidate.kind {
+            CandidateKind::Symbol => {
+                symbol_id += 1;
+                format!("s{symbol_id}")
+            }
+            CandidateKind::File => {
+                file_id += 1;
+                format!("f{file_id}")
+            }
+        };
     }
     candidates
 }
@@ -296,6 +424,38 @@ async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
     {
         attach_summaries(candidates, &value);
     }
+}
+
+/// Enforce the disposable-turn source/summary budget without ever removing a
+/// candidate identity. Earlier RRF candidates consume the shared budget first.
+fn bound_candidate_context(candidates: &mut [Candidate]) -> usize {
+    let mut remaining = MAX_TOTAL_CONTEXT_BYTES;
+    let mut used = 0;
+    for candidate in candidates {
+        let Some(context) = candidate.context.take() else {
+            continue;
+        };
+        let limit = remaining.min(MAX_CANDIDATE_CONTEXT_BYTES);
+        if limit == 0 {
+            continue;
+        }
+        let bounded = truncate_utf8(&context, limit);
+        used += bounded.len();
+        remaining -= bounded.len();
+        candidate.context = Some(bounded);
+    }
+    used
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 /// Attach truncated source text to symbol candidates from a
@@ -391,7 +551,7 @@ fn prefix_for_rerank(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages[..cut].to_vec()
 }
 
-fn build_rerank_prompt(query: &str, candidates: &[Candidate]) -> String {
+fn build_rerank_prompt(query: &str, candidates: &[Candidate], final_k: usize) -> String {
     let mut out = String::new();
     out.push_str(
         "A code search just ran for the query below and returned these candidate results. \
@@ -399,10 +559,11 @@ Each candidate has an id, the symbol or file it refers to, and (when available) 
 or file summary. Decide which candidates are genuinely relevant to the query and the task \
 in this conversation, then return their ids ordered most-relevant first. Omit irrelevant ones.\n\n",
     );
-    out.push_str(
-        "Respond with ONLY a JSON object of the form {\"relevant\": [\"<id>\", ...]} using the \
-exact ids shown. If nothing is relevant, return {\"relevant\": []}.\n\n",
-    );
+    out.push_str(&format!(
+        "Respond with ONLY a JSON object of the form {{\"relevant\": [\"<id>\", ...]}} using \
+the exact ids shown. Select at most {final_k}. If nothing is relevant, return \
+{{\"relevant\": []}}.\n\n"
+    ));
     out.push_str("<query>\n");
     out.push_str(query.trim());
     out.push_str("\n</query>\n\n<candidates>\n");
@@ -438,20 +599,86 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
 
 /// Resolve the model's selected ids back to candidates, preserving the model's
 /// order and dropping unknown/duplicate ids.
-fn order_candidates<'a>(candidates: &'a [Candidate], selected: &[String]) -> Vec<&'a Candidate> {
+fn order_candidates<'a>(
+    candidates: &'a [Candidate],
+    selected: &[String],
+    final_k: usize,
+) -> Vec<&'a Candidate> {
     let by_id: HashMap<&str, &Candidate> = candidates.iter().map(|c| (c.id.as_str(), c)).collect();
-    let mut seen: HashMap<&str, ()> = HashMap::new();
+    let mut seen = HashSet::new();
     let mut ordered = Vec::new();
     for id in selected {
-        if seen.contains_key(id.as_str()) {
+        if !seen.insert(id.as_str()) {
             continue;
         }
         if let Some(candidate) = by_id.get(id.as_str()) {
-            seen.insert(id.as_str(), ());
             ordered.push(*candidate);
+            if ordered.len() == final_k {
+                break;
+            }
         }
     }
     ordered
+}
+
+fn rrf_fallback(candidates: &[Candidate], final_k: usize) -> Vec<&Candidate> {
+    candidates.iter().take(final_k).collect()
+}
+
+struct RerankTrace<'a> {
+    raw: &'a Value,
+    final_k: usize,
+    base_k: usize,
+    deduplicated_count: usize,
+    context_bytes: usize,
+    selected_count: usize,
+    final_count: usize,
+    fallback_reason: Option<&'a str>,
+    usage: TokenUsage,
+}
+
+fn trace_rerank(trace: RerankTrace<'_>) {
+    let realized = |key: &str| {
+        trace
+            .raw
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    append_trace_record(json!({
+        "type": "semantic_search_rerank",
+        "requested_final_k": trace.final_k,
+        "forwarded_base_k": trace.base_k,
+        "retrieval_profile": diagnostic(trace.raw, "retrieval_profile"),
+        "requested_leg_counts": diagnostic(trace.raw, "requested_leg_counts"),
+        "realized_vector": realized("vector_ranked"),
+        "realized_bm25": realized("bm25_ranked"),
+        "realized_coedit": realized("coedit_ranked"),
+        "realized_leg_counts": {
+            "vector": realized("vector_ranked"),
+            "bm25": realized("bm25_ranked"),
+            "coedit": realized("coedit_ranked"),
+        },
+        "realized_dedup_candidates": trace.deduplicated_count,
+        "context_bytes": trace.context_bytes,
+        "reranker_selected_count": trace.selected_count,
+        "selected_final_count": trace.final_count,
+        "fallback": trace.fallback_reason.is_some(),
+        "fallback_reason": trace.fallback_reason,
+        "reranker_usage": {
+            "input_tokens": trace.usage.input_tokens,
+            "output_tokens": trace.usage.output_tokens,
+            "thought_tokens": trace.usage.thought_tokens,
+            "cached_read_tokens": trace.usage.cached_read_tokens,
+            "cached_write_tokens": trace.usage.cached_write_tokens,
+            "total_tokens": trace.usage.total_tokens(),
+        },
+    }));
+}
+
+fn diagnostic<'a>(raw: &'a Value, key: &str) -> Option<&'a Value> {
+    raw.get(key)
+        .or_else(|| raw.get("diagnostics").and_then(|value| value.get(key)))
 }
 
 fn render_unified(
@@ -520,16 +747,18 @@ fn rerank_schema() -> Value {
 /// Parse `{"relevant": ["id", ...]}` from a model response. Native
 /// structured-output backends return clean JSON by construction; the prompt
 /// instructs the rest to do the same. Anything that doesn't parse yields `None`,
-/// which degrades to raw passthrough -- no bespoke extraction needed.
+/// which invokes deterministic RRF fallback -- no bespoke extraction needed.
 fn parse_selected_ids(text: &str) -> Option<Vec<String>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
-    let array = value.get("relevant")?.as_array()?;
-    Some(
-        array
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-    )
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let array = object.get("relevant")?.as_array()?;
+    array
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect()
 }
 
 fn sample_source(text: &str) -> String {
@@ -633,6 +862,52 @@ mod tests {
     }
 
     #[test]
+    fn final_k_defaults_and_validates_model_boundary() {
+        assert_eq!(parse_final_k(&json!({ "query": "x" })), Ok(20));
+        assert_eq!(parse_final_k(&json!({ "query": "x", "k": 1 })), Ok(1));
+        assert_eq!(parse_final_k(&json!({ "query": "x", "k": 20 })), Ok(20));
+        for invalid in [json!(0), json!(21), json!(1.5), json!("20"), Value::Null] {
+            assert!(parse_final_k(&json!({ "k": invalid })).is_err());
+        }
+    }
+
+    #[test]
+    fn bifrost_receives_twice_the_final_k() {
+        for final_k in [1, 7, 20] {
+            let args = json!({ "query": "needle", "k": final_k });
+            let (forwarded, base_k) = prepare_bifrost_args(&args, final_k);
+            assert_eq!(base_k, 2 * final_k);
+            assert_eq!(forwarded["k"], 2 * final_k);
+            assert_eq!(forwarded["query"], "needle");
+            assert_eq!(args["k"], final_k);
+        }
+    }
+
+    #[test]
+    fn parses_and_prompts_entire_120_candidate_pool() {
+        let vector: Vec<Value> = (0..40)
+            .map(|i| json!({ "fqfn": format!("vector::{i}"), "score": 1.0 }))
+            .collect();
+        let bm25: Vec<Value> = (0..40)
+            .map(|i| json!({ "fqfn": format!("bm25::{i}"), "score": 1.0 }))
+            .collect();
+        let coedit: Vec<Value> = (0..40)
+            .map(|i| json!({ "path": format!("src/{i}.rs"), "score": 1.0 }))
+            .collect();
+        let candidates = parse_candidates(&json!({
+            "vector_ranked": vector,
+            "bm25_ranked": bm25,
+            "coedit_ranked": coedit,
+        }));
+        assert_eq!(candidates.len(), 120);
+        let prompt = build_rerank_prompt("query", &candidates, 20);
+        for candidate in &candidates {
+            assert!(prompt.contains(&format!("[{}]", candidate.id)));
+            assert!(prompt.contains(&candidate.name));
+        }
+    }
+
+    #[test]
     fn parses_relevant_object_and_rejects_non_json() {
         assert_eq!(
             parse_selected_ids(r#"{"relevant":["s1","f2"]}"#),
@@ -649,6 +924,11 @@ mod tests {
             None
         );
         assert_eq!(parse_selected_ids("no json here"), None);
+        assert_eq!(parse_selected_ids(r#"{"relevant":["s1",3]}"#), None);
+        assert_eq!(
+            parse_selected_ids(r#"{"relevant":[],"unexpected":true}"#),
+            None
+        );
     }
 
     #[test]
@@ -665,9 +945,81 @@ mod tests {
             "s1".to_string(),
             "s2".to_string(),
         ];
-        let ordered = order_candidates(&candidates, &selected);
+        let ordered = order_candidates(&candidates, &selected, 20);
         let names: Vec<&str> = ordered.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["a.B.d", "a.B.c"]);
+    }
+
+    #[test]
+    fn valid_empty_fewer_and_overlong_selections_are_final() {
+        let candidates = parse_candidates(&json!({
+            "vector_ranked": (0..6)
+                .map(|i| json!({ "fqfn": format!("item::{i}") }))
+                .collect::<Vec<_>>()
+        }));
+        assert!(order_candidates(&candidates, &[], 3).is_empty());
+
+        let fewer = order_candidates(&candidates, &["s2".to_string()], 3);
+        assert_eq!(fewer.len(), 1);
+
+        let selected: Vec<String> = (1..=6).map(|i| format!("s{i}")).collect();
+        let capped = order_candidates(&candidates, &selected, 3);
+        assert_eq!(capped.len(), 3);
+    }
+
+    #[test]
+    fn reciprocal_rank_fallback_is_deterministic_and_bounded() {
+        let candidates = parse_candidates(&json!({
+            "vector_ranked": [
+                { "fqfn": "vector_only" },
+                { "fqfn": "both" }
+            ],
+            "bm25_ranked": [
+                { "fqfn": "bm25_only" },
+                { "fqfn": "both" }
+            ],
+            "coedit_ranked": [
+                { "path": "src/file.rs" }
+            ]
+        }));
+        let first: Vec<&str> = rrf_fallback(&candidates, 2)
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect();
+        let second: Vec<&str> = rrf_fallback(&candidates, 2)
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect();
+        assert_eq!(first, vec!["both", "vector_only"]);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn context_budget_is_utf8_safe_and_preserves_all_identities() {
+        let context = "α".repeat(5_000);
+        let mut candidates: Vec<Candidate> = (0..20)
+            .map(|i| {
+                live_candidate(
+                    &format!("s{}", i + 1),
+                    CandidateKind::Symbol,
+                    &format!("item::{i}"),
+                    vec!["vector"],
+                    &context,
+                )
+            })
+            .collect();
+        let used = bound_candidate_context(&mut candidates);
+        assert_eq!(used, MAX_TOTAL_CONTEXT_BYTES);
+        assert!(
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.context.as_ref())
+                .all(|context| context.len() <= MAX_CANDIDATE_CONTEXT_BYTES)
+        );
+        let prompt = build_rerank_prompt("query", &candidates, 20);
+        for candidate in &candidates {
+            assert!(prompt.contains(&candidate.name));
+        }
     }
 
     fn live_candidate(
@@ -684,6 +1036,8 @@ mod tests {
             signals,
             location: None,
             context: Some(context.to_string()),
+            rrf_score: 0.0,
+            first_seen: 0,
         }
     }
 
@@ -733,6 +1087,7 @@ mod tests {
         let prompt = build_rerank_prompt(
             "where is JSON config file parsing implemented?",
             &candidates,
+            20,
         );
         let messages = vec![ChatMessage::user(prompt)];
         let structured = StructuredOutputRequest {

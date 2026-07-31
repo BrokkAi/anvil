@@ -691,13 +691,37 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 /// list of hits with source/summaries -- not bifrost's three raw ranked lists.
 fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
     const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Given a natural-language \
-        query, returns a single relevance-ordered list of the most relevant symbols and files, \
-        each with its source or a summary. Results are reranked for relevance to your query and \
-        the current task, so prefer the order given and start from the top.";
+        query, returns a single relevance-ordered list of symbols and files, each with its source \
+        or a summary. k is the maximum number of final relevance-reranked results. The reranker \
+        may return fewer than k by design when fewer candidates are relevant.";
     match name {
         "semantic_search" => SEMANTIC_SEARCH,
         _ => original,
     }
+}
+
+fn mcp_tool_input_schema(name: &str, mut original: serde_json::Value) -> serde_json::Value {
+    if name != "semantic_search" {
+        return original;
+    }
+    let Some(properties) = original
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        tracing::warn!("semantic_search input schema has no properties object");
+        return original;
+    };
+    properties.insert(
+        "k".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 20,
+            "description": "Maximum number of final relevance-reranked results. The reranker may return fewer than k by design when fewer candidates are relevant."
+        }),
+    );
+    original
 }
 
 /// Unified tool registry: filesystem tools + shell + configured
@@ -1102,7 +1126,7 @@ impl ToolRegistry {
                 defs.push(tool_def(
                     &tool.name,
                     mcp_tool_description(&tool.name, &tool.description),
-                    tool.input_schema.clone(),
+                    mcp_tool_input_schema(&tool.name, tool.input_schema.clone()),
                 ));
             }
         }
@@ -2214,13 +2238,42 @@ mod tests {
     #[test]
     fn semantic_search_description_is_overridden() {
         let overridden = mcp_tool_description("semantic_search", "bifrost's raw description");
-        assert!(overridden.contains("relevance-ordered"));
+        assert!(overridden.contains("maximum number of final relevance-reranked results"));
+        assert!(overridden.contains("may return fewer than k by design"));
         assert_ne!(overridden, "bifrost's raw description");
         // Other tools keep bifrost's description unchanged.
         assert_eq!(
             mcp_tool_description("search_symbols", "bifrost's raw description"),
             "bifrost's raw description"
         );
+    }
+
+    #[test]
+    fn semantic_search_k_schema_is_overridden() {
+        let schema = mcp_tool_input_schema(
+            "semantic_search",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["query"]
+            }),
+        );
+        let k = &schema["properties"]["k"];
+        assert_eq!(k["type"], "integer");
+        assert_eq!(k["minimum"], 1);
+        assert_eq!(k["maximum"], 20);
+        assert_eq!(k["default"], 20);
+        assert!(
+            k["description"]
+                .as_str()
+                .unwrap()
+                .contains("may return fewer than k by design")
+        );
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["required"], json!(["query"]));
     }
 
     #[test]
