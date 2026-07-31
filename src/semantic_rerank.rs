@@ -651,6 +651,7 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "forwarded_base_k": trace.base_k,
         "retrieval_profile": diagnostic(trace.raw, "retrieval_profile"),
         "requested_leg_counts": diagnostic(trace.raw, "requested_leg_counts"),
+        "retrieval_timings": diagnostic(trace.raw, "timings"),
         "realized_vector": realized("vector_ranked"),
         "realized_bm25": realized("bm25_ranked"),
         "realized_coedit": realized("coedit_ranked"),
