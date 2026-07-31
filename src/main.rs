@@ -94,7 +94,7 @@ struct Args {
     /// cost/time, in which case hitting N forces a final text response. The
     /// conversation context is preserved on that stop, so sending another
     /// message (e.g. "continue") resumes the task from where it stopped.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "ANVIL_MAX_TURNS", default_value_t = 0)]
     max_turns: usize,
 
     /// Candidate model for Asgard trajectory search. Repeat to configure an
