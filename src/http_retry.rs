@@ -250,14 +250,20 @@ pub(crate) fn contains_gateway_transient_marker(message: &str) -> bool {
 /// Body markers that mean the same thing a 5xx or a 429 status means, and
 /// so earn the same patient retry tier: every one of them names an overload
 /// or a throttle on the provider's side, never a defect in the request.
+/// "internal server error" covers Bedrock Mantle streams that wrap a 500 in
+/// a client-shaped error code (observed 2026-07-31: `response.failed` with
+/// code `invalid_prompt`, message "Internal server error" — the code lies,
+/// the message is the server's own diagnosis).
 pub(crate) fn contains_standard_transient_marker(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
     [
         "server_error",
         "server_is_overloaded",
         "rate_limit_exceeded",
+        "internal server error",
     ]
     .iter()
-    .any(|marker| message.contains(marker))
+    .any(|marker| lower.contains(marker))
 }
 
 /// Retry a request until it either succeeds, fails deterministically, or
@@ -594,6 +600,34 @@ mod tests {
             crate::llm_client::llm_retry_tier(&error),
             Some(LlmRetryTier::GatewayTransient)
         );
+    }
+
+    #[test]
+    fn invalid_prompt_wrapping_a_server_error_is_retryable() {
+        // Verbatim stream failure observed 2026-07-31: Bedrock Mantle labels
+        // an internal 500 with the client-shaped code `invalid_prompt`. The
+        // message names a server-side failure, so it earns the patient tier;
+        // classifying it terminal killed a 95-turn attempt.
+        let error = retryable_llm_error_for_responses_failure(
+            "Responses stream failed: invalid_prompt: Internal server error",
+            "invalid_prompt: Internal server error",
+        );
+        assert_eq!(
+            crate::llm_client::llm_retry_tier(&error),
+            Some(LlmRetryTier::GatewayTransient)
+        );
+    }
+
+    #[test]
+    fn genuine_invalid_prompt_stays_terminal() {
+        // A real prompt rejection names the prompt, not the server; it must
+        // not become retryable, or a deterministic refusal would burn the
+        // whole patient retry envelope on every occurrence.
+        let error = retryable_llm_error_for_responses_failure(
+            "Responses stream failed: invalid_prompt: Your prompt was rejected by content filters",
+            "invalid_prompt: Your prompt was rejected by content filters",
+        );
+        assert_eq!(crate::llm_client::llm_retry_tier(&error), None);
     }
 
     /// A 5xx must outlast a provider blip that is longer than the fast
