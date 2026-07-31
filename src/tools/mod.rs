@@ -1298,6 +1298,16 @@ impl ToolRegistry {
         policy: SandboxPolicy,
         outside_sandbox_once: bool,
     ) -> ToolResult {
+        if name == "run_shell_command"
+            && outside_sandbox_once
+            && std::env::var_os("ANVIL_OFFLINE_SHELL").is_some()
+        {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: "Outside-sandbox shell execution is disabled for this offline evaluation session."
+                    .to_string(),
+            };
+        }
         self.execute_with_sandbox_mode(name, args, policy, outside_sandbox_once, None)
             .await
     }
