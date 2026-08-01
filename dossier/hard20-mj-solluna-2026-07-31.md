@@ -338,3 +338,17 @@ edit atomicity recommendation: in-memory apply, single write (we lack
 omp's fuzzy fallback, so mid-batch failures are likelier for us);
 whole-project verification dropped as not-ours (benchmark fitting);
 compaction replay filed as anvil#326.
+
+**Landed (2026-08-01 midday)**: timeout_seconds schema ([10..3600],
+deployment cap env, default 60s->120s) + edit-batch recovery script,
+anvil `48c7450`; deterministic whitespace ladder for edit matching
+(brokk-EditBlock-style tiers, no fuzzy scoring per owner) `7abbe25`,
+gates independently re-run green (1362+19). Solver git identity +
+go/bin PATH landed in brokkbench `0e415fec` — the audit's "identity
+unset" was a prep-vs-solver HOME split: prep's `git config --global`
+wrote to /root while the solver reads /opt/work/home. Review churn
+ticketed as mjolnir#535; rtk cluster as anvil#327 (rip-vs-fix pending
+the ANVIL_RTK_DISABLED A/B). Trace provenance corrected: the audit set
+was all run 7; run 6 verified DR-free (0 review sessions in 3 spot
+checks). Ready next: fresh musl snapshot -> replication run, optionally
+as the rtk A/B.
