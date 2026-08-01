@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.17";
+const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.18";
 
 struct SmokeCase {
     name: &'static str,

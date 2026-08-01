@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil"
-version = "0.24.1"
+version = "0.24.2"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
