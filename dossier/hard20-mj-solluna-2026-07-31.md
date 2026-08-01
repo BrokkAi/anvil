@@ -273,7 +273,7 @@ criterion. Runs: 12, 13, 13, 9/16k, 10/15k, **16** vs E=15.2.
 
 Prompted by the cost equilibrium: if we pay 2.5x for more investigation
 without more quality, are the tools working as intended, or is sol
-fighting them? Three parallel Opus auditors read six run-6/7 traces
+fighting them? Three parallel Opus auditors read six run-7 traces
 end-to-end (pebble+kysely, dynamodb+cliffy, skrub+python-statemachine).
 
 **Verdict: the request volume survives audit; the tooling does not.**
