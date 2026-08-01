@@ -7,9 +7,18 @@
 //! The checkpoint is provider-neutral and persisted on its anchor turn, while
 //! raw turns remain untouched for ACP replay, rewind, and Brokk compatibility.
 //!
-//! Inputs too large for one compactor request are split, extracted, and folded
-//! until the final state-snapshot request fits. The same chunking machinery is
-//! retained for the independent user-facing recap feature.
+//! Compaction tries a native, in-conversation path first: the full native
+//! message list (canonical prefix + dynamic history) plus the advertised
+//! tool schemas is sent back to the model as-is, with one trailing user
+//! instruction asking it to write the `<state_snapshot>` in place. This
+//! preserves provider prompt-cache reuse and loses no structure, unlike
+//! flattening to text. When that attempt is skipped (the input is already
+//! too close to the context window to risk it), fails, or produces an
+//! unusable or non-reducing snapshot, compaction falls back to rendering
+//! history as plain text and summarizing it in a fresh request, splitting,
+//! extracting, and folding hierarchically until the final state-snapshot
+//! request fits. The same chunking machinery is retained for the
+//! independent user-facing turn-recap feature.
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -20,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
     ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
-    TokenUsage, stream_chat_no_visible_output_with_retry,
+    TokenUsage, ToolDefinition, stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ConversationTurn;
 use crate::tokens::{approximate_tokens, approximate_tokens_messages};
@@ -71,17 +80,10 @@ pub struct HistoryCompaction {
     pub after_tokens: usize,
 }
 
-const HISTORY_SNAPSHOT_PROMPT: &str = "You maintain the working memory of an AI coding agent. \
-Rewrite the supplied conversation history as a precise state snapshot that another agent can \
-continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
-verification that the history does not show. Include every user message or request, explicit \
-requirements and preferences, decisions and rationale, important files/symbols/patch state, \
-commands and results, errors and attempted fixes, current work, pending work, and the best next \
-step. Distinguish verified facts from hypotheses. Never present an action that already failed as \
-current or next work without stating that it failed and why. Tool calls may contain the only \
-evidence, so read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
-Return only this XML structure:\n\
-<state_snapshot>\n\
+/// The `<state_snapshot>` XML schema, shared verbatim by the rendered
+/// fallback prompt and the native in-conversation instruction so the tag
+/// list has exactly one source of truth.
+const STATE_SNAPSHOT_SCHEMA: &str = "<state_snapshot>\n\
 <primary_request_and_intent>...</primary_request_and_intent>\n\
 <explicit_requirements>...</explicit_requirements>\n\
 <all_user_messages>...</all_user_messages>\n\
@@ -93,6 +95,58 @@ Return only this XML structure:\n\
 <current_work>...</current_work>\n\
 <next_step>...</next_step>\n\
 </state_snapshot>";
+
+const HISTORY_SNAPSHOT_PROMPT_PREFIX: &str = "You maintain the working memory of an AI coding \
+agent. Rewrite the supplied conversation history as a precise state snapshot that another agent \
+can continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
+verification that the history does not show. Include every user message or request, explicit \
+requirements and preferences, decisions and rationale, important files/symbols/patch state, \
+commands and results, errors and attempted fixes, current work, pending work, and the best next \
+step. Distinguish verified facts from hypotheses. Never present an action that already failed as \
+current or next work without stating that it failed and why. Tool calls may contain the only \
+evidence, so read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
+Return only this XML structure:\n";
+
+/// System prompt for the rendered-fallback compaction request. Built (rather
+/// than a plain `const`) so it can splice in [`STATE_SNAPSHOT_SCHEMA`]
+/// without duplicating the tag list -- `concat!` cannot reference a named
+/// `const` string, only literals.
+fn history_snapshot_prompt() -> String {
+    format!("{HISTORY_SNAPSHOT_PROMPT_PREFIX}{STATE_SNAPSHOT_SCHEMA}")
+}
+
+/// Trailing user instruction appended to the native in-conversation
+/// compaction request (Phase 2's primary path). Unlike
+/// [`HISTORY_SNAPSHOT_PROMPT_PREFIX`], which introduces a flattened,
+/// out-of-band history dump, this is spoken directly into the ongoing
+/// conversation -- it announces the checkpoint, tells the model not to act
+/// on anything (no tool calls), and asks for the same snapshot schema.
+const NATIVE_SNAPSHOT_INSTRUCTION_PREFIX: &str = "The conversation above is this session's actual \
+history so far and is about to exceed its context window. Before we continue, checkpoint it: \
+rewrite everything above as a precise state snapshot that another instance of you can continue \
+from immediately, using only the conversation itself as source material. Preserve facts and \
+evidence, not prose. Never claim work or verification that the history does not show. Include \
+every user message or request, explicit requirements and preferences, decisions and rationale, \
+important files/symbols/patch state, commands and results, errors and attempted fixes, current \
+work, pending work, and the best next step. Distinguish verified facts from hypotheses. Never \
+present an action that already failed as current or next work without stating that it failed and \
+why. Tool calls may contain the only evidence, so read them carefully. Omit private \
+analysis/reasoning and redundant chatter. Do NOT call any tools for this; respond with text \
+only.\n\n\
+Return only this XML structure:\n";
+
+fn native_snapshot_instruction() -> String {
+    format!("{NATIVE_SNAPSHOT_INSTRUCTION_PREFIX}{STATE_SNAPSHOT_SCHEMA}")
+}
+
+/// Above this fraction of the declared context window, `all_messages` alone
+/// (before the trailing compaction instruction is even added) is judged too
+/// close to the limit to risk the native in-conversation attempt, so
+/// compaction skips straight to the rendered fallback. The trigger that
+/// calls `compact_history` at all fires at [`BUDGET_FRACTION`] (75%), so
+/// this only trips when the caller's token estimate ran far behind the
+/// real prompt size.
+const NATIVE_ATTEMPT_GUARD_FRACTION: f64 = 0.90;
 
 const HISTORY_CHUNK_PROMPT: &str = "Extract durable working-memory facts from this fragment of \
 an AI coding-agent history. Preserve user requests, requirements, decisions, paths and symbols, \
@@ -115,17 +169,28 @@ approach.";
 /// Compact complete provider-neutral model history into one cumulative state
 /// checkpoint. The caller keeps the canonical system/instruction prefix and
 /// any post-checkpoint tail verbatim.
+///
+/// `all_messages` is the full conversation (canonical prefix + dynamic
+/// history) in native form; `dynamic_start` is the index where the
+/// compactable dynamic history begins. Everything below operates on
+/// `history = &all_messages[dynamic_start..]`, exactly as if that slice had
+/// been passed directly -- `all_messages` and `tools` exist only so the
+/// native attempt can send the model its own real conversation (plus
+/// advertised tool schemas) instead of a flattened rendering of it.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_history(
     llm: &dyn LlmBackend,
     model: &str,
-    history: &[ChatMessage],
+    all_messages: &[ChatMessage],
+    dynamic_start: usize,
+    tools: Option<&[ToolDefinition]>,
     current_plan: Option<&crate::plan::UpdatePlanArgs>,
     reasoning_effort: Option<String>,
     context_length: Option<u32>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<HistoryCompaction> {
+    let history = &all_messages[dynamic_start..];
     if history.is_empty() {
         anyhow::bail!("cannot compact empty history");
     }
@@ -144,12 +209,75 @@ pub async fn compact_history(
     } else {
         exact_tail
     };
-    let mut body = render_history_for_compaction(history_to_summarize);
     let digests = build_digests(history);
+
+    // Primary path: ask the model to checkpoint its own real conversation
+    // in place. Skipped when the raw conversation is already close enough
+    // to the window that adding the trailing instruction risks overflowing
+    // it outright -- the rendered fallback below is smaller by
+    // construction (flattened text plus one instruction, not the full
+    // native message list).
+    let window_tokens = context_length.unwrap_or(FALLBACK_CONTEXT_LENGTH) as f64;
+    let all_messages_tokens = approximate_tokens_messages(all_messages) as f64;
+    if all_messages_tokens <= window_tokens * NATIVE_ATTEMPT_GUARD_FRACTION {
+        if cancel.is_cancelled() {
+            anyhow::bail!("compaction cancelled");
+        }
+        let mut native_messages = all_messages.to_vec();
+        native_messages.push(ChatMessage::user(native_snapshot_instruction()));
+        match run_compaction_request(
+            llm,
+            model,
+            native_messages,
+            tools.map(<[_]>::to_vec),
+            reasoning_effort.clone(),
+            idle_timeout,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok((snapshot, call_usage)) => {
+                usage.add(call_usage);
+                match build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)
+                {
+                    Ok((checkpoint_messages, after_tokens)) => {
+                        return Ok(HistoryCompaction {
+                            checkpoint_messages,
+                            usage,
+                            before_tokens,
+                            after_tokens,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "native in-conversation compaction produced an unusable checkpoint; \
+                             falling back to rendered summarization: {error:#}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    "native in-conversation compaction failed; falling back to rendered \
+                     summarization: {error:#}"
+                );
+            }
+        }
+    }
+
+    // Fallback: flatten `history` to plain text and summarize it in a fresh
+    // request, splitting hierarchically when even the flattened text
+    // doesn't fit. Unchanged from the pre-native-path behavior; also used
+    // directly (never via the native attempt above) by the turn-recap
+    // feature's chunking helpers below.
+    let mut body = render_history_for_compaction(history_to_summarize);
 
     loop {
         let final_messages = vec![
-            ChatMessage::system(HISTORY_SNAPSHOT_PROMPT),
+            ChatMessage::system(history_snapshot_prompt()),
             ChatMessage::user(format!("History to compact:\n\n{body}")),
         ];
         if approximate_tokens_messages(&final_messages) <= budget {
@@ -157,29 +285,15 @@ pub async fn compact_history(
                 llm,
                 model,
                 final_messages,
+                None,
                 reasoning_effort.clone(),
                 idle_timeout,
                 cancel.clone(),
             )
             .await?;
             usage.add(call_usage);
-            let snapshot = normalize_state_snapshot(&snapshot)?;
-            let mut checkpoint_messages = vec![ChatMessage::user(format!(
-                "{CHECKPOINT_PREAMBLE}\n\n{snapshot}{digests}"
-            ))];
-            if let Some(plan) = current_plan {
-                checkpoint_messages.push(ChatMessage::user(format!(
-                    "<current_plan>\n{}\n</current_plan>",
-                    serde_json::to_string_pretty(plan)?
-                )));
-            }
-            checkpoint_messages.extend_from_slice(exact_tail);
-            let after_tokens = approximate_tokens_messages(&checkpoint_messages);
-            if after_tokens >= before_tokens {
-                anyhow::bail!(
-                    "compaction did not reduce history (~{before_tokens} -> ~{after_tokens} tokens)"
-                );
-            }
+            let (checkpoint_messages, after_tokens) =
+                build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)?;
             return Ok(HistoryCompaction {
                 checkpoint_messages,
                 usage,
@@ -211,6 +325,7 @@ pub async fn compact_history(
                 llm,
                 model,
                 messages,
+                None,
                 reasoning_effort.clone(),
                 idle_timeout,
                 cancel.clone(),
@@ -228,6 +343,39 @@ pub async fn compact_history(
         }
         body = reduced;
     }
+}
+
+/// Normalize the compactor's raw response into checkpoint messages and
+/// verify the checkpoint actually shrank history. Shared by the native and
+/// rendered-fallback paths so both apply the exact same
+/// preamble/digest/plan/tail assembly and the same not-reduced check; the
+/// native path treats any `Err` here as a fallback trigger, while the
+/// rendered path (the last resort) propagates it as a hard error.
+fn build_checkpoint(
+    raw_snapshot: &str,
+    digests: &str,
+    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    exact_tail: &[ChatMessage],
+    before_tokens: usize,
+) -> Result<(Vec<ChatMessage>, usize)> {
+    let snapshot = normalize_state_snapshot(raw_snapshot)?;
+    let mut checkpoint_messages = vec![ChatMessage::user(format!(
+        "{CHECKPOINT_PREAMBLE}\n\n{snapshot}{digests}"
+    ))];
+    if let Some(plan) = current_plan {
+        checkpoint_messages.push(ChatMessage::user(format!(
+            "<current_plan>\n{}\n</current_plan>",
+            serde_json::to_string_pretty(plan)?
+        )));
+    }
+    checkpoint_messages.extend_from_slice(exact_tail);
+    let after_tokens = approximate_tokens_messages(&checkpoint_messages);
+    if after_tokens >= before_tokens {
+        anyhow::bail!(
+            "compaction did not reduce history (~{before_tokens} -> ~{after_tokens} tokens)"
+        );
+    }
+    Ok((checkpoint_messages, after_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +707,7 @@ async fn run_compaction_request(
     llm: &dyn LlmBackend,
     model: &str,
     messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDefinition>>,
     reasoning_effort: Option<String>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
@@ -570,7 +719,7 @@ async fn run_compaction_request(
         || StreamChatRequest {
             model: model.to_string(),
             messages: messages.clone(),
-            tools: None,
+            tools: tools.clone(),
             reasoning_effort: reasoning_effort.clone(),
             service_tier: None,
             temperature: None,
@@ -1759,9 +1908,11 @@ mod tests {
             &backend,
             "mock",
             &history,
+            0,
             None,
             None,
-            Some(8_000),
+            None,
+            Some(100_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
@@ -1779,6 +1930,288 @@ mod tests {
             Some("exact recent result")
         );
         assert!(compacted.after_tokens < compacted.before_tokens);
+    }
+
+    /// Backend for exercising the native in-conversation compaction path.
+    /// `ScriptedBackend` dispatches on the FIRST message, which works for
+    /// the rendered fallback (a fresh `[system, user]` request) but not for
+    /// the native attempt, whose first message is the conversation's own
+    /// system message. This dispatches on whether the LAST message carries
+    /// the native instruction's marker text instead, and records every
+    /// request's messages/tools for inspection.
+    type CapturedCompactionRequest = (
+        Vec<ChatMessage>,
+        Option<Vec<crate::llm_client::ToolDefinition>>,
+    );
+
+    struct NativeAwareBackend {
+        native_fails: bool,
+        native_response: String,
+        fallback_response: String,
+        chunk_response: String,
+        captured: Arc<Mutex<Vec<CapturedCompactionRequest>>>,
+    }
+
+    impl NativeAwareBackend {
+        fn new(native_fails: bool, native_response: &str, fallback_response: &str) -> Self {
+            Self {
+                native_fails,
+                native_response: native_response.to_string(),
+                fallback_response: fallback_response.to_string(),
+                chunk_response: "- extracted history".to_string(),
+                captured: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn is_native_request(messages: &[ChatMessage]) -> bool {
+            messages
+                .last()
+                .and_then(|m| m.text_content())
+                .is_some_and(|text| text.contains(NATIVE_SNAPSHOT_INSTRUCTION_PREFIX))
+        }
+    }
+
+    impl LlmBackend for NativeAwareBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            async { Ok(vec!["mock".into()]) }.boxed()
+        }
+        fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((request.messages.clone(), request.tools.clone()));
+            if Self::is_native_request(&request.messages) {
+                if self.native_fails {
+                    return async {
+                        Err(anyhow::anyhow!("native compaction intentionally failed"))
+                    }
+                    .boxed();
+                }
+                let response = self.native_response.clone();
+                return async move {
+                    Ok(LlmResponse::Text {
+                        text: response,
+                        reasoning_content: None,
+                        usage: crate::llm_client::TokenUsage::default(),
+                    })
+                }
+                .boxed();
+            }
+            let system = request
+                .messages
+                .first()
+                .and_then(|m| m.text_content())
+                .unwrap_or("");
+            // `HISTORY_CHUNK_PROMPT` (extraction pass) vs. the final
+            // rendered-snapshot request built from `history_snapshot_prompt()`
+            // -- compact_history's fallback has no separate meta/combine
+            // stage, unlike turn summarization.
+            let response = if system.contains("Extract durable working-memory facts") {
+                self.chunk_response.clone()
+            } else {
+                self.fallback_response.clone()
+            };
+            async move {
+                Ok(LlmResponse::Text {
+                    text: response,
+                    reasoning_content: None,
+                    usage: crate::llm_client::TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn read_file_tool_definition() -> crate::llm_client::ToolDefinition {
+        crate::llm_client::ToolDefinition {
+            r#type: "function".to_string(),
+            function: crate::llm_client::FunctionDef {
+                name: "read_file".to_string(),
+                description: "Read a file.".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    /// The native attempt sends the conversation's own native messages
+    /// (assistant `tool_calls` included, un-flattened), the trailing
+    /// instruction, and the advertised tools -- exactly what Phase 2
+    /// promises over the old flatten-to-text request.
+    #[tokio::test]
+    async fn compact_history_native_path_sends_native_messages_and_tools() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let backend = NativeAwareBackend::new(
+            false,
+            "<state_snapshot><pending_tasks>done</pending_tasks></state_snapshot>",
+            "unused",
+        );
+        let captured = backend.captured.clone();
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("please read the file and summarize its contents".repeat(50)),
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+                },
+            }]),
+            ChatMessage::tool_result("c1", "read_file", "file contents ".repeat(200)),
+        ];
+        let tools = vec![read_file_tool_definition()];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            Some(&tools),
+            None,
+            None,
+            Some(200_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds");
+        assert!(compacted.after_tokens < compacted.before_tokens);
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "native attempt should succeed on the first call"
+        );
+        let (messages, request_tools) = &requests[0];
+
+        // The original native messages -- including the un-flattened
+        // assistant `tool_calls` message -- are present verbatim.
+        assert_eq!(messages[0].text_content(), Some("canonical system prompt"));
+        assert!(
+            messages[1]
+                .text_content()
+                .unwrap()
+                .starts_with("please read the file")
+        );
+        assert!(
+            messages[2].tool_calls.is_some(),
+            "assistant tool_calls must survive un-flattened"
+        );
+        assert_eq!(
+            messages[2].tool_calls.as_ref().unwrap()[0].function.name,
+            "read_file"
+        );
+        assert_eq!(messages[3].role, "tool");
+
+        // Trailing instruction asks for a state snapshot in text only.
+        let last = messages.last().unwrap().text_content().unwrap();
+        assert!(last.contains("state_snapshot"));
+        assert!(last.contains("Do NOT call any tools"));
+
+        // Advertised tool schemas are passed through.
+        let request_tools = request_tools.as_ref().expect("tools should be forwarded");
+        assert!(request_tools.iter().any(|t| t.function.name == "read_file"));
+    }
+
+    /// When the native attempt fails, compaction falls back to the
+    /// flatten+chunk rendered path and still produces a valid checkpoint.
+    #[tokio::test]
+    async fn compact_history_falls_back_when_native_attempt_fails() {
+        let backend = NativeAwareBackend::new(
+            true,
+            "unused",
+            "<state_snapshot><pending_tasks>fallback done</pending_tasks></state_snapshot>",
+        );
+        let captured = backend.captured.clone();
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("old context ".repeat(2_000)),
+            ChatMessage::assistant("acknowledged"),
+        ];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            None,
+            None,
+            None,
+            Some(200_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds via fallback");
+
+        let first_message = compacted.checkpoint_messages[0].text_content().unwrap();
+        assert!(first_message.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(first_message.contains("<state_snapshot>"));
+        assert!(first_message.contains("fallback done"));
+
+        let requests = captured.lock().unwrap();
+        assert!(
+            requests.len() >= 2,
+            "expected a failed native call plus at least one fallback call, got {}",
+            requests.len()
+        );
+        assert!(
+            NativeAwareBackend::is_native_request(&requests[0].0),
+            "first call should be the native attempt"
+        );
+        assert!(
+            !NativeAwareBackend::is_native_request(&requests[1].0),
+            "second call should be the rendered fallback, not another native attempt"
+        );
+    }
+
+    /// When the raw conversation is already too close to the declared
+    /// context window, the native attempt is skipped entirely -- the
+    /// backend never sees the native instruction, and the very first
+    /// request is already the rendered fallback.
+    #[tokio::test]
+    async fn compact_history_guard_skips_native_when_conversation_too_large() {
+        let backend = NativeAwareBackend::new(
+            false,
+            "unused",
+            "<state_snapshot><pending_tasks>guarded fallback</pending_tasks></state_snapshot>",
+        );
+        let captured = backend.captured.clone();
+        // A tiny declared window (1_000 tokens) with history that alone
+        // exceeds 90% of it forces the guard to trip.
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("word ".repeat(2_000)),
+        ];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            None,
+            None,
+            None,
+            Some(1_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds via fallback");
+        assert!(
+            compacted.checkpoint_messages[0]
+                .text_content()
+                .unwrap()
+                .contains("guarded fallback")
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(!requests.is_empty());
+        for (messages, _) in requests.iter() {
+            assert!(
+                !NativeAwareBackend::is_native_request(messages),
+                "native instruction must never be sent once the guard trips"
+            );
+        }
     }
 
     /// Build an assistant message issuing one `read_file` tool call, using

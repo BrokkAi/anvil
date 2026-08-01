@@ -2067,11 +2067,12 @@ pub(crate) async fn run(
             && crate::tokens::approximate_tokens_messages(&messages)
                 > crate::context_manager::context_budget(context_length)
         {
-            let dynamic_history = messages[context_prefix_len..].to_vec();
             match crate::context_manager::compact_history(
                 llm.as_ref(),
                 model,
-                &dynamic_history,
+                &messages,
+                context_prefix_len,
+                Some(&tools),
                 current_plan.as_ref(),
                 reasoning_effort.map(str::to_string),
                 context_length,
