@@ -6447,6 +6447,7 @@ mod tests {
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),
                 Vec::new(),
+                false,
             )
             .await,
         );
@@ -6557,6 +6558,7 @@ mod tests {
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),
                 Vec::new(),
+                false,
             )
             .await,
         );
@@ -6683,6 +6685,7 @@ mod tests {
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),
                 Vec::new(),
+                false,
             )
             .await,
         );

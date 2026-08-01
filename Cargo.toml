@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "crates/anvil-minimizer"]
 # Keep `cargo build` / `cargo test` from the workspace root focused on the
 # root crate. The xtask sub-crate is dev-only and is invoked through the
 # `cargo xtask` alias (see .cargo/config.toml), which builds it on demand.
@@ -25,18 +25,12 @@ path = "src/main.rs"
 
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable"] }
+anvil-minimizer = { path = "crates/anvil-minimizer" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
 # wasmtime hosts when the wasm sandbox is enabled.
 brokk-acp-sandbox = "0.1.0"
-# Anvil hosts RTK for command rewriting and dispatches rewritten commands via
-# `anvil __rtk ...`. The `hosted` feature suppresses RTK's telemetry, hook
-# warnings, integrity checks, and tracking writes for this embedded use case.
-# We intentionally do not try to compile out RTK's `src/hooks`: it is wired into
-# command parsing, filter trust checks, discovery, and analytics, while hosted
-# mode already avoids the hook installer/runtime side effects Anvil cares about.
-rtk_core = { package = "brokk-rtk", version = "0.42.4", features = ["hosted"] }
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.

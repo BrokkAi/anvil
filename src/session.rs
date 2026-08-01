@@ -2995,6 +2995,9 @@ pub struct SessionStore {
     /// not of any one session), mirroring `available_models`.
     client_elicitation_caps: Arc<RwLock<ClientElicitationCaps>>,
     limits: SessionLimits,
+    /// Whether each session's ToolRegistry gets a shell-output minimizer.
+    /// Set once at startup from `--no-shell-minimizer`.
+    shell_minimizer_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3098,7 +3101,15 @@ impl SessionStore {
             next_access: Arc::new(AtomicU64::new(0)),
             client_elicitation_caps: Arc::new(RwLock::new(ClientElicitationCaps::default())),
             limits,
+            shell_minimizer_enabled: true,
         }
+    }
+
+    /// Enable or disable the shell-output minimizer for registries built by
+    /// this store. Consuming builder, wired from `--no-shell-minimizer`.
+    pub fn with_shell_minimizer(mut self, enabled: bool) -> Self {
+        self.shell_minimizer_enabled = enabled;
+        self
     }
 
     /// Bump the LRU "last accessed" counter for `id`. Cheap: a single
@@ -3323,6 +3334,7 @@ impl SessionStore {
                 skills,
                 agents,
                 plugin_hooks,
+                self.shell_minimizer_enabled,
             )
             .await,
         );
@@ -3385,6 +3397,7 @@ impl SessionStore {
                 skills,
                 agents,
                 plugin_hooks,
+                self.shell_minimizer_enabled,
             )
             .await,
         ))

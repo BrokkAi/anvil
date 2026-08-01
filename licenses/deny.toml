@@ -42,9 +42,8 @@ exceptions = [
     # This parser is embedded both as native Rust code and as a wasm32-wasip2
     # guest. Its exact source and LGPL/GPL texts are represented in the report.
     { crate = "brokk-acp-sandbox@0.1.0", allow = ["LGPL-3.0-only"] },
-    # MPL applies at file scope. Keep it limited to the two reviewed crates and
+    # MPL applies at file scope. Keep it limited to the reviewed crate and
     # retain exact source-package links in the generated report.
-    { crate = "colored@2.2.0", allow = ["MPL-2.0"] },
     { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
     # The bzip2/libbzip2 1.0.6 terms are permissive but use a non-SPDX id.
     { crate = "libbz2-rs-sys@0.2.5", allow = ["bzip2-1.0.6"] },

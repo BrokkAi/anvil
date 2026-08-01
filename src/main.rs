@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -199,6 +198,14 @@ struct Args {
     /// runs without any sandbox of any kind.
     #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
+
+    /// Disable the built-in shell-output minimizer. By default,
+    /// `run_shell_command` output from well-known tools (git, cargo,
+    /// pytest, npm, ...) is condensed after capture, with the raw output
+    /// preserved under `.brokk/shell-output/` in the workspace and
+    /// referenced from the tool result.
+    #[arg(long, env = "ANVIL_NO_SHELL_MINIMIZER", default_value_t = false)]
+    no_shell_minimizer: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,6 +230,7 @@ impl std::fmt::Debug for Args {
             .field("llm_idle_timeout_secs", &self.llm_idle_timeout_secs)
             .field("llm_stall_timeout_secs", &self.llm_stall_timeout_secs)
             .field("transient_setup", &self.transient_setup)
+            .field("no_shell_minimizer", &self.no_shell_minimizer)
             // Deprecated flags omitted from Debug to avoid leaking api_key.
             .finish()
     }
@@ -573,11 +581,6 @@ fn build_bedrock_backend(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__rtk")) {
-        let rtk_args = std::iter::once(OsString::from("rtk")).chain(std::env::args_os().skip(2));
-        std::process::exit(rtk_core::cli_entry_code(rtk_args));
-    }
-
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -779,7 +782,8 @@ async fn main() -> Result<()> {
         args.default_model,
         limits,
         args.transient_setup,
-    );
+    )
+    .with_shell_minimizer(!args.no_shell_minimizer);
     sessions
         .set_default_reasoning_effort(args.reasoning_effort)
         .await;
