@@ -352,3 +352,31 @@ the ANVIL_RTK_DISABLED A/B). Trace provenance corrected: the audit set
 was all run 7; run 6 verified DR-free (0 review sessions in 3 spot
 checks). Ready next: fresh musl snapshot -> replication run, optionally
 as the rtk A/B.
+
+### Run 8 (replication, all fixes) — killed at max 15, 2026-08-01 evening
+
+Config: run-7 invocation verbatim; anvil 0.24.2 musl `0b228ad4`
+(compaction digests #326, rtk replaced by vendored oh-my-pi minimizer,
+timeout_seconds, whitespace ladder, batch recovery script), engine
+git-identity/PATH fix live. **Killed per policy at 9W/5L of 14 graded —
+max possible 15 < 15.2**, the same stopping point as run 6. Run 7's 16
+did not replicate; treat 16/20 as within single-run variance
+(P(vanilla>=16)=0.42 stands).
+
+Losses, all p2p-green hidden-suite near-misses except one: bandit 83/88
+(worse than its chronic 86/88), fastapi 136/137, cliffy 0/37 (its
+all-or-nothing signature), opa-template 4/5, and **dynamodb 37/37 f2p —
+the first full hidden-suite sweep in eight attempts across every config
+— lost to a single p2p regression (1266/1267)**. The freeze-invariant
+wall finally fell; the loss class moved.
+
+Field verification of the two watch items (mid-run trace reads):
+compaction restart carried the new digest snapshot ("ALREADY DONE ...
+do not re-issue tool calls") with 139 messages of productive
+continuation after it; minimizer spill round-trip confirmed — model
+read `.brokk/shell-output/<id>.txt` back via read_file and got real
+targeted test output. The audit's tee-unreachability class is dead.
+Harness bug noted: `costUsd` is 0.00 in every run-8 result row; token
+counts intact, engine cost calc broken.
+
+Score history: 12, 13, 13, 9/16k, 10/15k, **16**, 9/14k(max 15).
