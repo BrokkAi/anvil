@@ -30,6 +30,13 @@ pub enum ToolStatus {
     InternalError,
 }
 
+/// Whether a rendered tool result text represents a failure. Matches the
+/// `"Error: "` / `"Internal error: "` status prefixes `tool_result_to_execution`
+/// applies in `tool_loop.rs` for `ToolStatus::RequestError` / `InternalError`.
+pub(crate) fn tool_result_failed(result: &str) -> bool {
+    result.starts_with("Error:") || result.starts_with("Internal error:")
+}
+
 #[derive(Debug, Deserialize)]
 struct ReadFileArgs {
     file_path: String,

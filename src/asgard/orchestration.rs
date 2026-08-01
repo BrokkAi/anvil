@@ -1008,6 +1008,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 &winner.model,
                 &dynamic,
                 canonical_plan.as_ref(),
+                reasoning_effort.map(str::to_string),
                 context_length,
                 idle_timeout,
                 cancel.clone(),

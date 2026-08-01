@@ -2951,6 +2951,7 @@ pub async fn run_agent(
                     return responder.respond_with_error(unknown_session_error(&session_id));
                 };
 
+                let reasoning_effort_for_compression = snap.reasoning_effort.clone();
                 let prepared_prompt = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
@@ -2961,6 +2962,7 @@ pub async fn run_agent(
                     cancel.clone(),
                     compression_idle_timeout,
                     context_length,
+                    reasoning_effort_for_compression,
                 )
                 .await;
                 let messages = prepared_prompt.messages;
@@ -4219,6 +4221,7 @@ async fn build_prompt_messages_with_compression(
     cancel: tokio_util::sync::CancellationToken,
     idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
+    reasoning_effort: Option<String>,
 ) -> PreparedPrompt {
     use crate::context_manager::{compact_history, context_budget};
 
@@ -4247,6 +4250,7 @@ async fn build_prompt_messages_with_compression(
         &snap.model,
         &history_messages,
         current_plan.as_ref(),
+        reasoning_effort,
         context_length,
         idle_timeout,
         cancel,
@@ -4830,6 +4834,7 @@ async fn run_prepared_model_turn(
         default_idle_timeout_secs,
         default_stall_timeout_secs,
     );
+    let reasoning_effort_for_compression = snap.reasoning_effort.clone();
     let prepared_prompt = build_prompt_messages_with_compression(
         snap,
         prompt_text,
@@ -4840,6 +4845,7 @@ async fn run_prepared_model_turn(
         cancel.clone(),
         idle_timeout,
         context_length,
+        reasoning_effort_for_compression,
     )
     .await;
     let Some(registry) = sessions
@@ -9553,6 +9559,7 @@ async fn handle_compress(
         &snap.model,
         &history,
         current_plan,
+        snap.reasoning_effort.clone(),
         context_length,
         idle_timeout,
         cancel,

@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -76,8 +77,9 @@ continue from immediately. Preserve facts and evidence, not prose. Never claim w
 verification that the history does not show. Include every user message or request, explicit \
 requirements and preferences, decisions and rationale, important files/symbols/patch state, \
 commands and results, errors and attempted fixes, current work, pending work, and the best next \
-step. Distinguish verified facts from hypotheses. Tool calls may contain the only evidence, so \
-read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
+step. Distinguish verified facts from hypotheses. Never present an action that already failed as \
+current or next work without stating that it failed and why. Tool calls may contain the only \
+evidence, so read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
 Return only this XML structure:\n\
 <state_snapshot>\n\
 <primary_request_and_intent>...</primary_request_and_intent>\n\
@@ -98,14 +100,28 @@ patch state, commands and their actual results, errors, unfinished work, and chr
 infer success. Omit private analysis and redundant chatter. Output concise labeled bullets only; \
 a later pass will assemble the final state snapshot.";
 
+/// Frames the checkpoint for the restarted agent that reads it next. Issue
+/// #326: without this framing, a fresh session treated the checkpoint as
+/// just more history to react to, so it re-read files and re-issued tool
+/// calls whose outcomes were already recorded (and often already failed).
+const CHECKPOINT_PREAMBLE: &str = "A previous session of this same agent ran out of context while \
+working on the task described below. The state snapshot and digests that follow summarize work \
+that is ALREADY DONE. Build on it instead of repeating it: do not re-issue tool calls whose \
+outcomes are recorded here, do not re-read files listed in <files_already_read> unless you need \
+content that is not summarized here, and never repeat a call listed in <failed_tool_calls> with \
+the same arguments -- those exact calls already failed. Fix the arguments or take a different \
+approach.";
+
 /// Compact complete provider-neutral model history into one cumulative state
 /// checkpoint. The caller keeps the canonical system/instruction prefix and
 /// any post-checkpoint tail verbatim.
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_history(
     llm: &dyn LlmBackend,
     model: &str,
     history: &[ChatMessage],
     current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    reasoning_effort: Option<String>,
     context_length: Option<u32>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
@@ -129,6 +145,7 @@ pub async fn compact_history(
         exact_tail
     };
     let mut body = render_history_for_compaction(history_to_summarize);
+    let digests = build_digests(history);
 
     loop {
         let final_messages = vec![
@@ -136,12 +153,20 @@ pub async fn compact_history(
             ChatMessage::user(format!("History to compact:\n\n{body}")),
         ];
         if approximate_tokens_messages(&final_messages) <= budget {
-            let (snapshot, call_usage) =
-                run_compaction_request(llm, model, final_messages, idle_timeout, cancel.clone())
-                    .await?;
+            let (snapshot, call_usage) = run_compaction_request(
+                llm,
+                model,
+                final_messages,
+                reasoning_effort.clone(),
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await?;
             usage.add(call_usage);
             let snapshot = normalize_state_snapshot(&snapshot)?;
-            let mut checkpoint_messages = vec![ChatMessage::user(snapshot)];
+            let mut checkpoint_messages = vec![ChatMessage::user(format!(
+                "{CHECKPOINT_PREAMBLE}\n\n{snapshot}{digests}"
+            ))];
             if let Some(plan) = current_plan {
                 checkpoint_messages.push(ChatMessage::user(format!(
                     "<current_plan>\n{}\n</current_plan>",
@@ -182,8 +207,15 @@ pub async fn compact_history(
                     chunk
                 )),
             ];
-            let (summary, call_usage) =
-                run_compaction_request(llm, model, messages, idle_timeout, cancel.clone()).await?;
+            let (summary, call_usage) = run_compaction_request(
+                llm,
+                model,
+                messages,
+                reasoning_effort.clone(),
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await?;
             usage.add(call_usage);
             summaries.push(summary);
         }
@@ -196,6 +228,275 @@ pub async fn compact_history(
         }
         body = reduced;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint digests
+// ---------------------------------------------------------------------------
+//
+// Deterministic (non-LLM) summaries appended after the compactor's prose
+// snapshot. The model-written snapshot can lose or blur exact tool-call
+// outcomes when it summarizes; these digests are computed straight from the
+// full history so a restarted agent has an unambiguous record of what not
+// to repeat.
+
+/// Build the digest suffix appended after the state snapshot in the first
+/// checkpoint message: `<files_already_read>` then `<failed_tool_calls>`,
+/// each preceded by a blank line, in that order. Empty string when neither
+/// digest has anything to report.
+fn build_digests(history: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    if let Some(files) = files_already_read_digest(history) {
+        out.push_str("\n\n");
+        out.push_str(&files);
+    }
+    if let Some(failed) = failed_tool_calls_digest(history) {
+        out.push_str("\n\n");
+        out.push_str(&failed);
+    }
+    out
+}
+
+/// Cap on distinct paths listed in the `<files_already_read>` digest. Past
+/// this, later paths are dropped in favor of one summary line -- a session
+/// that read hundreds of files has already blown well past what's useful to
+/// enumerate.
+const MAX_DIGEST_PATHS: usize = 100;
+
+/// How many of the most recent failed tool calls the `<failed_tool_calls>`
+/// digest keeps in full. Older failures are dropped with a count note --
+/// only the failures the next agent is likely to still be relevant to
+/// (i.e. recent ones) are worth the tokens.
+const MAX_DIGEST_FAILURES: usize = 10;
+
+/// One `read_file` call's `(offset, limit)` pair, in the tool's raw
+/// 0-based-offset / max-line-count schema.
+type ReadRange = (Option<usize>, Option<usize>);
+
+/// Scan `history` for `read_file` tool calls and render one line per
+/// distinct path (first-seen order): just the path if any call read the
+/// whole file, otherwise the merged 1-based inclusive line ranges actually
+/// read (`src/foo.rs (lines 1-200, 400-450)`). Calls with unparseable
+/// arguments or a missing/non-string `file_path` are ignored. `None` when no
+/// `read_file` calls are present.
+fn files_already_read_digest(history: &[ChatMessage]) -> Option<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut reads: HashMap<String, Vec<ReadRange>> = HashMap::new();
+
+    for message in history {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in calls {
+            if call.function.name != "read_file" {
+                continue;
+            }
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            else {
+                continue;
+            };
+            let Some(file_path) = args.get("file_path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            reads
+                .entry(file_path.to_string())
+                .or_insert_with(|| {
+                    order.push(file_path.to_string());
+                    Vec::new()
+                })
+                .push((offset, limit));
+        }
+    }
+
+    if order.is_empty() {
+        return None;
+    }
+
+    let total_paths = order.len();
+    let mut lines: Vec<String> = Vec::new();
+    for path in order.iter().take(MAX_DIGEST_PATHS) {
+        let calls = &reads[path];
+        let whole_file = calls
+            .iter()
+            .any(|(offset, limit)| offset.is_none() && limit.is_none());
+        if whole_file {
+            lines.push(path.clone());
+            continue;
+        }
+        lines.push(format!("{path} ({})", render_read_ranges(calls)));
+    }
+    if total_paths > MAX_DIGEST_PATHS {
+        lines.push(format!("(+{} more files)", total_paths - MAX_DIGEST_PATHS));
+    }
+
+    Some(format!(
+        "<files_already_read>\n{}\n</files_already_read>",
+        lines.join("\n")
+    ))
+}
+
+/// Merge one path's `(offset, limit)` reads into "lines A-B, C-D" text.
+/// `offset` is the tool's 0-based start line; `limit` is the max line
+/// count, absent meaning "to end of file". Overlapping/adjacent ranges are
+/// merged; an unbounded (to-end-of-file) range renders its upper bound as
+/// `end` and absorbs any range that starts after it.
+fn render_read_ranges(calls: &[ReadRange]) -> String {
+    let mut ranges: Vec<(usize, usize)> = calls
+        .iter()
+        .map(|(offset, limit)| {
+            let start = offset.unwrap_or(0) + 1; // 0-based -> 1-based
+            let end = limit
+                .map(|limit| start.saturating_add(limit.saturating_sub(1)))
+                .unwrap_or(usize::MAX);
+            (start, end)
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => {
+                last.1 = last.1.max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let rendered = merged
+        .iter()
+        .map(|&(start, end)| {
+            if end == usize::MAX {
+                format!("{start}-end")
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("lines {rendered}")
+}
+
+/// Scan `history` for failed tool results (per
+/// `crate::tools::tool_result_failed`) and render the most recent
+/// [`MAX_DIGEST_FAILURES`] as a numbered list: `` N. `tool` args=... -> result
+/// first line ``. Arguments and the result's first line are truncated
+/// (char-boundary-safe) to keep the digest bounded. `None` when no tool
+/// result failed.
+fn failed_tool_calls_digest(history: &[ChatMessage]) -> Option<String> {
+    const MAX_ARGS_CHARS: usize = 500;
+    const MAX_RESULT_CHARS: usize = 200;
+
+    let mut calls: HashMap<&str, (&str, &str)> = HashMap::new();
+    for message in history {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in tool_calls {
+            calls.insert(
+                call.id.as_str(),
+                (
+                    call.function.name.as_str(),
+                    call.function.arguments.as_str(),
+                ),
+            );
+        }
+    }
+
+    struct Failure {
+        tool_name: String,
+        arguments: String,
+        result_first_line: String,
+    }
+
+    let mut failures: Vec<Failure> = Vec::new();
+    for message in history {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call_id) = &message.tool_call_id else {
+            continue;
+        };
+        let text = message.text_content().unwrap_or("");
+        if !crate::tools::tool_result_failed(text) {
+            continue;
+        }
+        let (tool_name, arguments) = calls
+            .get(call_id.as_str())
+            .map(|&(name, args)| (name.to_string(), args.to_string()))
+            .unwrap_or_else(|| {
+                (
+                    message
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    String::new(),
+                )
+            });
+        failures.push(Failure {
+            tool_name,
+            arguments,
+            result_first_line: text.lines().next().unwrap_or("").to_string(),
+        });
+    }
+
+    if failures.is_empty() {
+        return None;
+    }
+
+    let total = failures.len();
+    let kept: &[Failure] = if total > MAX_DIGEST_FAILURES {
+        &failures[total - MAX_DIGEST_FAILURES..]
+    } else {
+        &failures[..]
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    if total > MAX_DIGEST_FAILURES {
+        lines.push(format!(
+            "({} earlier failed calls omitted)",
+            total - MAX_DIGEST_FAILURES
+        ));
+    }
+    for (index, failure) in kept.iter().enumerate() {
+        lines.push(format!(
+            "{}. `{}` args={} -> {}",
+            index + 1,
+            failure.tool_name,
+            truncate_chars(&failure.arguments, MAX_ARGS_CHARS),
+            truncate_chars(&failure.result_first_line, MAX_RESULT_CHARS),
+        ));
+    }
+
+    Some(format!(
+        "<failed_tool_calls>\n{}\n</failed_tool_calls>",
+        lines.join("\n")
+    ))
+}
+
+/// Truncate `s` to at most `max` chars (char-boundary-safe, unlike a byte
+/// slice), appending `…` when truncation actually happened.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Retain a recent provider-neutral tail verbatim while summarizing the older
@@ -258,6 +559,7 @@ async fn run_compaction_request(
     llm: &dyn LlmBackend,
     model: &str,
     messages: Vec<ChatMessage>,
+    reasoning_effort: Option<String>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<(String, TokenUsage)> {
@@ -269,7 +571,7 @@ async fn run_compaction_request(
             model: model.to_string(),
             messages: messages.clone(),
             tools: None,
-            reasoning_effort: Some("low".to_string()),
+            reasoning_effort: reasoning_effort.clone(),
             service_tier: None,
             temperature: None,
             structured_output: None,
@@ -1448,7 +1750,7 @@ mod tests {
                 r#type: "function".into(),
                 function: FunctionCall {
                     name: "read_file".into(),
-                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 },
             }]),
             ChatMessage::tool_result("c1", "read_file", "exact recent result"),
@@ -1458,6 +1760,7 @@ mod tests {
             "mock",
             &history,
             None,
+            None,
             Some(8_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
@@ -1465,12 +1768,10 @@ mod tests {
         .await
         .expect("compaction succeeds");
 
-        assert!(
-            compacted.checkpoint_messages[0]
-                .text_content()
-                .unwrap()
-                .contains("<state_snapshot>")
-        );
+        let first_message = compacted.checkpoint_messages[0].text_content().unwrap();
+        assert!(first_message.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(first_message.contains("<state_snapshot>"));
+        assert!(first_message.contains("<files_already_read>"));
         assert_eq!(compacted.checkpoint_messages[1].role, "assistant");
         assert_eq!(compacted.checkpoint_messages[2].role, "tool");
         assert_eq!(
@@ -1478,6 +1779,209 @@ mod tests {
             Some("exact recent result")
         );
         assert!(compacted.after_tokens < compacted.before_tokens);
+    }
+
+    /// Build an assistant message issuing one `read_file` tool call, using
+    /// the real schema fields (`file_path`, `offset`, `limit`; see
+    /// `tools/mod.rs` `ReadFileArgs`).
+    fn read_file_call(
+        call_id: &str,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> ChatMessage {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+        if let Some(offset) = offset {
+            args.insert("offset".to_string(), serde_json::Value::from(offset));
+        }
+        if let Some(limit) = limit {
+            args.insert("limit".to_string(), serde_json::Value::from(limit));
+        }
+        ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: call_id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::Value::Object(args).to_string(),
+            },
+        }])
+    }
+
+    #[test]
+    fn files_already_read_digest_is_none_without_read_file_calls() {
+        let history = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        assert!(files_already_read_digest(&history).is_none());
+    }
+
+    #[test]
+    fn files_already_read_digest_dedupes_merges_ranges_and_prefers_whole_file() {
+        let history = vec![
+            read_file_call("c1", "src/foo.rs", Some(0), Some(200)), // lines 1-200
+            read_file_call("c2", "src/foo.rs", Some(399), Some(51)), // lines 400-450
+            read_file_call("c3", "src/foo.rs", Some(150), Some(100)), // lines 151-250, overlaps c1
+            read_file_call("c4", "src/bar.rs", Some(10), Some(5)),  // lines 11-15
+            read_file_call("c5", "src/bar.rs", None, None),         // whole file wins
+            read_file_call("c6", "src/baz.rs", Some(20), None),     // offset-to-end
+        ];
+        let digest = files_already_read_digest(&history).expect("digest present");
+        assert!(digest.starts_with("<files_already_read>\n"));
+        assert!(digest.ends_with("\n</files_already_read>"));
+        // c1 and c3 overlap (1-200 and 151-250) and merge into one range;
+        // c2 (400-450) stays separate.
+        assert!(
+            digest.contains("src/foo.rs (lines 1-250, 400-450)"),
+            "unexpected digest: {digest}"
+        );
+        // A later whole-file read overrides the earlier ranged reads.
+        assert!(digest.contains("src/bar.rs\n") || digest.contains("src/bar.rs\n</"));
+        assert!(!digest.contains("src/bar.rs (lines"));
+        // offset present, no limit -> "to end of file".
+        assert!(digest.contains("src/baz.rs (lines 21-end)"), "{digest}");
+        // First-seen order: foo.rs before bar.rs before baz.rs.
+        let foo_pos = digest.find("src/foo.rs").unwrap();
+        let bar_pos = digest.find("src/bar.rs").unwrap();
+        let baz_pos = digest.find("src/baz.rs").unwrap();
+        assert!(foo_pos < bar_pos && bar_pos < baz_pos);
+    }
+
+    #[test]
+    fn files_already_read_digest_ignores_unparseable_and_missing_path() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let bad_json = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: "not json".into(),
+            },
+        }]);
+        let missing_path = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "c2".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"offset":0}"#.into(),
+            },
+        }]);
+        let history = vec![bad_json, missing_path];
+        assert!(files_already_read_digest(&history).is_none());
+    }
+
+    #[test]
+    fn files_already_read_digest_caps_paths_and_notes_the_rest() {
+        let history: Vec<ChatMessage> = (0..101)
+            .map(|i| read_file_call(&format!("c{i}"), &format!("src/file_{i}.rs"), None, None))
+            .collect();
+        let digest = files_already_read_digest(&history).expect("digest present");
+        assert!(digest.contains("(+1 more files)"), "{digest}");
+        assert!(digest.contains("src/file_0.rs"));
+        assert!(!digest.contains("src/file_100.rs"));
+    }
+
+    /// Build a `role: "tool"` message paired with an assistant tool call so
+    /// the digest's call-id join has something to match. `result` becomes
+    /// the tool message's text content.
+    fn tool_exchange_messages(
+        call_id: &str,
+        tool_name: &str,
+        args: &str,
+        result: &str,
+    ) -> Vec<ChatMessage> {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        vec![
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: call_id.to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: tool_name.to_string(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            ChatMessage::tool_result(call_id, tool_name, result),
+        ]
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_is_none_when_nothing_failed() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "read_file",
+            "{}",
+            "file contents",
+        ));
+        assert!(failed_tool_calls_digest(&history).is_none());
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_catches_malformed_args_error() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "read_file",
+            r#"{"file_path": "src/lib.rs""#,
+            "Error: tool arguments are not valid JSON (EOF while parsing an object at line 1 column 27)",
+        ));
+        // A successful call must not show up alongside the failure.
+        history.extend(tool_exchange_messages(
+            "c2",
+            "read_file",
+            "{}",
+            "ok contents",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.starts_with("<failed_tool_calls>\n"));
+        assert!(digest.contains("1. `read_file` args="));
+        assert!(digest.contains("Error: tool arguments are not valid JSON"));
+        assert!(!digest.contains("ok contents"));
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_truncates_long_arguments() {
+        let long_args = format!(r#"{{"pattern":"{}"}}"#, "x".repeat(600));
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "grep_search",
+            &long_args,
+            "Error: no matches",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.contains('…'), "expected truncation marker: {digest}");
+        // 500 chars of args plus the marker, well under the full argument length.
+        assert!(digest.len() < long_args.len());
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_keeps_last_ten_and_notes_omitted_count() {
+        let mut history = Vec::new();
+        for i in 0..13 {
+            history.extend(tool_exchange_messages(
+                &format!("c{i}"),
+                "run_shell_command",
+                &format!(r#"{{"command":"step{i}"}}"#),
+                &format!("Error: step {i} failed"),
+            ));
+        }
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(
+            digest.contains("(3 earlier failed calls omitted)"),
+            "{digest}"
+        );
+        // Only the last 10 (steps 3..=12) survive, renumbered from 1.
+        assert!(digest.contains("step 3 failed"), "{digest}");
+        assert!(!digest.contains("step 2 failed"), "{digest}");
+        assert!(digest.contains("step 12 failed"), "{digest}");
+        assert!(digest.contains("10. `run_shell_command`"), "{digest}");
+        assert!(!digest.contains("11. `run_shell_command`"), "{digest}");
     }
 
     /// The recap entry point reuses the same machinery but drives the

@@ -34,7 +34,7 @@ use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::tools::sandbox::SandboxPolicy;
-use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots};
+use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots, tool_result_failed};
 use crate::trace_logging::append_trace_record;
 use crate::train_bifrost::{self, TrainingPacket};
 
@@ -2073,6 +2073,7 @@ pub(crate) async fn run(
                 model,
                 &dynamic_history,
                 current_plan.as_ref(),
+                reasoning_effort.map(str::to_string),
                 context_length,
                 idle_timeout,
                 cancel.clone(),
@@ -4822,10 +4823,6 @@ fn normalize_tool_path(path: &str) -> Option<String> {
             .trim_start_matches("./")
             .to_string(),
     )
-}
-
-fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Internal error:")
 }
 
 fn is_bifrost_context_tool(name: &str) -> bool {
