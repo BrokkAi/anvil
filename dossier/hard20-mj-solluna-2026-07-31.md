@@ -248,3 +248,23 @@ implementer with good tools (multi-hunk edit, code intelligence), one
 fresh independent reviewer holding the verbatim contract with a bounded
 completeness mandate, and prompts that name the operating reality. Every
 coordination architecture this project built underperformed it.
+
+### Cost decomposition postscript (2026-08-01)
+
+Run-7 spend split by session: primary 163 requests / 10.1M sol input per
+task (95%), reviewer 13 requests / 0.5M (5%), subagents zero. Multi-edit
+was fully adopted (run 6: 2.07 hunks per edit call, 49% multi-entry, 6
+write_file rewrites/task) and request counts still ROSE across runs 5→7
+(101 → 115 → 177 sol requests/task). Two supply-side cost narratives
+died on measurement (finalize test discipline; edit granularity as the
+dominant term — promoted from one 29-edit tail case where edits were
+~30% of calls).
+
+Standing conclusion: **step count is a behavioral equilibrium, not a
+tooling artifact.** The model works until satisfied; cheaper and richer
+affordances get reinvested in more reading and verification rather than
+banked. mini-swe's ~38 steps are scarcity, not efficiency. Run 7's 10.1M
+primary tokens and its 16/20 are one phenomenon: cost per solved task
+$10.70 vs vanilla's $4.60. The one demand-side lever not yet built or
+falsified is a model-visible spend budget that changes the satisfaction
+criterion. Runs: 12, 13, 13, 9/16k, 10/15k, **16** vs E=15.2.
