@@ -4628,7 +4628,8 @@ async fn run_model_turn_in_spawn(
                 initial_plan,
             )
             .await;
-            (outcome, None)
+            let usage_by_model = outcome.usage_by_model.clone();
+            (outcome, Some(usage_by_model))
         }
     };
     let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
@@ -4646,6 +4647,7 @@ async fn run_model_turn_in_spawn(
                     tool_exchanges: Vec::new(),
                     replay_events: Vec::new(),
                     usage: crate::llm_client::TokenUsage::default(),
+                    usage_by_model: BTreeMap::new(),
                     stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
                         retryable: false,
                         message: "agent loop panicked".to_string(),
@@ -4670,6 +4672,7 @@ async fn run_model_turn_in_spawn(
         tool_exchanges,
         replay_events,
         usage: turn_usage,
+        usage_by_model: _,
         stop,
         continuation_messages: _,
         current_plan,

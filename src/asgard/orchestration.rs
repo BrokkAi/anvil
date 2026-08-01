@@ -628,10 +628,19 @@ pub(crate) async fn run_asgard_trajectory_loop(
         ) in futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
-            usage_by_model
-                .entry(model.clone())
-                .or_default()
-                .add(outcome.usage);
+            if outcome.usage_by_model.is_empty() {
+                usage_by_model
+                    .entry(model.clone())
+                    .or_default()
+                    .add(outcome.usage);
+            } else {
+                for (usage_model, usage) in &outcome.usage_by_model {
+                    usage_by_model
+                        .entry(usage_model.clone())
+                        .or_default()
+                        .add(*usage);
+                }
+            }
             match patches {
                 Ok((patch, delta_patch)) => candidates.push(AsgardCandidate {
                     index,
@@ -1115,6 +1124,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut outcome = selected_outcome
         .unwrap_or_else(|| asgard_failure(anyhow::anyhow!("Asgard produced no candidate windows")));
     outcome.usage = aggregate_usage;
+    outcome.usage_by_model = usage_by_model.clone();
     (outcome, usage_by_model)
 }
 
@@ -4214,6 +4224,7 @@ pub(crate) fn asgard_failure(error: anyhow::Error) -> crate::tool_loop::LoopOutc
         tool_exchanges: Vec::new(),
         replay_events: Vec::new(),
         usage: crate::llm_client::TokenUsage::default(),
+        usage_by_model: BTreeMap::new(),
         stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
             retryable: false,
             message: format!("Asgard failed: {error:#}"),

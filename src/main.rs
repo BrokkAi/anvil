@@ -53,6 +53,7 @@ mod tools;
 mod trace_logging;
 mod train_bifrost;
 mod usage_report;
+mod utility_model;
 mod workspace_delta;
 
 use crate::llm_client::LlmBackend;
@@ -84,6 +85,13 @@ struct Args {
     /// ignore unsupported effort levels and fall back to their default behavior.
     #[arg(long)]
     reasoning_effort: Option<String>,
+
+    /// Provider-qualified model for internal semantic-search reranking and
+    /// automatic permission classification. When unset, these calls use the
+    /// active session model at low reasoning effort. An explicitly configured
+    /// utility model uses its provider-default reasoning behavior.
+    #[arg(long, env = "ANVIL_UTILITY_MODEL")]
+    utility_model: Option<String>,
 
     /// Optional cap on tool-calling turns per prompt. Defaults to `0` =
     /// unbounded: the loop runs until the model answers without a tool call
@@ -214,6 +222,7 @@ impl std::fmt::Debug for Args {
             .field("command", &self.command)
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("utility_model", &self.utility_model)
             .field("max_turns", &self.max_turns)
             .field("asgard_models", &self.asgard_models)
             .field("asgard_supervisor", &self.asgard_supervisor)
@@ -799,6 +808,11 @@ async fn main() -> Result<()> {
     }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
+    let utility_model = utility_model::UtilityModelConfig::new(args.utility_model);
+    if let Some(model) = utility_model.configured_model() {
+        llm.validate_explicit_model_route(model)?;
+    }
+    utility_model::configure(utility_model);
     acp::run_agent(
         llm,
         sessions,

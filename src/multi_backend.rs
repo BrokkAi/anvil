@@ -86,6 +86,15 @@ pub struct MultiBackend {
 }
 
 impl MultiBackend {
+    pub(crate) fn validate_explicit_model_route(&self, wire_model: &str) -> Result<()> {
+        if split_wire_id(wire_model).is_none() {
+            anyhow::bail!(
+                "utility model {wire_model:?} must be provider-qualified as <source>::<id>"
+            );
+        }
+        self.resolve(wire_model).map(|_| ())
+    }
+
     pub fn new(registrations: Vec<BackendRegistration>) -> Self {
         let mut seen = std::collections::HashSet::new();
         let backends = registrations
@@ -1283,6 +1292,30 @@ mod tests {
         assert!(
             models.iter().any(|m| m == "openrouter::openrouter-stub"),
             "healthy provider should still contribute models: got {models:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_utility_route_requires_qualified_available_provider() {
+        let (deepseek_backend, _) = recording("deepseek");
+        let multi = test_multi(None, None, Some(deepseek_backend), None, None, None);
+
+        multi
+            .validate_explicit_model_route("deepseek::deepseek-v4-flash")
+            .expect("configured provider is accepted");
+        assert!(
+            multi
+                .validate_explicit_model_route("deepseek-v4-flash")
+                .unwrap_err()
+                .to_string()
+                .contains("provider-qualified")
+        );
+        assert!(
+            multi
+                .validate_explicit_model_route("bedrock::openai.gpt-5.6-luna")
+                .unwrap_err()
+                .to_string()
+                .contains("not configured")
         );
     }
 }

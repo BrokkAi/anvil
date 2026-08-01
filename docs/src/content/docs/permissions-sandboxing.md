@@ -25,6 +25,8 @@ The ACP client owns the live Permission selector. Remembered **Always allow** de
 
 Shell commands request explicit outside-sandbox escalation with `sandbox_permissions: "require_escalated"`. In interactive modes this produces a **Run outside sandbox** choice. An outside-sandbox approval is never stored as an Always allow rule.
 
+The automatic permission classifier is an internal utility call. Configure its model, shared with semantic-search reranking, using `--utility-model <provider>::<model>` or `ANVIL_UTILITY_MODEL`. If unset, it uses the active session model at low reasoning effort; an explicit utility model uses that provider's default effort. History compaction is separate and always remains on the session model at low effort so it can reuse the conversation prefix cache.
+
 ## Sandbox Strategies
 
 | Strategy | Parsing and bounded file work | Shell commands |

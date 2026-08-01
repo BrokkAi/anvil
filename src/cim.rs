@@ -14,14 +14,9 @@ const CIM_CONFIG_ENV: &str = "BRK_CIM_CONFIG";
 const CIM_SCHEMA_VERSION: u32 = 1;
 const CIM_FINAL_K: usize = 20;
 const CIM_MCP_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(1_800);
-const CIM_RERANK_WALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) fn mcp_tool_call_timeout() -> Option<Duration> {
     enabled().then_some(CIM_MCP_TOOL_CALL_TIMEOUT)
-}
-
-pub(crate) fn rerank_wall_timeout() -> Option<Duration> {
-    enabled().then_some(CIM_RERANK_WALL_TIMEOUT)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +194,5 @@ mod tests {
     #[test]
     fn cim_mcp_timeout_covers_the_cell_deadline() {
         assert_eq!(CIM_MCP_TOOL_CALL_TIMEOUT, Duration::from_secs(1_800));
-        assert_eq!(CIM_RERANK_WALL_TIMEOUT, Duration::from_secs(120));
     }
 }

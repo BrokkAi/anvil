@@ -5,24 +5,28 @@
 //! (`vector_ranked` and `bm25_ranked` over symbols, `coedit_ranked` over
 //! files) and explicitly leaves fusion to the caller. Rather than dump all
 //! three raw lists into the model's context, the harness runs one *disposable*
-//! LLM turn on top of the live conversation: it shows the active model each
+//! LLM turn on top of the live conversation: it shows the selected utility model each
 //! candidate together with its (truncated) source or file summary and asks it
 //! to return just the relevant ones, best-first. The model then sees a single
 //! clean, relevance-ordered hit list; the bulky candidate context lives only
 //! in the disposable turn and never pollutes the main conversation.
 //!
 //! The disposable turn reuses the conversation history as its prefix (minus the
-//! trailing assistant message that carries the in-flight `tool_calls`), so the
-//! long history stays a provider-cache hit and the only genuinely new tokens
-//! are the candidate sources themselves.
+//! trailing assistant message that carries the in-flight `tool_calls`). When
+//! utility routing resolves to the session provider, that prefix can remain a
+//! provider-cache hit; an explicitly separate utility provider receives the
+//! same relevance context without changing the main conversation.
 //!
-//! Provider and structured-output failures degrade to deterministic reciprocal
-//! rank fusion. Bifrost's raw three-list payload is never exposed to the model.
+//! In ordinary operation, provider and structured-output failures degrade to
+//! deterministic reciprocal-rank fusion. CIM evaluation mode fails closed so a
+//! provider failure cannot silently change the experimental treatment.
+//! Bifrost's raw three-list payload is never exposed to the model.
 
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
@@ -41,11 +45,6 @@ const MAX_TOTAL_CONTEXT_BYTES: usize = 120_000;
 const CONTEXT_FETCH_BATCH: usize = 8;
 const RRF_RANK_CONSTANT: f64 = 60.0;
 
-/// Reasoning effort for the disposable turn. "low" (not "minimal", which some
-/// backends don't support and which is too aggressive where they do) keeps the
-/// relevance call cheap and fast.
-const RERANK_REASONING_EFFORT: &str = "low";
-
 const MAX_LINE_CHARS: usize = 2048;
 
 /// What the reranker hands back to the tool loop, mirroring the fields the loop
@@ -54,6 +53,7 @@ pub(crate) struct RerankOutcome {
     pub output: String,
     pub failed: bool,
     pub usage: TokenUsage,
+    pub usage_model: Option<String>,
 }
 
 impl RerankOutcome {
@@ -62,6 +62,7 @@ impl RerankOutcome {
             output,
             failed: false,
             usage,
+            usage_model: None,
         }
     }
 
@@ -70,6 +71,7 @@ impl RerankOutcome {
             output: message,
             failed: true,
             usage: TokenUsage::default(),
+            usage_model: None,
         }
     }
 }
@@ -101,8 +103,8 @@ struct Candidate {
 }
 
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
-/// and render a unified, relevance-ordered hit list. Falls back to bifrost's raw
-/// payload on any error or empty selection.
+/// and render a unified, relevance-ordered hit list. Ordinary operation falls
+/// back to deterministic RRF on reranker failure; CIM evaluation fails closed.
 pub(crate) async fn rerank_semantic_search(
     llm: &Arc<dyn LlmBackend>,
     model: &str,
@@ -112,6 +114,8 @@ pub(crate) async fn rerank_semantic_search(
     idle_timeout: IdleTimeouts,
     cancel: &CancellationToken,
 ) -> RerankOutcome {
+    let utility = crate::utility_model::select(model);
+    let started = Instant::now();
     let final_k = match parse_final_k(args) {
         Ok(k) => k,
         Err(message) => return RerankOutcome::error(message),
@@ -124,12 +128,25 @@ pub(crate) async fn rerank_semantic_search(
     let (bifrost_args, base_k) = prepare_bifrost_args(args, final_k);
 
     // 1. Underlying search. A hard failure here is the model's to see.
+    trace_phase("retrieval_start", &query, &utility, started, None);
     let raw = match registry
         .call_bifrost_tool_raw("semantic_search", bifrost_args)
         .await
     {
-        Ok(value) => value,
-        Err(err) => return RerankOutcome::error(format!("Error: {err}")),
+        Ok(value) => {
+            trace_phase("retrieval_complete", &query, &utility, started, None);
+            value
+        }
+        Err(err) => {
+            trace_phase(
+                "retrieval_error",
+                &query,
+                &utility,
+                started,
+                Some(&format!("{err:#}")),
+            );
+            return RerankOutcome::error(format!("Error: {err}"));
+        }
     };
 
     // 2. Parse the entire realized pool. An empty search is a valid final result.
@@ -145,6 +162,7 @@ pub(crate) async fn rerank_semantic_search(
             final_count: 0,
             fallback_reason: None,
             usage: TokenUsage::default(),
+            utility: &utility,
         });
         return RerankOutcome::passthrough(
             render_unified(&query, &[], 0, notes(&raw)),
@@ -153,7 +171,9 @@ pub(crate) async fn rerank_semantic_search(
     }
 
     // 3. Fetch source / summaries for the candidates (best effort).
+    trace_phase("context_fetch_start", &query, &utility, started, None);
     fetch_context(registry, &mut candidates).await;
+    trace_phase("context_fetch_complete", &query, &utility, started, None);
     let context_bytes = bound_candidate_context(&mut candidates);
 
     // 4. Disposable relevance turn on top of the live conversation.
@@ -170,15 +190,16 @@ pub(crate) async fn rerank_semantic_search(
         prefer_json_object: false,
     };
 
-    let mut response_future = Box::pin(stream_chat_no_visible_output_with_retry(
+    trace_phase("utility_request_start", &query, &utility, started, None);
+    let response = stream_chat_no_visible_output_with_retry(
         llm.as_ref(),
         "semantic_search rerank",
         cancel,
         || StreamChatRequest {
-            model: model.to_string(),
+            model: utility.model.clone(),
             messages: messages.clone(),
             tools: None,
-            reasoning_effort: Some(RERANK_REASONING_EFFORT.to_string()),
+            reasoning_effort: utility.reasoning_effort.clone(),
             service_tier: None,
             temperature: None,
             structured_output: Some(structured.clone()),
@@ -187,21 +208,24 @@ pub(crate) async fn rerank_semantic_search(
             cancel: cancel.clone(),
             idle_timeouts: idle_timeout,
         },
-    ));
-    let response = match crate::cim::rerank_wall_timeout() {
-        Some(timeout) => match tokio::time::timeout(timeout, response_future.as_mut()).await {
-            Ok(response) => response,
-            Err(_) => Err(anyhow::anyhow!(
-                "semantic_search rerank exceeded CIM wall timeout of {} seconds",
-                timeout.as_secs()
-            )),
-        },
-        None => response_future.await,
-    };
+    )
+    .await;
 
     let response = match response {
         Ok(response) => response,
         Err(err) => {
+            trace_phase(
+                "utility_request_error",
+                &query,
+                &utility,
+                started,
+                Some(&format!("{err:#}")),
+            );
+            if crate::cim::enabled() {
+                return RerankOutcome::error(format!(
+                    "Error: semantic_search reranker failed in CIM mode: {err:#}"
+                ));
+            }
             tracing::warn!(
                 error = format!("{err:#}"),
                 "semantic_search rerank turn failed; using reciprocal-rank fusion"
@@ -217,6 +241,7 @@ pub(crate) async fn rerank_semantic_search(
                 final_count: ordered.len(),
                 fallback_reason: Some("provider_failure"),
                 usage: TokenUsage::default(),
+                utility: &utility,
             });
             return RerankOutcome::passthrough(
                 render_unified(&query, &ordered, candidates.len(), notes(&raw)),
@@ -224,6 +249,7 @@ pub(crate) async fn rerank_semantic_search(
             );
         }
     };
+    trace_phase("utility_request_complete", &query, &utility, started, None);
     let usage = response.usage();
     let text = match response {
         LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
@@ -234,6 +260,22 @@ pub(crate) async fn rerank_semantic_search(
     let selected = match parse_selected_ids(&text) {
         Some(selected) => selected,
         None => {
+            if crate::cim::enabled() {
+                trace_phase(
+                    "utility_output_error",
+                    &query,
+                    &utility,
+                    started,
+                    Some("malformed structured output"),
+                );
+                return RerankOutcome {
+                    output: "Error: semantic_search reranker returned malformed output in CIM mode"
+                        .to_string(),
+                    failed: true,
+                    usage,
+                    usage_model: Some(utility.model.clone()),
+                };
+            }
             tracing::warn!(
                 "semantic_search rerank returned malformed output; using reciprocal-rank fusion"
             );
@@ -248,11 +290,14 @@ pub(crate) async fn rerank_semantic_search(
                 final_count: ordered.len(),
                 fallback_reason: Some("malformed_output"),
                 usage,
+                utility: &utility,
             });
-            return RerankOutcome::passthrough(
+            let mut outcome = RerankOutcome::passthrough(
                 render_unified(&query, &ordered, candidates.len(), notes(&raw)),
                 usage,
             );
+            outcome.usage_model = Some(utility.model.clone());
+            return outcome;
         }
     };
     let ordered = order_candidates(&candidates, &selected, final_k);
@@ -275,9 +320,12 @@ pub(crate) async fn rerank_semantic_search(
         final_count: ordered.len(),
         fallback_reason: None,
         usage,
+        utility: &utility,
     });
     let output = render_unified(&query, &ordered, candidates.len(), notes(&raw));
-    RerankOutcome::passthrough(output, usage)
+    let mut outcome = RerankOutcome::passthrough(output, usage);
+    outcome.usage_model = Some(utility.model.clone());
+    outcome
 }
 
 fn parse_final_k(args: &Value) -> Result<usize, String> {
@@ -735,6 +783,26 @@ struct RerankTrace<'a> {
     final_count: usize,
     fallback_reason: Option<&'a str>,
     usage: TokenUsage,
+    utility: &'a crate::utility_model::UtilityModelSelection,
+}
+
+fn trace_phase(
+    phase: &str,
+    query: &str,
+    utility: &crate::utility_model::UtilityModelSelection,
+    started: Instant,
+    error: Option<&str>,
+) {
+    append_trace_record(json!({
+        "type": "semantic_search_phase",
+        "phase": phase,
+        "query": query,
+        "elapsed_millis": started.elapsed().as_millis(),
+        "utility_model": utility.model,
+        "utility_reasoning_effort": utility.reasoning_effort,
+        "utility_model_source": utility.source,
+        "error": error,
+    }));
 }
 
 fn trace_rerank(trace: RerankTrace<'_>) {
@@ -766,6 +834,9 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "selected_final_count": trace.final_count,
         "fallback": trace.fallback_reason.is_some(),
         "fallback_reason": trace.fallback_reason,
+        "utility_model": trace.utility.model,
+        "utility_reasoning_effort": trace.utility.reasoning_effort,
+        "utility_model_source": trace.utility.source,
         "reranker_usage": {
             "input_tokens": trace.usage.input_tokens,
             "output_tokens": trace.usage.output_tokens,
@@ -1235,7 +1306,7 @@ mod tests {
                 model: "deepseek-v4-flash".to_string(),
                 messages: messages.clone(),
                 tools: None,
-                reasoning_effort: Some(RERANK_REASONING_EFFORT.to_string()),
+                reasoning_effort: None,
                 service_tier: None,
                 temperature: None,
                 structured_output: Some(structured.clone()),
