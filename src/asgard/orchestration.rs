@@ -1002,12 +1002,16 @@ pub(crate) async fn run_asgard_trajectory_loop(
         if crate::tokens::approximate_tokens_messages(&common_messages)
             > crate::context_manager::context_budget(context_length)
         {
-            let dynamic = common_messages[context_prefix_len.min(common_messages.len())..].to_vec();
+            let dynamic_start = context_prefix_len.min(common_messages.len());
+            let winner_tools = registries[winner.index].tool_definitions().await;
             match crate::context_manager::compact_history(
                 llm.as_ref(),
                 &winner.model,
-                &dynamic,
+                &common_messages,
+                dynamic_start,
+                Some(&winner_tools),
                 canonical_plan.as_ref(),
+                reasoning_effort.map(str::to_string),
                 context_length,
                 idle_timeout,
                 cancel.clone(),

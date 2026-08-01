@@ -7,19 +7,29 @@
 //! The checkpoint is provider-neutral and persisted on its anchor turn, while
 //! raw turns remain untouched for ACP replay, rewind, and Brokk compatibility.
 //!
-//! Inputs too large for one compactor request are split, extracted, and folded
-//! until the final state-snapshot request fits. The same chunking machinery is
-//! retained for the independent user-facing recap feature.
+//! Compaction tries a native, in-conversation path first: the full native
+//! message list (canonical prefix + dynamic history) plus the advertised
+//! tool schemas is sent back to the model as-is, with one trailing user
+//! instruction asking it to write the `<state_snapshot>` in place. This
+//! preserves provider prompt-cache reuse and loses no structure, unlike
+//! flattening to text. When that attempt is skipped (the input is already
+//! too close to the context window to risk it), fails, or produces an
+//! unusable or non-reducing snapshot, compaction falls back to rendering
+//! history as plain text and summarizing it in a fresh request, splitting,
+//! extracting, and folding hierarchically until the final state-snapshot
+//! request fits. The same chunking machinery is retained for the
+//! independent user-facing turn-recap feature.
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
     ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
-    TokenUsage, stream_chat_no_visible_output_with_retry,
+    TokenUsage, ToolDefinition, stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ConversationTurn;
 use crate::tokens::{approximate_tokens, approximate_tokens_messages};
@@ -70,16 +80,10 @@ pub struct HistoryCompaction {
     pub after_tokens: usize,
 }
 
-const HISTORY_SNAPSHOT_PROMPT: &str = "You maintain the working memory of an AI coding agent. \
-Rewrite the supplied conversation history as a precise state snapshot that another agent can \
-continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
-verification that the history does not show. Include every user message or request, explicit \
-requirements and preferences, decisions and rationale, important files/symbols/patch state, \
-commands and results, errors and attempted fixes, current work, pending work, and the best next \
-step. Distinguish verified facts from hypotheses. Tool calls may contain the only evidence, so \
-read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
-Return only this XML structure:\n\
-<state_snapshot>\n\
+/// The `<state_snapshot>` XML schema, shared verbatim by the rendered
+/// fallback prompt and the native in-conversation instruction so the tag
+/// list has exactly one source of truth.
+const STATE_SNAPSHOT_SCHEMA: &str = "<state_snapshot>\n\
 <primary_request_and_intent>...</primary_request_and_intent>\n\
 <explicit_requirements>...</explicit_requirements>\n\
 <all_user_messages>...</all_user_messages>\n\
@@ -92,24 +96,101 @@ Return only this XML structure:\n\
 <next_step>...</next_step>\n\
 </state_snapshot>";
 
+const HISTORY_SNAPSHOT_PROMPT_PREFIX: &str = "You maintain the working memory of an AI coding \
+agent. Rewrite the supplied conversation history as a precise state snapshot that another agent \
+can continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
+verification that the history does not show. Include every user message or request, explicit \
+requirements and preferences, decisions and rationale, important files/symbols/patch state, \
+commands and results, errors and attempted fixes, current work, pending work, and the best next \
+step. Distinguish verified facts from hypotheses. Never present an action that already failed as \
+current or next work without stating that it failed and why. Tool calls may contain the only \
+evidence, so read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
+Return only this XML structure:\n";
+
+/// System prompt for the rendered-fallback compaction request. Built (rather
+/// than a plain `const`) so it can splice in [`STATE_SNAPSHOT_SCHEMA`]
+/// without duplicating the tag list -- `concat!` cannot reference a named
+/// `const` string, only literals.
+fn history_snapshot_prompt() -> String {
+    format!("{HISTORY_SNAPSHOT_PROMPT_PREFIX}{STATE_SNAPSHOT_SCHEMA}")
+}
+
+/// Trailing user instruction appended to the native in-conversation
+/// compaction request (Phase 2's primary path). Unlike
+/// [`HISTORY_SNAPSHOT_PROMPT_PREFIX`], which introduces a flattened,
+/// out-of-band history dump, this is spoken directly into the ongoing
+/// conversation -- it announces the checkpoint, tells the model not to act
+/// on anything (no tool calls), and asks for the same snapshot schema.
+const NATIVE_SNAPSHOT_INSTRUCTION_PREFIX: &str = "The conversation above is this session's actual \
+history so far and is about to exceed its context window. Before we continue, checkpoint it: \
+rewrite everything above as a precise state snapshot that another instance of you can continue \
+from immediately, using only the conversation itself as source material. Preserve facts and \
+evidence, not prose. Never claim work or verification that the history does not show. Include \
+every user message or request, explicit requirements and preferences, decisions and rationale, \
+important files/symbols/patch state, commands and results, errors and attempted fixes, current \
+work, pending work, and the best next step. Distinguish verified facts from hypotheses. Never \
+present an action that already failed as current or next work without stating that it failed and \
+why. Tool calls may contain the only evidence, so read them carefully. Omit private \
+analysis/reasoning and redundant chatter. Do NOT call any tools for this; respond with text \
+only.\n\n\
+Return only this XML structure:\n";
+
+fn native_snapshot_instruction() -> String {
+    format!("{NATIVE_SNAPSHOT_INSTRUCTION_PREFIX}{STATE_SNAPSHOT_SCHEMA}")
+}
+
+/// Above this fraction of the declared context window, `all_messages` alone
+/// (before the trailing compaction instruction is even added) is judged too
+/// close to the limit to risk the native in-conversation attempt, so
+/// compaction skips straight to the rendered fallback. The trigger that
+/// calls `compact_history` at all fires at [`BUDGET_FRACTION`] (75%), so
+/// this only trips when the caller's token estimate ran far behind the
+/// real prompt size.
+const NATIVE_ATTEMPT_GUARD_FRACTION: f64 = 0.90;
+
 const HISTORY_CHUNK_PROMPT: &str = "Extract durable working-memory facts from this fragment of \
 an AI coding-agent history. Preserve user requests, requirements, decisions, paths and symbols, \
 patch state, commands and their actual results, errors, unfinished work, and chronology. Do not \
 infer success. Omit private analysis and redundant chatter. Output concise labeled bullets only; \
 a later pass will assemble the final state snapshot.";
 
+/// Frames the checkpoint for the restarted agent that reads it next. Issue
+/// #326: without this framing, a fresh session treated the checkpoint as
+/// just more history to react to, so it re-read files and re-issued tool
+/// calls whose outcomes were already recorded (and often already failed).
+const CHECKPOINT_PREAMBLE: &str = "A previous session of this same agent ran out of context while \
+working on the task described below. The state snapshot and digests that follow summarize work \
+that is ALREADY DONE. Build on it instead of repeating it: do not re-issue tool calls whose \
+outcomes are recorded here, do not re-read files listed in <files_already_read> unless you need \
+content that is not summarized here, and never repeat a call listed in <failed_tool_calls> with \
+the same arguments -- those exact calls already failed. Fix the arguments or take a different \
+approach.";
+
 /// Compact complete provider-neutral model history into one cumulative state
 /// checkpoint. The caller keeps the canonical system/instruction prefix and
 /// any post-checkpoint tail verbatim.
+///
+/// `all_messages` is the full conversation (canonical prefix + dynamic
+/// history) in native form; `dynamic_start` is the index where the
+/// compactable dynamic history begins. Everything below operates on
+/// `history = &all_messages[dynamic_start..]`, exactly as if that slice had
+/// been passed directly -- `all_messages` and `tools` exist only so the
+/// native attempt can send the model its own real conversation (plus
+/// advertised tool schemas) instead of a flattened rendering of it.
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_history(
     llm: &dyn LlmBackend,
     model: &str,
-    history: &[ChatMessage],
+    all_messages: &[ChatMessage],
+    dynamic_start: usize,
+    tools: Option<&[ToolDefinition]>,
     current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    reasoning_effort: Option<String>,
     context_length: Option<u32>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<HistoryCompaction> {
+    let history = &all_messages[dynamic_start..];
     if history.is_empty() {
         anyhow::bail!("cannot compact empty history");
     }
@@ -128,33 +209,91 @@ pub async fn compact_history(
     } else {
         exact_tail
     };
+    let digests = build_digests(history);
+
+    // Primary path: ask the model to checkpoint its own real conversation
+    // in place. Skipped when the raw conversation is already close enough
+    // to the window that adding the trailing instruction risks overflowing
+    // it outright -- the rendered fallback below is smaller by
+    // construction (flattened text plus one instruction, not the full
+    // native message list).
+    let window_tokens = context_length.unwrap_or(FALLBACK_CONTEXT_LENGTH) as f64;
+    let all_messages_tokens = approximate_tokens_messages(all_messages) as f64;
+    if all_messages_tokens <= window_tokens * NATIVE_ATTEMPT_GUARD_FRACTION {
+        if cancel.is_cancelled() {
+            anyhow::bail!("compaction cancelled");
+        }
+        let mut native_messages = all_messages.to_vec();
+        native_messages.push(ChatMessage::user(native_snapshot_instruction()));
+        match run_compaction_request(
+            llm,
+            model,
+            native_messages,
+            tools.map(<[_]>::to_vec),
+            reasoning_effort.clone(),
+            idle_timeout,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok((snapshot, call_usage)) => {
+                usage.add(call_usage);
+                match build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)
+                {
+                    Ok((checkpoint_messages, after_tokens)) => {
+                        return Ok(HistoryCompaction {
+                            checkpoint_messages,
+                            usage,
+                            before_tokens,
+                            after_tokens,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "native in-conversation compaction produced an unusable checkpoint; \
+                             falling back to rendered summarization: {error:#}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                if cancel.is_cancelled() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    "native in-conversation compaction failed; falling back to rendered \
+                     summarization: {error:#}"
+                );
+            }
+        }
+    }
+
+    // Fallback: flatten `history` to plain text and summarize it in a fresh
+    // request, splitting hierarchically when even the flattened text
+    // doesn't fit. Unchanged from the pre-native-path behavior; also used
+    // directly (never via the native attempt above) by the turn-recap
+    // feature's chunking helpers below.
     let mut body = render_history_for_compaction(history_to_summarize);
 
     loop {
         let final_messages = vec![
-            ChatMessage::system(HISTORY_SNAPSHOT_PROMPT),
+            ChatMessage::system(history_snapshot_prompt()),
             ChatMessage::user(format!("History to compact:\n\n{body}")),
         ];
         if approximate_tokens_messages(&final_messages) <= budget {
-            let (snapshot, call_usage) =
-                run_compaction_request(llm, model, final_messages, idle_timeout, cancel.clone())
-                    .await?;
+            let (snapshot, call_usage) = run_compaction_request(
+                llm,
+                model,
+                final_messages,
+                None,
+                reasoning_effort.clone(),
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await?;
             usage.add(call_usage);
-            let snapshot = normalize_state_snapshot(&snapshot)?;
-            let mut checkpoint_messages = vec![ChatMessage::user(snapshot)];
-            if let Some(plan) = current_plan {
-                checkpoint_messages.push(ChatMessage::user(format!(
-                    "<current_plan>\n{}\n</current_plan>",
-                    serde_json::to_string_pretty(plan)?
-                )));
-            }
-            checkpoint_messages.extend_from_slice(exact_tail);
-            let after_tokens = approximate_tokens_messages(&checkpoint_messages);
-            if after_tokens >= before_tokens {
-                anyhow::bail!(
-                    "compaction did not reduce history (~{before_tokens} -> ~{after_tokens} tokens)"
-                );
-            }
+            let (checkpoint_messages, after_tokens) =
+                build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)?;
             return Ok(HistoryCompaction {
                 checkpoint_messages,
                 usage,
@@ -182,8 +321,16 @@ pub async fn compact_history(
                     chunk
                 )),
             ];
-            let (summary, call_usage) =
-                run_compaction_request(llm, model, messages, idle_timeout, cancel.clone()).await?;
+            let (summary, call_usage) = run_compaction_request(
+                llm,
+                model,
+                messages,
+                None,
+                reasoning_effort.clone(),
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await?;
             usage.add(call_usage);
             summaries.push(summary);
         }
@@ -196,6 +343,308 @@ pub async fn compact_history(
         }
         body = reduced;
     }
+}
+
+/// Normalize the compactor's raw response into checkpoint messages and
+/// verify the checkpoint actually shrank history. Shared by the native and
+/// rendered-fallback paths so both apply the exact same
+/// preamble/digest/plan/tail assembly and the same not-reduced check; the
+/// native path treats any `Err` here as a fallback trigger, while the
+/// rendered path (the last resort) propagates it as a hard error.
+fn build_checkpoint(
+    raw_snapshot: &str,
+    digests: &str,
+    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    exact_tail: &[ChatMessage],
+    before_tokens: usize,
+) -> Result<(Vec<ChatMessage>, usize)> {
+    let snapshot = normalize_state_snapshot(raw_snapshot)?;
+    let mut checkpoint_messages = vec![ChatMessage::user(format!(
+        "{CHECKPOINT_PREAMBLE}\n\n{snapshot}{digests}"
+    ))];
+    if let Some(plan) = current_plan {
+        checkpoint_messages.push(ChatMessage::user(format!(
+            "<current_plan>\n{}\n</current_plan>",
+            serde_json::to_string_pretty(plan)?
+        )));
+    }
+    checkpoint_messages.extend_from_slice(exact_tail);
+    let after_tokens = approximate_tokens_messages(&checkpoint_messages);
+    if after_tokens >= before_tokens {
+        anyhow::bail!(
+            "compaction did not reduce history (~{before_tokens} -> ~{after_tokens} tokens)"
+        );
+    }
+    Ok((checkpoint_messages, after_tokens))
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint digests
+// ---------------------------------------------------------------------------
+//
+// Deterministic (non-LLM) summaries appended after the compactor's prose
+// snapshot. The model-written snapshot can lose or blur exact tool-call
+// outcomes when it summarizes; these digests are computed straight from the
+// full history so a restarted agent has an unambiguous record of what not
+// to repeat.
+
+/// Build the digest suffix appended after the state snapshot in the first
+/// checkpoint message: `<files_already_read>` then `<failed_tool_calls>`,
+/// each preceded by a blank line, in that order. Empty string when neither
+/// digest has anything to report.
+fn build_digests(history: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    if let Some(files) = files_already_read_digest(history) {
+        out.push_str("\n\n");
+        out.push_str(&files);
+    }
+    if let Some(failed) = failed_tool_calls_digest(history) {
+        out.push_str("\n\n");
+        out.push_str(&failed);
+    }
+    out
+}
+
+/// Cap on distinct paths listed in the `<files_already_read>` digest. Past
+/// this, later paths are dropped in favor of one summary line -- a session
+/// that read hundreds of files has already blown well past what's useful to
+/// enumerate.
+const MAX_DIGEST_PATHS: usize = 100;
+
+/// How many of the most recent failed tool calls the `<failed_tool_calls>`
+/// digest keeps in full. Older failures are dropped with a count note --
+/// only the failures the next agent is likely to still be relevant to
+/// (i.e. recent ones) are worth the tokens.
+const MAX_DIGEST_FAILURES: usize = 10;
+
+/// One `read_file` call's `(offset, limit)` pair, in the tool's raw
+/// 0-based-offset / max-line-count schema.
+type ReadRange = (Option<usize>, Option<usize>);
+
+/// Scan `history` for `read_file` tool calls and render one line per
+/// distinct path (first-seen order): just the path if any call read the
+/// whole file, otherwise the merged 1-based inclusive line ranges actually
+/// read (`src/foo.rs (lines 1-200, 400-450)`). Calls with unparseable
+/// arguments or a missing/non-string `file_path` are ignored. `None` when no
+/// `read_file` calls are present.
+fn files_already_read_digest(history: &[ChatMessage]) -> Option<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut reads: HashMap<String, Vec<ReadRange>> = HashMap::new();
+
+    for message in history {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in calls {
+            if call.function.name != "read_file" {
+                continue;
+            }
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            else {
+                continue;
+            };
+            let Some(file_path) = args.get("file_path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            reads
+                .entry(file_path.to_string())
+                .or_insert_with(|| {
+                    order.push(file_path.to_string());
+                    Vec::new()
+                })
+                .push((offset, limit));
+        }
+    }
+
+    if order.is_empty() {
+        return None;
+    }
+
+    let total_paths = order.len();
+    let mut lines: Vec<String> = Vec::new();
+    for path in order.iter().take(MAX_DIGEST_PATHS) {
+        let calls = &reads[path];
+        let whole_file = calls
+            .iter()
+            .any(|(offset, limit)| offset.is_none() && limit.is_none());
+        if whole_file {
+            lines.push(path.clone());
+            continue;
+        }
+        lines.push(format!("{path} ({})", render_read_ranges(calls)));
+    }
+    if total_paths > MAX_DIGEST_PATHS {
+        lines.push(format!("(+{} more files)", total_paths - MAX_DIGEST_PATHS));
+    }
+
+    Some(format!(
+        "<files_already_read>\n{}\n</files_already_read>",
+        lines.join("\n")
+    ))
+}
+
+/// Merge one path's `(offset, limit)` reads into "lines A-B, C-D" text.
+/// `offset` is the tool's 0-based start line; `limit` is the max line
+/// count, absent meaning "to end of file". Overlapping/adjacent ranges are
+/// merged; an unbounded (to-end-of-file) range renders its upper bound as
+/// `end` and absorbs any range that starts after it.
+fn render_read_ranges(calls: &[ReadRange]) -> String {
+    let mut ranges: Vec<(usize, usize)> = calls
+        .iter()
+        .map(|(offset, limit)| {
+            let start = offset.unwrap_or(0) + 1; // 0-based -> 1-based
+            let end = limit
+                .map(|limit| start.saturating_add(limit.saturating_sub(1)))
+                .unwrap_or(usize::MAX);
+            (start, end)
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => {
+                last.1 = last.1.max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let rendered = merged
+        .iter()
+        .map(|&(start, end)| {
+            if end == usize::MAX {
+                format!("{start}-end")
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("lines {rendered}")
+}
+
+/// Scan `history` for failed tool results (per
+/// `crate::tools::tool_result_failed`) and render the most recent
+/// [`MAX_DIGEST_FAILURES`] as a numbered list: `` N. `tool` args=... -> result
+/// first line ``. Arguments and the result's first line are truncated
+/// (char-boundary-safe) to keep the digest bounded. `None` when no tool
+/// result failed.
+fn failed_tool_calls_digest(history: &[ChatMessage]) -> Option<String> {
+    const MAX_ARGS_CHARS: usize = 500;
+    const MAX_RESULT_CHARS: usize = 200;
+
+    let mut calls: HashMap<&str, (&str, &str)> = HashMap::new();
+    for message in history {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in tool_calls {
+            calls.insert(
+                call.id.as_str(),
+                (
+                    call.function.name.as_str(),
+                    call.function.arguments.as_str(),
+                ),
+            );
+        }
+    }
+
+    struct Failure {
+        tool_name: String,
+        arguments: String,
+        result_first_line: String,
+    }
+
+    let mut failures: Vec<Failure> = Vec::new();
+    for message in history {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call_id) = &message.tool_call_id else {
+            continue;
+        };
+        let text = message.text_content().unwrap_or("");
+        if !crate::tools::tool_result_failed(text) {
+            continue;
+        }
+        let (tool_name, arguments) = calls
+            .get(call_id.as_str())
+            .map(|&(name, args)| (name.to_string(), args.to_string()))
+            .unwrap_or_else(|| {
+                (
+                    message
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    String::new(),
+                )
+            });
+        failures.push(Failure {
+            tool_name,
+            arguments,
+            result_first_line: text.lines().next().unwrap_or("").to_string(),
+        });
+    }
+
+    if failures.is_empty() {
+        return None;
+    }
+
+    let total = failures.len();
+    let kept: &[Failure] = if total > MAX_DIGEST_FAILURES {
+        &failures[total - MAX_DIGEST_FAILURES..]
+    } else {
+        &failures[..]
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    if total > MAX_DIGEST_FAILURES {
+        lines.push(format!(
+            "({} earlier failed calls omitted)",
+            total - MAX_DIGEST_FAILURES
+        ));
+    }
+    for (index, failure) in kept.iter().enumerate() {
+        lines.push(format!(
+            "{}. `{}` args={} -> {}",
+            index + 1,
+            failure.tool_name,
+            truncate_chars(&failure.arguments, MAX_ARGS_CHARS),
+            truncate_chars(&failure.result_first_line, MAX_RESULT_CHARS),
+        ));
+    }
+
+    Some(format!(
+        "<failed_tool_calls>\n{}\n</failed_tool_calls>",
+        lines.join("\n")
+    ))
+}
+
+/// Truncate `s` to at most `max` chars (char-boundary-safe, unlike a byte
+/// slice), appending `…` when truncation actually happened.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Retain a recent provider-neutral tail verbatim while summarizing the older
@@ -258,6 +707,8 @@ async fn run_compaction_request(
     llm: &dyn LlmBackend,
     model: &str,
     messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDefinition>>,
+    reasoning_effort: Option<String>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<(String, TokenUsage)> {
@@ -268,8 +719,8 @@ async fn run_compaction_request(
         || StreamChatRequest {
             model: model.to_string(),
             messages: messages.clone(),
-            tools: None,
-            reasoning_effort: Some("low".to_string()),
+            tools: tools.clone(),
+            reasoning_effort: reasoning_effort.clone(),
             service_tier: None,
             temperature: None,
             structured_output: None,
@@ -1448,7 +1899,7 @@ mod tests {
                 r#type: "function".into(),
                 function: FunctionCall {
                     name: "read_file".into(),
-                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 },
             }]),
             ChatMessage::tool_result("c1", "read_file", "exact recent result"),
@@ -1457,20 +1908,21 @@ mod tests {
             &backend,
             "mock",
             &history,
+            0,
             None,
-            Some(8_000),
+            None,
+            None,
+            Some(100_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
         .expect("compaction succeeds");
 
-        assert!(
-            compacted.checkpoint_messages[0]
-                .text_content()
-                .unwrap()
-                .contains("<state_snapshot>")
-        );
+        let first_message = compacted.checkpoint_messages[0].text_content().unwrap();
+        assert!(first_message.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(first_message.contains("<state_snapshot>"));
+        assert!(first_message.contains("<files_already_read>"));
         assert_eq!(compacted.checkpoint_messages[1].role, "assistant");
         assert_eq!(compacted.checkpoint_messages[2].role, "tool");
         assert_eq!(
@@ -1478,6 +1930,512 @@ mod tests {
             Some("exact recent result")
         );
         assert!(compacted.after_tokens < compacted.before_tokens);
+    }
+
+    /// Backend for exercising the native in-conversation compaction path.
+    /// `ScriptedBackend` dispatches on the FIRST message, which works for
+    /// the rendered fallback (a fresh `[system, user]` request) but not for
+    /// the native attempt, whose first message is the conversation's own
+    /// system message. This dispatches on whether the LAST message carries
+    /// the native instruction's marker text instead, and records every
+    /// request's messages/tools for inspection.
+    type CapturedCompactionRequest = (
+        Vec<ChatMessage>,
+        Option<Vec<crate::llm_client::ToolDefinition>>,
+    );
+
+    struct NativeAwareBackend {
+        native_fails: bool,
+        native_response: String,
+        fallback_response: String,
+        chunk_response: String,
+        captured: Arc<Mutex<Vec<CapturedCompactionRequest>>>,
+    }
+
+    impl NativeAwareBackend {
+        fn new(native_fails: bool, native_response: &str, fallback_response: &str) -> Self {
+            Self {
+                native_fails,
+                native_response: native_response.to_string(),
+                fallback_response: fallback_response.to_string(),
+                chunk_response: "- extracted history".to_string(),
+                captured: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn is_native_request(messages: &[ChatMessage]) -> bool {
+            messages
+                .last()
+                .and_then(|m| m.text_content())
+                .is_some_and(|text| text.contains(NATIVE_SNAPSHOT_INSTRUCTION_PREFIX))
+        }
+    }
+
+    impl LlmBackend for NativeAwareBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            async { Ok(vec!["mock".into()]) }.boxed()
+        }
+        fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((request.messages.clone(), request.tools.clone()));
+            if Self::is_native_request(&request.messages) {
+                if self.native_fails {
+                    return async {
+                        Err(anyhow::anyhow!("native compaction intentionally failed"))
+                    }
+                    .boxed();
+                }
+                let response = self.native_response.clone();
+                return async move {
+                    Ok(LlmResponse::Text {
+                        text: response,
+                        reasoning_content: None,
+                        usage: crate::llm_client::TokenUsage::default(),
+                    })
+                }
+                .boxed();
+            }
+            let system = request
+                .messages
+                .first()
+                .and_then(|m| m.text_content())
+                .unwrap_or("");
+            // `HISTORY_CHUNK_PROMPT` (extraction pass) vs. the final
+            // rendered-snapshot request built from `history_snapshot_prompt()`
+            // -- compact_history's fallback has no separate meta/combine
+            // stage, unlike turn summarization.
+            let response = if system.contains("Extract durable working-memory facts") {
+                self.chunk_response.clone()
+            } else {
+                self.fallback_response.clone()
+            };
+            async move {
+                Ok(LlmResponse::Text {
+                    text: response,
+                    reasoning_content: None,
+                    usage: crate::llm_client::TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn read_file_tool_definition() -> crate::llm_client::ToolDefinition {
+        crate::llm_client::ToolDefinition {
+            r#type: "function".to_string(),
+            function: crate::llm_client::FunctionDef {
+                name: "read_file".to_string(),
+                description: "Read a file.".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    /// The native attempt sends the conversation's own native messages
+    /// (assistant `tool_calls` included, un-flattened), the trailing
+    /// instruction, and the advertised tools -- exactly what Phase 2
+    /// promises over the old flatten-to-text request.
+    #[tokio::test]
+    async fn compact_history_native_path_sends_native_messages_and_tools() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let backend = NativeAwareBackend::new(
+            false,
+            "<state_snapshot><pending_tasks>done</pending_tasks></state_snapshot>",
+            "unused",
+        );
+        let captured = backend.captured.clone();
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("please read the file and summarize its contents".repeat(50)),
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+                },
+            }]),
+            ChatMessage::tool_result("c1", "read_file", "file contents ".repeat(200)),
+        ];
+        let tools = vec![read_file_tool_definition()];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            Some(&tools),
+            None,
+            None,
+            Some(200_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds");
+        assert!(compacted.after_tokens < compacted.before_tokens);
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "native attempt should succeed on the first call"
+        );
+        let (messages, request_tools) = &requests[0];
+
+        // The original native messages -- including the un-flattened
+        // assistant `tool_calls` message -- are present verbatim.
+        assert_eq!(messages[0].text_content(), Some("canonical system prompt"));
+        assert!(
+            messages[1]
+                .text_content()
+                .unwrap()
+                .starts_with("please read the file")
+        );
+        assert!(
+            messages[2].tool_calls.is_some(),
+            "assistant tool_calls must survive un-flattened"
+        );
+        assert_eq!(
+            messages[2].tool_calls.as_ref().unwrap()[0].function.name,
+            "read_file"
+        );
+        assert_eq!(messages[3].role, "tool");
+
+        // Trailing instruction asks for a state snapshot in text only.
+        let last = messages.last().unwrap().text_content().unwrap();
+        assert!(last.contains("state_snapshot"));
+        assert!(last.contains("Do NOT call any tools"));
+
+        // Advertised tool schemas are passed through.
+        let request_tools = request_tools.as_ref().expect("tools should be forwarded");
+        assert!(request_tools.iter().any(|t| t.function.name == "read_file"));
+    }
+
+    /// When the native attempt fails, compaction falls back to the
+    /// flatten+chunk rendered path and still produces a valid checkpoint.
+    #[tokio::test]
+    async fn compact_history_falls_back_when_native_attempt_fails() {
+        let backend = NativeAwareBackend::new(
+            true,
+            "unused",
+            "<state_snapshot><pending_tasks>fallback done</pending_tasks></state_snapshot>",
+        );
+        let captured = backend.captured.clone();
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("old context ".repeat(2_000)),
+            ChatMessage::assistant("acknowledged"),
+        ];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            None,
+            None,
+            None,
+            Some(200_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds via fallback");
+
+        let first_message = compacted.checkpoint_messages[0].text_content().unwrap();
+        assert!(first_message.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(first_message.contains("<state_snapshot>"));
+        assert!(first_message.contains("fallback done"));
+
+        let requests = captured.lock().unwrap();
+        assert!(
+            requests.len() >= 2,
+            "expected a failed native call plus at least one fallback call, got {}",
+            requests.len()
+        );
+        assert!(
+            NativeAwareBackend::is_native_request(&requests[0].0),
+            "first call should be the native attempt"
+        );
+        assert!(
+            !NativeAwareBackend::is_native_request(&requests[1].0),
+            "second call should be the rendered fallback, not another native attempt"
+        );
+    }
+
+    /// When the raw conversation is already too close to the declared
+    /// context window, the native attempt is skipped entirely -- the
+    /// backend never sees the native instruction, and the very first
+    /// request is already the rendered fallback.
+    #[tokio::test]
+    async fn compact_history_guard_skips_native_when_conversation_too_large() {
+        let backend = NativeAwareBackend::new(
+            false,
+            "unused",
+            "<state_snapshot><pending_tasks>guarded fallback</pending_tasks></state_snapshot>",
+        );
+        let captured = backend.captured.clone();
+        // A tiny declared window (1_000 tokens) with history that alone
+        // exceeds 90% of it forces the guard to trip.
+        let all_messages = vec![
+            ChatMessage::system("canonical system prompt"),
+            ChatMessage::user("word ".repeat(2_000)),
+        ];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &all_messages,
+            1,
+            None,
+            None,
+            None,
+            Some(1_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds via fallback");
+        assert!(
+            compacted.checkpoint_messages[0]
+                .text_content()
+                .unwrap()
+                .contains("guarded fallback")
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(!requests.is_empty());
+        for (messages, _) in requests.iter() {
+            assert!(
+                !NativeAwareBackend::is_native_request(messages),
+                "native instruction must never be sent once the guard trips"
+            );
+        }
+    }
+
+    /// Build an assistant message issuing one `read_file` tool call, using
+    /// the real schema fields (`file_path`, `offset`, `limit`; see
+    /// `tools/mod.rs` `ReadFileArgs`).
+    fn read_file_call(
+        call_id: &str,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> ChatMessage {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+        if let Some(offset) = offset {
+            args.insert("offset".to_string(), serde_json::Value::from(offset));
+        }
+        if let Some(limit) = limit {
+            args.insert("limit".to_string(), serde_json::Value::from(limit));
+        }
+        ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: call_id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::Value::Object(args).to_string(),
+            },
+        }])
+    }
+
+    #[test]
+    fn files_already_read_digest_is_none_without_read_file_calls() {
+        let history = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        assert!(files_already_read_digest(&history).is_none());
+    }
+
+    #[test]
+    fn files_already_read_digest_dedupes_merges_ranges_and_prefers_whole_file() {
+        let history = vec![
+            read_file_call("c1", "src/foo.rs", Some(0), Some(200)), // lines 1-200
+            read_file_call("c2", "src/foo.rs", Some(399), Some(51)), // lines 400-450
+            read_file_call("c3", "src/foo.rs", Some(150), Some(100)), // lines 151-250, overlaps c1
+            read_file_call("c4", "src/bar.rs", Some(10), Some(5)),  // lines 11-15
+            read_file_call("c5", "src/bar.rs", None, None),         // whole file wins
+            read_file_call("c6", "src/baz.rs", Some(20), None),     // offset-to-end
+        ];
+        let digest = files_already_read_digest(&history).expect("digest present");
+        assert!(digest.starts_with("<files_already_read>\n"));
+        assert!(digest.ends_with("\n</files_already_read>"));
+        // c1 and c3 overlap (1-200 and 151-250) and merge into one range;
+        // c2 (400-450) stays separate.
+        assert!(
+            digest.contains("src/foo.rs (lines 1-250, 400-450)"),
+            "unexpected digest: {digest}"
+        );
+        // A later whole-file read overrides the earlier ranged reads.
+        assert!(digest.contains("src/bar.rs\n") || digest.contains("src/bar.rs\n</"));
+        assert!(!digest.contains("src/bar.rs (lines"));
+        // offset present, no limit -> "to end of file".
+        assert!(digest.contains("src/baz.rs (lines 21-end)"), "{digest}");
+        // First-seen order: foo.rs before bar.rs before baz.rs.
+        let foo_pos = digest.find("src/foo.rs").unwrap();
+        let bar_pos = digest.find("src/bar.rs").unwrap();
+        let baz_pos = digest.find("src/baz.rs").unwrap();
+        assert!(foo_pos < bar_pos && bar_pos < baz_pos);
+    }
+
+    #[test]
+    fn files_already_read_digest_ignores_unparseable_and_missing_path() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let bad_json = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "c1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: "not json".into(),
+            },
+        }]);
+        let missing_path = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "c2".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"offset":0}"#.into(),
+            },
+        }]);
+        let history = vec![bad_json, missing_path];
+        assert!(files_already_read_digest(&history).is_none());
+    }
+
+    #[test]
+    fn files_already_read_digest_caps_paths_and_notes_the_rest() {
+        let history: Vec<ChatMessage> = (0..101)
+            .map(|i| read_file_call(&format!("c{i}"), &format!("src/file_{i}.rs"), None, None))
+            .collect();
+        let digest = files_already_read_digest(&history).expect("digest present");
+        assert!(digest.contains("(+1 more files)"), "{digest}");
+        assert!(digest.contains("src/file_0.rs"));
+        assert!(!digest.contains("src/file_100.rs"));
+    }
+
+    /// Build a `role: "tool"` message paired with an assistant tool call so
+    /// the digest's call-id join has something to match. `result` becomes
+    /// the tool message's text content.
+    fn tool_exchange_messages(
+        call_id: &str,
+        tool_name: &str,
+        args: &str,
+        result: &str,
+    ) -> Vec<ChatMessage> {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        vec![
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: call_id.to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: tool_name.to_string(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            ChatMessage::tool_result(call_id, tool_name, result),
+        ]
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_is_none_when_nothing_failed() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "read_file",
+            "{}",
+            "file contents",
+        ));
+        assert!(failed_tool_calls_digest(&history).is_none());
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_catches_malformed_args_error() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "read_file",
+            r#"{"file_path": "src/lib.rs""#,
+            "Error: tool arguments are not valid JSON (EOF while parsing an object at line 1 column 27)",
+        ));
+        // A successful call must not show up alongside the failure.
+        history.extend(tool_exchange_messages(
+            "c2",
+            "read_file",
+            "{}",
+            "ok contents",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.starts_with("<failed_tool_calls>\n"));
+        assert!(digest.contains("1. `read_file` args="));
+        assert!(digest.contains("Error: tool arguments are not valid JSON"));
+        assert!(!digest.contains("ok contents"));
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_catches_permission_denials() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "edit",
+            r#"{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            "Tool use denied by user.",
+        ));
+        history.extend(tool_exchange_messages(
+            "c2",
+            "run_shell_command",
+            r#"{"command":"rm -rf target"}"#,
+            "Tool use denied by auto permissions: destructive command outside approved scope",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.contains("1. `edit` args="), "{digest}");
+        assert!(digest.contains("Tool use denied by user."), "{digest}");
+        assert!(digest.contains("2. `run_shell_command` args="), "{digest}");
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_truncates_long_arguments() {
+        let long_args = format!(r#"{{"pattern":"{}"}}"#, "x".repeat(600));
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "grep_search",
+            &long_args,
+            "Error: no matches",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.contains('…'), "expected truncation marker: {digest}");
+        // 500 chars of args plus the marker, well under the full argument length.
+        assert!(digest.len() < long_args.len());
+    }
+
+    #[test]
+    fn failed_tool_calls_digest_keeps_last_ten_and_notes_omitted_count() {
+        let mut history = Vec::new();
+        for i in 0..13 {
+            history.extend(tool_exchange_messages(
+                &format!("c{i}"),
+                "run_shell_command",
+                &format!(r#"{{"command":"step{i}"}}"#),
+                &format!("Error: step {i} failed"),
+            ));
+        }
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(
+            digest.contains("(3 earlier failed calls omitted)"),
+            "{digest}"
+        );
+        // Only the last 10 (steps 3..=12) survive, renumbered from 1.
+        assert!(digest.contains("step 3 failed"), "{digest}");
+        assert!(!digest.contains("step 2 failed"), "{digest}");
+        assert!(digest.contains("step 12 failed"), "{digest}");
+        assert!(digest.contains("10. `run_shell_command`"), "{digest}");
+        assert!(!digest.contains("11. `run_shell_command`"), "{digest}");
     }
 
     /// The recap entry point reuses the same machinery but drives the

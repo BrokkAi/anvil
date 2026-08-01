@@ -13,6 +13,7 @@ use crate::llm_client::{
     is_retryable_llm_error, stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ToolExchange;
+use crate::tools::tool_result_failed;
 use crate::trace_logging::append_trace_record;
 
 pub(crate) const TRAIN_BIFROST_PACKET_ENV: &str = "BRK_TRAIN_BIFROST_PACKET";
@@ -245,10 +246,6 @@ fn related_file_summarized(path: &str, tool_exchanges: &[ToolExchange]) -> bool 
                 &format!("{}\n{}", exchange.arguments, exchange.result).replace('\\', "/"),
             )
     })
-}
-
-fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Internal error:")
 }
 
 fn listed_directory_contains_path(path: &str, exchange: &ToolExchange) -> bool {
