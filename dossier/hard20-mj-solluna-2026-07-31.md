@@ -268,3 +268,73 @@ primary tokens and its 16/20 are one phenomenon: cost per solved task
 $10.70 vs vanilla's $4.60. The one demand-side lever not yet built or
 falsified is a model-visible spend budget that changes the satisfaction
 criterion. Runs: 12, 13, 13, 9/16k, 10/15k, **16** vs E=15.2.
+
+### Tool-integrity audit (2026-08-01)
+
+Prompted by the cost equilibrium: if we pay 2.5x for more investigation
+without more quality, are the tools working as intended, or is sol
+fighting them? Three parallel Opus auditors read six run-6/7 traces
+end-to-end (pebble+kysely, dynamodb+cliffy, skrub+python-statemachine).
+
+**Verdict: the request volume survives audit; the tooling does not.**
+Tool/env-attributable turns are 5-16% across all six traces (worst in Go,
+least in Python), strictly redundant verification 1-4% — the model's
+requests are overwhelmingly real work (pebble: 55% productive
+first-attempt implementation). But wall clock and several specific
+behaviors trace to concrete defects:
+
+1. **rtk wrapper dishonesty (the headline).** At >10MiB the capture
+   keeps the FIRST 10MiB and drops the tail — where test failures
+   cluster — then summarizes the truncated buffer as if complete:
+   "Go test: 930 passed in 66 packages ... Exit code: 1" with zero
+   failures listed, twice. Panic stacks and test identities erased;
+   ruff diagnostics collapsed to "Found 1 error." even inside a file
+   the model had redirected to; the advertised tee log unreachable by
+   the sandboxed read_file. Sol's countermeasures were rational and
+   expensive: 11 RTK_DISABLED=1 bypasses (~17min re-running, pebble), a
+   self-invented 5-part escape incantation used 14x (psm). Ownership
+   settled: rtk is vendored INTO anvil (rtk_core; shell.rs rewrites
+   every command through `anvil __rtk`), and `ANVIL_RTK_DISABLED=1` is
+   an existing zero-code global kill switch — rip-vs-fix is a free A/B.
+2. **run_shell_command timeout is milliseconds** (1s round-up floor).
+   Skrub's reviewer passed `timeout: 120` meaning seconds, was killed at
+   1s three times, and abandoned empirical verification — every finding
+   filed source-reviewed-only. Same unit bug exists in the qwencode
+   original (worse: no floor, 120 = 120ms). The schema says
+   "milliseconds"; the model's unit prior beats the doc.
+3. **Container hygiene**: git identity unset in 100% of sessions
+   (~2 turns each; the engine only configures identity in the grading
+   phase), GOPATH/bin off PATH (6 diagnosis turns + 10 prefixed
+   commands), dash-not-bash, one pre-existing OOM package (266s to
+   exonerate).
+4. **edit batches apply non-atomically** — a mid-batch failure leaves
+   the file moved under the model's stale anchors (4-turn recovery
+   observed; base rate 0-5%). oh-my-pi ships the same stop-at-first
+   semantics but with an explicit recovery script in the error text.
+5. **Whole-project verification**: 18 full tsc runs = 10.6% of
+   dynamodb's wall; two full pytest suites = 64% of skrub's tool time.
+6. **Compaction restarts as request multiplier**: dynamodb restarted 3x,
+   re-reading files and replaying one malformed edit verbatim; 64%
+   post-compaction re-reads in psm. Plus ~35 of pebble's 104min never
+   reached the agent at all (container contention) — wall-clock
+   comparisons are contaminated.
+
+**The quality finding that answers the original question**: psm's six
+review rounds consumed 53% of the task's requests and moved the hidden
+suite zero — rat-holed on ungraded deepcopy edge cases while the one
+discoverable spec bug (child-shadows-parent precedence, verbatim in the
+spec, inverted by a `reversed()`) sat untouched from minute 15. Pebble's
+FIRST review round found a real durability bug that shipped. Round one
+of review earns its cost; rounds two through six bought nothing.
+
+**Decision round (owner, 2026-08-01)**: timeout moves to seconds with a
+[10..3600] clamp (schema rename `timeout_seconds` proposed, pending);
+rtk rip-vs-fix pending the free ANVIL_RTK_DISABLED A/B (fix path if
+kept: exit-code cross-check — never claim clean when exit != 0 — plus
+truncation-aware summaries, tail-not-head capture, skip wrapping
+redirected commands, RTK_TEE_DIR into the workspace); container fix
+located (deepswe_agent_engine.py prep block + solver env prefix);
+edit atomicity recommendation: in-memory apply, single write (we lack
+omp's fuzzy fallback, so mid-batch failures are likelier for us);
+whole-project verification dropped as not-ours (benchmark fitting);
+compaction replay filed as anvil#326.
