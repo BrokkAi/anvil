@@ -146,10 +146,6 @@ struct WebSearchArgs {
     max_results: usize,
 }
 
-fn default_shell_timeout_ms() -> u64 {
-    60_000
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ShellSandboxPermissionArg {
@@ -183,8 +179,18 @@ impl ShellSandboxPermissionArg {
 #[derive(Debug, Deserialize)]
 struct RunShellCommandArgs {
     command: String,
-    #[serde(default = "default_shell_timeout_ms")]
-    timeout: u64,
+    /// The advertised timeout field, in seconds. Clamped to
+    /// `[shell::MIN_TIMEOUT_SECONDS, shell::MAX_TIMEOUT_SECONDS]`.
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    timeout_seconds: Option<u64>,
+    /// Legacy millisecond timeout. Deserialized but deliberately absent from
+    /// the advertised schema: models kept reading "timeout" as seconds and
+    /// having their commands killed at the 1s rounding floor. Kept so
+    /// in-process callers and replayed traces that still pass milliseconds
+    /// behave exactly as they did, with only the ceiling moved.
+    /// `timeout_seconds` wins when both are present.
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    timeout: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     directory: Option<String>,
     #[serde(
@@ -270,7 +276,7 @@ impl BuiltinArgsContract for RunShellCommandArgs {
     const REQUIRED_FIELDS: &'static [&'static str] = &["command"];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
         ("command", "string"),
-        ("timeout", "integer"),
+        ("timeout_seconds", "integer"),
         ("description", "string"),
         ("directory", "string"),
         (ShellSandboxPermissionArg::FIELD, "string"),
@@ -1145,16 +1151,22 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("run_shell_command") {
+            // Seconds, not milliseconds: models routinely passed `120`
+            // meaning two minutes, and the millisecond reading rounded that
+            // to a 1-second budget that killed the command. The unit is
+            // stated twice on purpose -- in the field name and in the text.
             let timeout_description = format!(
-                "Optional timeout in milliseconds. Rounded up to seconds and clamped to a {} second server maximum.",
-                shell::MAX_TIMEOUT_SECONDS
+                "Optional timeout in seconds (not milliseconds) for this command. Clamped to a minimum of {} seconds and a maximum of {} seconds. Defaults to {} seconds when omitted.",
+                shell::MIN_TIMEOUT_SECONDS,
+                shell::MAX_TIMEOUT_SECONDS,
+                shell::DEFAULT_TIMEOUT_SECONDS
             );
             let mut shell_properties = json!({
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute (passed to sh -c)."
                 },
-                "timeout": {
+                "timeout_seconds": {
                     "type": "integer",
                     "description": timeout_description
                 },
@@ -1549,8 +1561,7 @@ impl ToolRegistry {
                     Ok(args) => args,
                     Err(result) => return result,
                 };
-                let timeout_seconds = args.timeout.saturating_add(999) / 1000;
-                let timeout_seconds = timeout_seconds.max(1);
+                let timeout = shell::ShellTimeout::resolve(args.timeout_seconds, args.timeout);
                 let command_cwd = match args.directory.as_deref() {
                     Some(directory) if !directory.trim().is_empty() => {
                         match safe_resolve_in_roots(&self.cwd, &self.additional_roots, directory) {
@@ -1571,10 +1582,10 @@ impl ToolRegistry {
                     }
                     _ => self.cwd.clone(),
                 };
-                shell::run_shell_command_cancellable(
+                shell::run_shell_command_with_timeout(
                     &command_cwd,
                     &args.command,
-                    timeout_seconds,
+                    timeout,
                     policy,
                     outside_sandbox_once,
                     cancel,
@@ -2474,6 +2485,49 @@ mod tests {
         assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
     }
 
+    /// The model is offered exactly one timeout field, in seconds. The legacy
+    /// millisecond `timeout` stays deserializable for replay and in-process
+    /// callers but must never be advertised again: seeing both would just
+    /// reintroduce the unit confusion this switch exists to remove.
+    #[tokio::test]
+    async fn shell_schema_advertises_timeout_seconds_only() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let shell_def = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+        let properties = &shell_def.function.parameters["properties"];
+
+        assert!(
+            properties["timeout"].is_null(),
+            "the millisecond timeout field must not be advertised: {properties}"
+        );
+        assert_eq!(properties["timeout_seconds"]["type"], "integer");
+        let description = properties["timeout_seconds"]["description"]
+            .as_str()
+            .expect("timeout_seconds should carry a description");
+        assert_eq!(
+            description,
+            "Optional timeout in seconds (not milliseconds) for this command. \
+             Clamped to a minimum of 10 seconds and a maximum of 3600 seconds. \
+             Defaults to 120 seconds when omitted."
+        );
+        // The advertised numbers are the constants the resolver enforces.
+        assert!(description.contains(&format!(
+            "minimum of {} seconds",
+            shell::MIN_TIMEOUT_SECONDS
+        )));
+        assert!(description.contains(&format!(
+            "maximum of {} seconds",
+            shell::MAX_TIMEOUT_SECONDS
+        )));
+        assert!(description.contains(&format!(
+            "Defaults to {} seconds",
+            shell::DEFAULT_TIMEOUT_SECONDS
+        )));
+    }
+
     #[tokio::test]
     async fn edit_tool_schema_surfaces_batch_entries() {
         let registry = registry_with_skills(vec![]);
@@ -2596,6 +2650,14 @@ mod tests {
             "command",
         )
         .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "run_shell_command",
+            json!({ "command": "echo ok", "timeout_seconds": 30.5 }),
+            "timeout_seconds",
+        )
+        .await;
+        // Legacy millisecond field: unadvertised, still validated.
         assert_invalid_builtin_args(
             &registry,
             "run_shell_command",
@@ -2859,13 +2921,16 @@ mod tests {
         );
     }
 
+    /// End-to-end wiring of the ceiling. The exact clamped value is pinned by
+    /// `shell::timeout_tests`, which serializes against the deployment-cap
+    /// override; asserting the number here would race that test.
     #[tokio::test]
-    async fn shell_timeout_is_clamped_and_reported() {
+    async fn shell_timeout_seconds_above_the_cap_is_clamped_and_reported() {
         let registry = registry_with_skills(vec![]);
         let result = registry
             .execute_with_sandbox_mode_cancellable(
                 "run_shell_command",
-                json!({ "command": "echo ok", "timeout": 601_000 }),
+                json!({ "command": "echo ok", "timeout_seconds": 4000 }),
                 SandboxPolicy::None,
                 false,
                 None,
@@ -2881,13 +2946,116 @@ mod tests {
         assert!(
             result
                 .output
-                .contains(&format!("clamped to {}s", shell::MAX_TIMEOUT_SECONDS)),
+                .contains("exceeded the server maximum; clamped to"),
             "clamped timeout should be reported; output={}",
             result.output
         );
         assert!(
             result.output.contains("ok"),
             "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// The trace that motivated the seconds switch: a model passed a small
+    /// number meaning seconds, got a sub-second budget, and gave up on
+    /// verifying its work. Now the floor rescues it and says so.
+    #[tokio::test]
+    async fn shell_timeout_seconds_below_the_floor_is_raised_and_reported() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout_seconds": 3 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "floored timeout command should still run; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains(&format!(
+                "Notice: requested timeout 3s was below the {}s minimum; raised to {}s.",
+                shell::MIN_TIMEOUT_SECONDS,
+                shell::MIN_TIMEOUT_SECONDS
+            )),
+            "raised timeout should be reported; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// The millisecond field is no longer advertised, but replayed traces and
+    /// in-process callers still pass it and must keep working unchanged: 2000ms
+    /// is a 2 second budget, not floored to the new 10 second minimum.
+    #[tokio::test]
+    async fn legacy_millisecond_timeout_is_still_accepted() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout": 2_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "legacy millisecond timeout should still run; output={}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Notice: requested timeout"),
+            "a legacy millisecond value inside the range should not be clamped; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// Both fields present: the advertised seconds field wins. A legacy
+    /// 600000ms would be a silent 600s budget, so the floor notice is the
+    /// tell that `timeout_seconds` was the one that took effect.
+    #[tokio::test]
+    async fn timeout_seconds_takes_precedence_over_legacy_milliseconds() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout_seconds": 3, "timeout": 600_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "command should still run; output={}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("Notice: requested timeout 3s was below"),
+            "timeout_seconds should win over the legacy millisecond field; output={}",
             result.output
         );
     }

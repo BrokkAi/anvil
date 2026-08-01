@@ -135,6 +135,34 @@ pub fn edit_file_in_roots(
     )
 }
 
+/// Recovery instructions appended to a multi-entry `edit` failure.
+///
+/// A batch stops at the first failing entry and keeps every earlier entry
+/// applied, so the file is left in a state that neither the original request
+/// nor a naive retry describes: re-sending the whole batch would fail again
+/// on entries whose `old_string` is already gone. Spelling out what landed,
+/// what was never attempted, and what to send next turns that partial state
+/// into a mechanical next step instead of a guess.
+///
+/// `failed_index` is the 0-based index reported as `edits[{failed_index}]`;
+/// the entry numbers here are 1-based, matching how the caller counts the
+/// list it wrote.
+fn batch_recovery_script(failed_index: usize, total: usize) -> String {
+    let applied_clause = match failed_index {
+        0 => "No entries were applied.".to_string(),
+        1 => "Entry 1 was already applied.".to_string(),
+        applied => format!("Entries 1-{applied} were already applied."),
+    };
+    let unapplied_clause = match total.saturating_sub(failed_index + 1) {
+        0 => String::new(),
+        1 => format!("Entry {total} was NOT applied. "),
+        _ => format!("Entries {}-{total} were NOT applied. ", failed_index + 2),
+    };
+    format!(
+        "{applied_clause} {unapplied_clause}Re-read the file and re-issue only the failed and unapplied entries."
+    )
+}
+
 pub fn edit_file_entries_in_roots(
     cwd: &Path,
     additional_roots: &[std::path::PathBuf],
@@ -182,9 +210,10 @@ pub fn edit_file_entries_in_roots(
             Err(mut result) => {
                 if !single_entry {
                     result.output = format!(
-                        "Applied {applied_entries} edit entr{} before failure at edits[{index}]: {}",
+                        "Applied {applied_entries} edit entr{} before failure at edits[{index}]: {}\n\n{}",
                         if applied_entries == 1 { "y" } else { "ies" },
-                        result.output
+                        result.output,
+                        batch_recovery_script(index, edits.len())
                     );
                 }
                 return result;
@@ -1216,16 +1245,131 @@ mod tests {
         let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
 
         assert!(matches!(r.status, ToolStatus::RequestError));
-        assert!(
-            r.output.contains(
-                "Applied 1 edit entry before failure at edits[1]: No occurrences of `old_string` found in 'a.txt'"
-            ),
-            "{}",
-            r.output
+        assert_eq!(
+            r.output,
+            "Applied 1 edit entry before failure at edits[1]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entry 1 was already applied. Entry 3 was NOT applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
         );
         assert_eq!(
             std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
             "alpha\nBETA\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Failure at the first entry: nothing landed, so the recovery script must
+    /// not invite the model to skip entries it never applied.
+    #[test]
+    fn edit_file_entries_recovery_script_when_first_entry_fails() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-first");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "gamma".to_string(),
+                new_string: "GAMMA".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 0 edit entries before failure at edits[0]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             No entries were applied. Entries 2-3 were NOT applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Failure at the last entry: everything before it landed and nothing is
+    /// left unattempted, so the script says so instead of naming an empty
+    /// range.
+    #[test]
+    fn edit_file_entries_recovery_script_when_last_entry_fails() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-last");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 2 edit entries before failure at edits[2]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entries 1-2 were already applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "ALPHA\nBETA\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A two-entry batch failing at entry 2 exercises the singular
+    /// already-applied phrasing with nothing left unapplied.
+    #[test]
+    fn edit_file_entries_recovery_script_singular_applied_entry() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-pair");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 1 edit entry before failure at edits[1]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entry 1 was already applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
         );
         std::fs::remove_dir_all(&cwd).ok();
     }

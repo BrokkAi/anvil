@@ -9,7 +9,24 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
-pub(super) const MAX_TIMEOUT_SECONDS: u64 = 600;
+/// Wall-clock budget for one `run_shell_command` call when the model names
+/// neither `timeout_seconds` nor the legacy millisecond `timeout`.
+pub(super) const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+/// Floor for a model-supplied `timeout_seconds`. A model that asks for a
+/// couple of seconds is almost always confusing units or guessing; killing
+/// its command at the requested value teaches it that verification is
+/// impossible here, so we raise the budget and say so in the output.
+/// Deliberately NOT applied to the legacy millisecond field, whose exact
+/// semantics replayed traces depend on.
+pub(super) const MIN_TIMEOUT_SECONDS: u64 = 10;
+/// Ceiling for every timeout, whichever field requested it. Deployments can
+/// lower it via `ANVIL_SHELL_TIMEOUT_CAP_SECONDS`; the model is never told
+/// about that override, it just sees the clamp notice if one fires.
+pub(super) const MAX_TIMEOUT_SECONDS: u64 = 3600;
+/// Deployment-level override for [`MAX_TIMEOUT_SECONDS`]. Read from the
+/// agent's own environment (not the sandboxed child's), so a command cannot
+/// widen its own budget by exporting this.
+const TIMEOUT_CAP_ENV: &str = "ANVIL_SHELL_TIMEOUT_CAP_SECONDS";
 #[cfg(not(target_os = "windows"))]
 const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
 #[cfg(not(target_os = "windows"))]
@@ -481,10 +498,141 @@ fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
+/// Effective ceiling on a shell timeout, in seconds.
+///
+/// [`MAX_TIMEOUT_SECONDS`] unless `ANVIL_SHELL_TIMEOUT_CAP_SECONDS` names a
+/// positive integer. An absent, empty, zero, or unparseable value falls back
+/// to the default rather than failing the call: a mistyped deployment knob
+/// must not break every shell command.
+fn timeout_cap_seconds() -> u64 {
+    parse_timeout_cap(std::env::var(TIMEOUT_CAP_ENV).ok().as_deref())
+}
+
+fn parse_timeout_cap(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(MAX_TIMEOUT_SECONDS)
+}
+
+/// A resolved wall-clock budget for one shell call, plus the user-visible
+/// notice to emit when the request had to be clamped.
+///
+/// Every timeout policy decision lives here so the advertised
+/// `timeout_seconds` field, the retained legacy millisecond `timeout` field,
+/// and internal callers cannot drift apart:
+///
+/// - [`Self::from_request_seconds`] -- what the model asks for. Clamped to
+///   `[MIN_TIMEOUT_SECONDS, cap]`, with a notice in either direction.
+/// - [`Self::from_legacy_millis`] -- the unadvertised millisecond field kept
+///   for replay/internal compatibility. Rounds up to whole seconds with a 1s
+///   floor exactly as before; only the ceiling moved. It is deliberately NOT
+///   raised to `MIN_TIMEOUT_SECONDS`, so a replayed trace that asked for
+///   1500ms still gets 2s.
+/// - [`Self::from_exact_seconds`] -- in-process callers that already speak
+///   seconds; same permissive floor as the legacy path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellTimeout {
+    seconds: u64,
+    clamp_notice: Option<String>,
+}
+
+impl ShellTimeout {
+    /// Pick the budget for one `run_shell_command` call from its arguments.
+    /// `timeout_seconds` wins when both fields are present.
+    pub(super) fn resolve(timeout_seconds: Option<u64>, legacy_millis: Option<u64>) -> Self {
+        match (timeout_seconds, legacy_millis) {
+            (Some(seconds), _) => Self::from_request_seconds(seconds),
+            (None, Some(millis)) => Self::from_legacy_millis(millis),
+            (None, None) => Self::default_budget(),
+        }
+    }
+
+    /// Neither timeout field was supplied. The model asked for nothing, so
+    /// there is nothing to report even if a deployment cap lowers the
+    /// default.
+    fn default_budget() -> Self {
+        Self {
+            seconds: DEFAULT_TIMEOUT_SECONDS.min(timeout_cap_seconds()),
+            clamp_notice: None,
+        }
+    }
+
+    fn from_request_seconds(requested: u64) -> Self {
+        let cap = timeout_cap_seconds();
+        let seconds = requested.max(MIN_TIMEOUT_SECONDS).min(cap);
+        let clamp_notice = if seconds < requested {
+            Some(format!(
+                "Notice: requested timeout {requested}s exceeded the server maximum; clamped to {seconds}s."
+            ))
+        } else if seconds > requested {
+            Some(format!(
+                "Notice: requested timeout {requested}s was below the {MIN_TIMEOUT_SECONDS}s minimum; raised to {seconds}s."
+            ))
+        } else {
+            None
+        };
+        Self {
+            seconds,
+            clamp_notice,
+        }
+    }
+
+    fn from_legacy_millis(millis: u64) -> Self {
+        Self::from_exact_seconds(millis.saturating_add(999) / 1000)
+    }
+
+    fn from_exact_seconds(requested: u64) -> Self {
+        let requested = requested.max(1);
+        let seconds = requested.min(timeout_cap_seconds());
+        let clamp_notice = (seconds != requested).then(|| {
+            format!(
+                "Notice: requested timeout {requested}s exceeded the server maximum; clamped to {seconds}s."
+            )
+        });
+        Self {
+            seconds,
+            clamp_notice,
+        }
+    }
+
+    #[cfg(test)]
+    fn seconds(&self) -> u64 {
+        self.seconds
+    }
+
+    #[cfg(test)]
+    fn clamp_notice(&self) -> Option<&str> {
+        self.clamp_notice.as_deref()
+    }
+}
+
+/// Seconds-taking entry point kept for the tests that predate
+/// [`ShellTimeout`]; production dispatch resolves the budget from the tool
+/// arguments and calls [`run_shell_command_with_timeout`] directly.
+#[cfg(test)]
 pub async fn run_shell_command_cancellable(
     cwd: &Path,
     command: &str,
     timeout_seconds: u64,
+    policy: SandboxPolicy,
+    outside_sandbox_once: bool,
+    cancel: Option<&CancellationToken>,
+) -> ToolResult {
+    run_shell_command_with_timeout(
+        cwd,
+        command,
+        ShellTimeout::from_exact_seconds(timeout_seconds),
+        policy,
+        outside_sandbox_once,
+        cancel,
+    )
+    .await
+}
+
+pub async fn run_shell_command_with_timeout(
+    cwd: &Path,
+    command: &str,
+    timeout: ShellTimeout,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
     cancel: Option<&CancellationToken>,
@@ -495,13 +643,10 @@ pub async fn run_shell_command_cancellable(
             output: "Command must not be empty".to_string(),
         };
     }
-    let requested_timeout_seconds = timeout_seconds.max(1);
-    let timeout_seconds = requested_timeout_seconds.min(MAX_TIMEOUT_SECONDS);
-    let timeout_clamp_notice = (requested_timeout_seconds != timeout_seconds).then(|| {
-        format!(
-            "Notice: requested timeout {requested_timeout_seconds}s exceeded the server maximum; clamped to {timeout_seconds}s."
-        )
-    });
+    let ShellTimeout {
+        seconds: timeout_seconds,
+        clamp_notice: timeout_clamp_notice,
+    } = timeout;
 
     let command_to_run = rtk_rewritten_command(command);
 
@@ -1352,5 +1497,189 @@ mod tests {
             "cancellation waited too long: {:?}",
             started.elapsed()
         );
+    }
+}
+
+/// Timeout-resolution tests. Separate from the `unix`-gated module above
+/// because this arithmetic is platform-independent, and because every case
+/// that depends on the deployment cap must be serialized against the cases
+/// that override it.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate `ANVIL_SHELL_TIMEOUT_CAP_SECONDS`. Every
+    /// test here sets the var explicitly (empty string == "unset, use the
+    /// default cap") so an ambient value in the developer's environment
+    /// cannot change the expected numbers either.
+    static CAP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets `ANVIL_SHELL_TIMEOUT_CAP_SECONDS` and removes it on drop. Pair
+    /// with `CAP_ENV_LOCK`; the guard must be dropped before the lock.
+    struct CapEnvGuard;
+
+    impl CapEnvGuard {
+        fn set(value: &str) -> Self {
+            // SAFETY: the caller holds CAP_ENV_LOCK, which serializes
+            // mutation of this var across the crate's tests.
+            unsafe {
+                std::env::set_var(TIMEOUT_CAP_ENV, value);
+            }
+            Self
+        }
+    }
+
+    impl Drop for CapEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as set() -- guarded by CAP_ENV_LOCK.
+            unsafe {
+                std::env::remove_var(TIMEOUT_CAP_ENV);
+            }
+        }
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn omitted_timeout_uses_the_two_minute_default() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(None, None);
+        assert_eq!(timeout.seconds(), DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(timeout.seconds(), 120);
+        assert_eq!(timeout.clamp_notice(), None);
+    }
+
+    #[test]
+    fn timeout_seconds_below_the_floor_is_raised_with_a_notice() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(3), None);
+        assert_eq!(timeout.seconds(), MIN_TIMEOUT_SECONDS);
+        assert_eq!(
+            timeout.clamp_notice(),
+            Some("Notice: requested timeout 3s was below the 10s minimum; raised to 10s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_above_the_cap_is_clamped_with_a_notice() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(4000), None);
+        assert_eq!(timeout.seconds(), MAX_TIMEOUT_SECONDS);
+        assert_eq!(timeout.seconds(), 3600);
+        assert_eq!(
+            timeout.clamp_notice(),
+            Some("Notice: requested timeout 4000s exceeded the server maximum; clamped to 3600s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_inside_the_range_passes_through_unannounced() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        for requested in [MIN_TIMEOUT_SECONDS, 120, MAX_TIMEOUT_SECONDS] {
+            let timeout = ShellTimeout::resolve(Some(requested), None);
+            assert_eq!(timeout.seconds(), requested);
+            assert_eq!(timeout.clamp_notice(), None, "requested={requested}");
+        }
+    }
+
+    /// The unadvertised millisecond field keeps its exact pre-`timeout_seconds`
+    /// behavior -- round up to whole seconds, 1s floor -- so replayed traces
+    /// and in-process callers that still pass milliseconds are unaffected.
+    /// Only the ceiling moved (600s -> 3600s).
+    #[test]
+    fn legacy_millis_round_up_and_keep_the_one_second_floor() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        for (millis, expected) in [
+            (0_u64, 1_u64),
+            (1, 1),
+            (999, 1),
+            (1_000, 1),
+            (1_500, 2),
+            (60_000, 60),
+            (120_000, 120),
+            (601_000, 601),
+        ] {
+            let timeout = ShellTimeout::resolve(None, Some(millis));
+            assert_eq!(timeout.seconds(), expected, "millis={millis}");
+            assert_eq!(timeout.clamp_notice(), None, "millis={millis}");
+        }
+    }
+
+    #[test]
+    fn legacy_millis_are_capped_but_never_floored_to_the_new_minimum() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let capped = ShellTimeout::resolve(None, Some(3_601_000));
+        assert_eq!(capped.seconds(), MAX_TIMEOUT_SECONDS);
+        assert_eq!(
+            capped.clamp_notice(),
+            Some("Notice: requested timeout 3601s exceeded the server maximum; clamped to 3600s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_wins_when_both_fields_are_present() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(300), Some(1_000));
+        assert_eq!(timeout.seconds(), 300);
+        assert_eq!(timeout.clamp_notice(), None);
+
+        // Even when the seconds value is the one that needs clamping.
+        let floored = ShellTimeout::resolve(Some(3), Some(600_000));
+        assert_eq!(floored.seconds(), MIN_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn deployment_cap_env_lowers_the_ceiling_for_every_path() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("30");
+
+        assert_eq!(timeout_cap_seconds(), 30);
+
+        let requested = ShellTimeout::resolve(Some(600), None);
+        assert_eq!(requested.seconds(), 30);
+        assert_eq!(
+            requested.clamp_notice(),
+            Some("Notice: requested timeout 600s exceeded the server maximum; clamped to 30s.")
+        );
+
+        let legacy = ShellTimeout::resolve(None, Some(600_000));
+        assert_eq!(legacy.seconds(), 30);
+
+        // The default is lowered silently: the model asked for nothing, so
+        // there is no request to report a clamp against.
+        let defaulted = ShellTimeout::resolve(None, None);
+        assert_eq!(defaulted.seconds(), 30);
+        assert_eq!(defaulted.clamp_notice(), None);
+    }
+
+    #[test]
+    fn invalid_or_absent_cap_env_falls_back_to_the_default_ceiling() {
+        assert_eq!(parse_timeout_cap(None), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("   ")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("abc")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("-5")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("0")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some(" 45 ")), 45);
+        // A cap above the compiled-in default is honored too: the env var is
+        // a deployment decision, not a second maximum.
+        assert_eq!(parse_timeout_cap(Some("7200")), 7200);
     }
 }

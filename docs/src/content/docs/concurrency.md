@@ -37,7 +37,7 @@ One cancellation token is shared by the prompt, its tool calls, and all subagent
 | `--max-turns` | `0` (unbounded) | Agent-loop turns per prompt; subagents inherit it unless their definition sets a lower value. |
 | `--llm-idle-timeout-secs` | `300` | Wait for first meaningful LLM stream progress. |
 | `--llm-stall-timeout-secs` | `60` | Wait between meaningful chunks after progress begins. |
-| Shell timeout | `60s` | One shell call; requested milliseconds are rounded up and capped at 600 seconds. |
+| Shell timeout | `120s` | One shell call; `timeout_seconds` is clamped to 10-3600 seconds. Lower the ceiling with `ANVIL_SHELL_TIMEOUT_CAP_SECONDS`. |
 
 These controls are not a universal wall-clock deadline. A client or bot that needs an overall deadline must send `session/cancel` when it expires.
 
