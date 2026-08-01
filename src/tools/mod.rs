@@ -1046,7 +1046,7 @@ impl ToolRegistry {
         if builtin_tools.contains("edit") {
             defs.push(tool_def(
                 "edit",
-                "Replaces exact literal text within a file using one or more sequential edit entries. Each entry matches against the file content produced by previous entries, and each `old_string` must be the smallest text that uniquely identifies the change. If `old_string` is ambiguous, expand it with more context or set `replace_all` to true. Batch related changes to the same file into one call with multiple `edits` entries. If an entry fails, earlier entries remain applied and later entries are not attempted. For heavy rewrites -- many hunks or most of a file changing -- prefer `write_file` with the full new contents instead of a long edit chain.",
+                "Replaces exact literal text within a file using one or more sequential edit entries. Each entry matches against the file content produced by previous entries, and each `old_string` must be the smallest text that uniquely identifies the change. If `old_string` is ambiguous, expand it with more context or set `replace_all` to true. When no exact match exists, matching falls back to whole-line comparison ignoring leading/trailing whitespace, re-adjusting replacement indentation. Batch related changes to the same file into one call with multiple `edits` entries. If an entry fails, earlier entries remain applied and later entries are not attempted. For heavy rewrites -- many hunks or most of a file changing -- prefer `write_file` with the full new contents instead of a long edit chain.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2537,6 +2537,9 @@ mod tests {
             .find(|def| def.function.name == "edit")
             .expect("edit should be advertised");
 
+        assert!(edit.function.description.contains(
+            "When no exact match exists, matching falls back to whole-line comparison ignoring leading/trailing whitespace, re-adjusting replacement indentation."
+        ));
         assert_eq!(
             edit.function.parameters["required"],
             json!(["file_path", "edits"])
