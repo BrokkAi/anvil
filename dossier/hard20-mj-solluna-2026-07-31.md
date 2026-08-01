@@ -329,7 +329,7 @@ of review earns its cost; rounds two through six bought nothing.
 
 **Decision round (owner, 2026-08-01)**: timeout moves to seconds with a
 [10..3600] clamp (schema rename `timeout_seconds` proposed, pending);
-rtk rip-vs-fix pending the free ANVIL_RTK_DISABLED A/B (fix path if
+rtk rip-vs-fix pulled out to anvil#327, pending the free ANVIL_RTK_DISABLED A/B (fix path if
 kept: exit-code cross-check — never claim clean when exit != 0 — plus
 truncation-aware summaries, tail-not-head capture, skip wrapping
 redirected commands, RTK_TEE_DIR into the workspace); container fix
