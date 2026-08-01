@@ -91,7 +91,7 @@ use crate::goal::{
     render_blocked_progress, render_goal_exit,
 };
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, IdleTimeouts, ModelMetadata, ResolvedModelInfo,
+    ChatContentPart, ChatMessage, IdleTimeouts, ModelMetadata, ResolvedModelInfo, ToolDefinition,
 };
 use crate::multi_backend::MultiBackend;
 use crate::session::{
@@ -2951,6 +2951,8 @@ pub async fn run_agent(
                     return responder.respond_with_error(unknown_session_error(&session_id));
                 };
 
+                let reasoning_effort_for_compression = snap.reasoning_effort.clone();
+                let tools_for_compression = registry.tool_definitions().await;
                 let prepared_prompt = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
@@ -2961,6 +2963,8 @@ pub async fn run_agent(
                     cancel.clone(),
                     compression_idle_timeout,
                     context_length,
+                    reasoning_effort_for_compression,
+                    Some(&tools_for_compression),
                 )
                 .await;
                 let messages = prepared_prompt.messages;
@@ -4238,6 +4242,8 @@ async fn build_prompt_messages_with_compression(
     cancel: tokio_util::sync::CancellationToken,
     idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
+    reasoning_effort: Option<String>,
+    tools: Option<&[ToolDefinition]>,
 ) -> PreparedPrompt {
     use crate::context_manager::{compact_history, context_budget};
 
@@ -4260,12 +4266,20 @@ async fn build_prompt_messages_with_compression(
         };
     }
 
-    let history_messages = model_history_messages(&snap.history);
+    // The compactor must see exactly the canonical prefix + dynamic history
+    // that would otherwise be sent to the model -- never the new incoming
+    // prompt, which stays outside the checkpoint.
+    let mut all_messages = prompt_prefix_messages(snap, snap.mode);
+    let dynamic_start = all_messages.len();
+    all_messages.extend(model_history_messages(&snap.history));
     match compact_history(
         llm,
         &snap.model,
-        &history_messages,
+        &all_messages,
+        dynamic_start,
+        tools,
         current_plan.as_ref(),
+        reasoning_effort,
         context_length,
         idle_timeout,
         cancel,
@@ -4875,6 +4889,17 @@ async fn run_prepared_model_turn(
         default_idle_timeout_secs,
         default_stall_timeout_secs,
     );
+    // Hoisted above the compression call (which used to run first) so the
+    // compactor's native attempt can be given the same advertised tool
+    // catalog the chat call below will use.
+    let Some(registry) = sessions
+        .get_or_create_registry(session_id, snap.cwd.clone())
+        .await
+    else {
+        return Err(LoopIterationError::Terminal("unknown session".to_string()));
+    };
+    let reasoning_effort_for_compression = snap.reasoning_effort.clone();
+    let tools_for_compression = registry.tool_definitions().await;
     let prepared_prompt = build_prompt_messages_with_compression(
         snap,
         prompt_text,
@@ -4885,14 +4910,10 @@ async fn run_prepared_model_turn(
         cancel.clone(),
         idle_timeout,
         context_length,
+        reasoning_effort_for_compression,
+        Some(&tools_for_compression),
     )
     .await;
-    let Some(registry) = sessions
-        .get_or_create_registry(session_id, snap.cwd.clone())
-        .await
-    else {
-        return Err(LoopIterationError::Terminal("unknown session".to_string()));
-    };
 
     run_model_turn_in_spawn(
         cx,
@@ -9618,7 +9639,9 @@ async fn handle_compress(
         );
     }
     send_message(cx, session_id, "Compacting cumulative model history...\n");
-    let history = model_history_messages(&snap.history);
+    let mut all_messages = prompt_prefix_messages(snap, snap.mode);
+    let dynamic_start = all_messages.len();
+    all_messages.extend(model_history_messages(&snap.history));
     let current_plan = snap.history.iter().rev().find_map(|turn| {
         turn.current_plan.as_ref().or_else(|| {
             turn.compaction_checkpoint
@@ -9626,11 +9649,21 @@ async fn handle_compress(
                 .and_then(|checkpoint| checkpoint.current_plan.as_ref())
         })
     });
+    let tools = match sessions
+        .get_or_create_registry(session_id, snap.cwd.clone())
+        .await
+    {
+        Some(registry) => Some(registry.tool_definitions().await),
+        None => None,
+    };
     let compaction = match crate::context_manager::compact_history(
         llm,
         &snap.model,
-        &history,
+        &all_messages,
+        dynamic_start,
+        tools.as_deref(),
         current_plan,
+        snap.reasoning_effort.clone(),
         context_length,
         idle_timeout,
         cancel,

@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.8.6";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.8.18";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 /// Budget for setup RPCs: the initialize handshake, `tools/list`, and SSE
 /// endpoint discovery. These are expected to be fast; a long stall here

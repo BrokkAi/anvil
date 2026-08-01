@@ -3,7 +3,7 @@ title: Evaluate Anvil in Ten Minutes
 description: Verify ACP startup, provider routing, managed Bifrost, permissions, and context from Zed.
 ---
 
-> Documentation and fixture expectations checked against Anvil 0.23.0 and managed Bifrost 0.8.6 on 2026-07-21. Complete the journey below to verify your editor, provider, and platform.
+> Documentation and fixture expectations checked against Anvil 0.24.2 and managed Bifrost 0.8.18 on 2026-08-01. Complete the journey below to verify your editor, provider, and platform.
 
 This journey uses Zed and a checked-in Rust fixture. It proves that an ACP client can start Anvil, select a model, stream a managed-Bifrost tool call, enforce a permission mode, apply one approved edit, and report session context.
 

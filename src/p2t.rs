@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::llm_client::{ChatContentPart, ChatMessage, FunctionCall, ToolCall};
+use crate::tools::tool_result_failed;
 
 pub(crate) const PATCHES_TO_TRACES_ENV: &str = "BRK_PATCHES_TO_TRACES";
 const P2T_CONFIG_ENV: &str = "BRK_P2T_CONFIG";
@@ -337,10 +338,6 @@ fn prefix_step_has_successful_file_change(step: &PrefixStep) -> bool {
                 .iter()
                 .any(|result| result.call_id == call.id && !tool_result_failed(&result.content))
     })
-}
-
-pub(crate) fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Internal error:")
 }
 
 pub(crate) fn stop_reason_after_step(
