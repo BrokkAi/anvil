@@ -1942,6 +1942,9 @@ pub(crate) async fn run(
             "query_manifest_sha256": config.query_manifest_sha256,
             "query_count": calls.len(),
             "k": config.k,
+            "mcp_tool_timeout_seconds": crate::cim::mcp_tool_call_timeout()
+                .expect("CIM mode is enabled")
+                .as_secs(),
             "call_ids": call_ids,
         }));
         if !calls.is_empty() {

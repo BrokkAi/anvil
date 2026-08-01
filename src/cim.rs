@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -12,6 +13,11 @@ pub(crate) const CIM_EVAL_ENV: &str = "BRK_CIM_EVAL";
 const CIM_CONFIG_ENV: &str = "BRK_CIM_CONFIG";
 const CIM_SCHEMA_VERSION: u32 = 1;
 const CIM_FINAL_K: usize = 20;
+const CIM_MCP_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(1_800);
+
+pub(crate) fn mcp_tool_call_timeout() -> Option<Duration> {
+    enabled().then_some(CIM_MCP_TOOL_CALL_TIMEOUT)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CimConfig {
@@ -183,5 +189,10 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&step.tool_calls[0].arguments).unwrap(),
             serde_json::json!({"query": "find auth flow", "k": 20})
         );
+    }
+
+    #[test]
+    fn cim_mcp_timeout_covers_the_cell_deadline() {
+        assert_eq!(CIM_MCP_TOOL_CALL_TIMEOUT, Duration::from_secs(1_800));
     }
 }
