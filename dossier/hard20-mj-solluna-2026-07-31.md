@@ -143,3 +143,60 @@ the matching levers remain: spend/wrap-up discipline for the cap tax, a
 finalize completeness check against instruction-enumerated surfaces for the
 wrong-reading tax (cliffy 0/37 fits the opa-rego audit's pattern), and the
 mj non-exit hang fix.
+
+## Addendum 2: runs 4-5, the async redesign, and the five-run verdict — 2026-08-01
+
+Run 4 (luna@max + report-level resume affordance): **13/20**, broke both
+chronic single-test walls (bandit 88/88, textual 20/20). Trace forensics
+after it exposed the real subagent lifecycle: reports deliver only between
+primary turns, an implementing primary never ends its turn, and cancel —
+the only pull — dropped the report and released the resumable session
+(resume: 1/43; one finished analysis destroyed unread; one just-booted
+subagent killed defensively after git status showed unexplained edits).
+
+The async redesign (mj `f4aa67d`): ending the turn is the await; every
+wake carries finished reports in full plus <subagent_progress> for
+still-running subagents (activity watermark shared with reports, diffstat
+since spawn); a parked primary is woken with progress alone after
+subagents.progress_wake_minutes (default 20); subagent_cancel returns the
+full report via a bus claim. Plus mj `1598697`/`3a6ccfc` (session note),
+the headless autonomy directive (never block on unobtainable approvals —
+added after sol twice obeyed OPA's AGENTS.md contribution gate and quit in
+one minute asking a nonexistent user for DCO sign-off), and `max` effort
+plumbed through anvil's preset list and brokkbench's effort gate (both
+silently/loudly rejected it before).
+
+Run 5 (async + luna@max + debrief): killed at 16 resolved per the new
+kill-early policy, **9 W / 7 L, max-possible 13 < 15.2**. Mechanically the
+design worked exactly as intended (corrected metrics, deepest-history
+counting): 13 wake injections, 9 with progress blocks, exactly 2 heartbeat
+wakes, 8 lossless cancel-returns, 14/14 injected reports debriefed, zero
+timeouts, median attempt 35m (best ever), first-ever pebble win (59/59).
+Behaviorally it halved sol's request volume — and exposed the residual:
+four near-miss regressions on previously-won tasks (bandit 83/88, cattrs
+68/69, fastapi 136/137, sqlfmt 28/32) at 2-4x speed.
+
+**Forensic correction that reframes everything**: every failing f2p test
+in those four lives in the grader's HIDDEN suite; p2p was green (sqlfmt's
+4 regressions excepted); the agents authored and ran their own tests, all
+green. "Finalize test discipline" was a wrong narrative — nothing runnable
+was red. The loss class is **behavior-space coverage of the instruction**:
+one edge behavior per task (nested-router override levels,
+detailed_validation=False, CLI metric counts) that the divided reading
+missed. The old marathon turns covered these incidentally through
+redundant grinding; async removed the waste and the incidental coverage
+together.
+
+**Five-run verdict** (12, 13, 13, 9/16-killed vs E=15.2): with every
+mechanical confound now stripped — no infra, no contamination, no starved
+reports, no timeouts, no policy quits, best-ever cost/latency — the duo
+still misses 1-few hidden edge behaviors on 3-5 tasks per run, which is
+exactly the gap. Vanilla sol is one continuous mind holding the whole
+instruction against the whole implementation; the duo divides that
+reading and pays the tail behaviors. Coordination taxes interpretation
+depth, and this benchmark prices interpretation depth. Remaining lever
+rated above an increment: make the primary enumerate the instruction's
+behavior surface and cover each item in its own tests before delivering.
+If that fails, the honest conclusion is that this task class does not
+reward a second mind at any price found across asgard v2 and five mj
+configurations.
