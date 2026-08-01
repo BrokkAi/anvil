@@ -108,3 +108,38 @@ side of the authority split: the duo runs at luna-level results for
 The one mechanism repeatedly earning its keep is independent fresh reads
 (sol-swing and sol-never wins concentrate where subagents did recon), which
 is also the cheapest part of the architecture.
+
+## Addendum: run 4 (sol+high / luna+max, session affordance) — 2026-07-31 evening
+
+Config delta from run 3: luna xhigh→max (anvil preset + brokkbench effort
+gate had to learn `max` first — both silently/loudly rejected it), the
+`<session>` resume affordance in reports, mj at 1.3.0-era master.
+
+**Result: 13/20 — ties run 3. P(vanilla sol@high ≤13) = 0.06. Wall 4.75h
+(slowest run; luna@max thinks long).** Tokens/task: sol in 9.6M (−26% vs
+run 3), luna in 16.6M (+36%) — the load moved to the cheap seat; sol output
+stays at vanilla parity (30k).
+
+The luna@max signal is the strongest any lever has produced: it cleared
+**both chronic single-test walls** — bandit 88/88 after three straight
+86/88, textual 20/20 after two straight 19/20 — and held sqlfmt (sol-0/4)
+and tengo. Nine tasks have now won all three post-fix runs.
+
+The giveback is the two per-run stochastic taxes, unchanged in expectation:
+(i) the wrong-reading/deference class took cliffy (0/37, both prior runs
+won it) and opa-rego — the latter a novel failure: sol read OPA's
+contributor guide and **ended its turn asking the nonexistent user for
+maintainer sign-off and DCO attestation** (1-minute attempt, 0-byte patch);
+(ii) the 2h cap took pebble and scriggo, scriggo doubly via the known,
+still-unfixed mjolnir non-exit hang burning attempt 1 at the wall.
+
+Resume uptake after the report-level affordance: **1 of 43 spawns** — up
+from 0/63, and the one use was inside bandit's breakthrough win, but the
+affordance alone does not change habits.
+
+Standing after four runs: 12 → 13 → 13 against the 15.2 bar. The near-miss
+tax is paid off; the plateau is now precisely the two stochastic taxes, and
+the matching levers remain: spend/wrap-up discipline for the cap tax, a
+finalize completeness check against instruction-enumerated surfaces for the
+wrong-reading tax (cliffy 0/37 fits the opa-rego audit's pattern), and the
+mj non-exit hang fix.
