@@ -200,3 +200,51 @@ behavior surface and cover each item in its own tests before delivering.
 If that fails, the honest conclusion is that this task class does not
 reward a second mind at any price found across asgard v2 and five mj
 configurations.
+
+## Addendum 3: runs 6-7 — multi-edit, discrete review resurrected, and the first result above the bar (2026-08-01)
+
+Two product fixes preceded these runs. **Multi-hunk edit** (anvil
+`fca13eb7`-era, modeled on oh-my-pi's replace schema): `edit` takes
+sequential `edits` entries, `write_file` owns heavy rewrites; live adoption
+was immediate (all batch-shape, up to 5 hunks/call, 11 write_file rewrites
+in one attempt vs ~2 historically). **Headless autonomy directive** (mj):
+never block on unobtainable approvals — killed the opa-rego policy-quit
+class on contact (22/25 with a real patch, then an outright win in run 7).
+
+**Discrete review's silent death, fully diagnosed**: review last ran in
+run 1 (single-prompt fallback). Since run 2: `detect_bifrost()` searches
+MJ_BIFROST_PATH then PATH; neither reached /opt/work/bin in the container,
+and the fatal-review change had removed the fallback — every review died
+at birth, unlogged. One env var (MJ_BIFROST_PATH) fixed detection; one
+more version skew (mj master's analyze_diff flags vs anvil's bundled
+bifrost 0.8.6) needed a separately staged bifrost 0.8.18 for mj
+(MJ_BIFROST_BIN → /opt/work/bin/bifrost-mj). The supervisor also gained
+the owner-approved bounded completeness mandate: every explicitly stated
+requirement must have demonstrated behavior; findings quote the verbatim
+requirement span; absent speculative hardening is never a finding.
+
+**Run 6** (multi-edit, no DR, sol+high/luna+max): killed at 15 resolved
+per policy, 10 W / 5 TF, max 15 < 15.2. Cleanest failure profile to date
+(every loss >= 4/5 partial, no timeouts).
+
+**Run 7** (solo sol+high — no primary subagent tools — DR at sol+medium
+with completeness mandate, lanes available on luna but unused):
+**16/20 in 2.3h total, the first run above the vanilla expectation of
+15.2.** Review supervisor ran in ~87% of attempts. The four losses:
+cliffy 36/37, dynamodb 21/37 (0-for-7 across all configs; audit
+candidate), and the two tasks vanilla sol also never solves (sqlfmt
+28/32, python-statemachine 67/72). Paired: won every vanilla-sure task
+except dynamodb, plus opa-template (vanilla 1/4) and opa-rego.
+
+Honest statistics: P(vanilla sol@high >= 16) = 0.42 — above expectation
+for the first time after six runs at or below it, not yet significant;
+significance needs >= 18 or replication. Cost: ~$8.6/task at current
+rates (sol 10.6M input/task, review included) ≈ 2.5x vanilla's $3.47 —
+the quality bar moved first; the price bar has not.
+
+The configuration that did it is notable for what it lacks: no worker
+DAG, no supervisor-directed checkpoints, no delegation at all. One strong
+implementer with good tools (multi-hunk edit, code intelligence), one
+fresh independent reviewer holding the verbatim contract with a bounded
+completeness mandate, and prompts that name the operating reality. Every
+coordination architecture this project built underperformed it.
