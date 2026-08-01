@@ -13,6 +13,7 @@ mod asgard;
 mod bedrock_auth;
 mod bedrock_client;
 mod bedrock_credits;
+mod cim;
 mod codex_auth;
 mod codex_client;
 mod codex_credits;

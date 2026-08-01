@@ -1798,6 +1798,16 @@ pub(crate) async fn run(
             ));
         }
     };
+    let cim_config = match crate::cim::load_config_from_env(p2t_config.is_some(), train_bifrost) {
+        Ok(config) => config,
+        Err(error) => {
+            append_trace_record(serde_json::json!({
+                "type": "cim_config_error",
+                "error": format!("{error:#}"),
+            }));
+            return LoopOutcome::setup_failure(format!("BRK_CIM_EVAL is misconfigured: {error:#}"));
+        }
+    };
     let training_packet = if train_bifrost {
         match train_bifrost::load_packet_from_env() {
             Ok(packet) => Some(packet),
@@ -1918,6 +1928,95 @@ pub(crate) async fn run(
         {
             snapshot_p2t_workspace_best_effort(config, registry.cwd(), snapshot_dir, 0);
         }
+    }
+    let session_is_fresh = sessions
+        .snapshot(&session_id, registry.cwd())
+        .await
+        .is_some_and(|snapshot| snapshot.history.is_empty());
+    if let Some(config) = cim_config.as_ref().filter(|_| session_is_fresh) {
+        let step = crate::cim::synthetic_step(config);
+        let calls = p2t::forced_step_to_tool_calls(&step);
+        let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_start",
+            "query_manifest_sha256": config.query_manifest_sha256,
+            "query_count": calls.len(),
+            "k": config.k,
+            "call_ids": call_ids,
+        }));
+        if !calls.is_empty() {
+            let advertised_this_request = advertised_tool_names(Some(&tools));
+            if !advertised_this_request.contains("semantic_search") {
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL has synthetic queries but semantic_search is unavailable"
+                        .to_string(),
+                );
+            }
+            let forced_message = p2t::forced_step_to_message(&step);
+            messages.push(forced_message);
+            replay_events.push(TurnReplayEvent::AssistantToolCalls {
+                text: String::new(),
+                calls: calls.iter().map(tool_call_to_replay).collect(),
+            });
+            let exchange_start = tool_exchanges.len();
+            let outcome = execute_step_tool_calls(
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                service_tier,
+                structured_output,
+                &original_user_request,
+                &calls,
+                &advertised_this_request,
+                &mut messages,
+                &mut tool_exchanges,
+                &mut replay_events,
+                &mut turn_usage,
+                &mut current_plan,
+                max_turns,
+                idle_timeout,
+                cancel.clone(),
+                &spawned_cx,
+                &session_id,
+                &sessions,
+                notifications,
+                depth,
+                permission_override,
+            )
+            .await;
+            if outcome.cancelled {
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL synthetic step was cancelled".to_string(),
+                );
+            }
+            let exchanges = &tool_exchanges[exchange_start..];
+            if exchanges.len() != calls.len()
+                || exchanges
+                    .iter()
+                    .any(|exchange| exchange.status == ToolExchangeStatus::Failed)
+            {
+                append_trace_record(serde_json::json!({
+                    "type": "cim_synthetic_step_end",
+                    "query_manifest_sha256": config.query_manifest_sha256,
+                    "query_count": calls.len(),
+                    "status": "failed",
+                    "results": exchanges.iter().map(|exchange| serde_json::json!({
+                        "call_id": exchange.call_id,
+                        "status": exchange.status.as_str(),
+                    })).collect::<Vec<_>>(),
+                }));
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL synthetic semantic-search step failed".to_string(),
+                );
+            }
+        }
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_end",
+            "query_manifest_sha256": config.query_manifest_sha256,
+            "query_count": calls.len(),
+            "status": "completed",
+        }));
     }
     let mut p2t_steps_executed = 0usize;
     let mut p2t_stop_reason: Option<P2tStopReason> = None;

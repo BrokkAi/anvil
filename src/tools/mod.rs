@@ -689,11 +689,34 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 /// `semantic_search` results are transparently reranked by the harness (see
 /// `crate::semantic_rerank`), so the model receives a single relevance-ordered
 /// list of hits with source/summaries -- not bifrost's three raw ranked lists.
-fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
+fn mcp_tool_description<'a>(name: &str, original: &'a str, cim_semantic_search: bool) -> &'a str {
     const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Given a natural-language \
         query, returns a single relevance-ordered list of symbols and files, each with its source \
         or a summary. k is the maximum number of final relevance-reranked results. The reranker \
         may return fewer than k by design when fewer candidates are relevant.";
+    const CIM_SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Prefer this for locating \
+        source code by behavior, intent, concept, or symptom, especially in an unfamiliar area or \
+        when the task provides no exact path or symbol hook. Given a natural-language query, it \
+        returns a single relevance-ordered list of symbols and files, each with source or a \
+        summary. Use exact symbol or regex tools when the task already supplies a direct hook. k \
+        is the maximum number of final relevance-reranked results; the reranker may return fewer \
+        than k by design when fewer candidates are relevant.";
+    const CIM_SEARCH_SYMBOLS: &str = "Find indexed declarations by exact or partial symbol name. \
+        Prefer this when the task already supplies a class, function, method, field, module, or \
+        other identifier; use semantic_search instead when you need to locate an implementation \
+        from behavior, intent, concept, or symptom.";
+    const CIM_GET_SUMMARIES: &str = "Summarize known files, classes, modules, packages, or \
+        directories and navigate their immediate structure. Prefer this after you have a concrete \
+        target or when you need a structural overview; use semantic_search to locate an unknown \
+        implementation by behavior or concept.";
+    if cim_semantic_search {
+        return match name {
+            "semantic_search" => CIM_SEMANTIC_SEARCH,
+            "search_symbols" => CIM_SEARCH_SYMBOLS,
+            "get_summaries" => CIM_GET_SUMMARIES,
+            _ => original,
+        };
+    }
     match name {
         "semantic_search" => SEMANTIC_SEARCH,
         _ => original,
@@ -914,12 +937,20 @@ impl ToolRegistry {
     /// sandbox-looking failure.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
+        let cim_semantic_search = crate::cim::enabled() && self.is_bifrost_tool("semantic_search");
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
-            let read_description = format!(
-                "Reads and returns the content of a specified text file, up to {} bytes. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
-                filesystem::READ_MAX_BYTES
-            );
+            let read_description = if cim_semantic_search {
+                format!(
+                    "Reads and returns the content of a specified text file, up to {} bytes. Use after selecting an exact file/range; prefer semantic_search for locating unknown code by behavior, get_symbol_sources for known definitions, and get_summaries for known-container orientation.",
+                    filesystem::READ_MAX_BYTES
+                )
+            } else {
+                format!(
+                    "Reads and returns the content of a specified text file, up to {} bytes. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
+                    filesystem::READ_MAX_BYTES
+                )
+            };
             defs.push(tool_def(
                 "read_file",
                 &read_description,
@@ -1018,7 +1049,11 @@ impl ToolRegistry {
         if builtin_tools.contains("grep_search") {
             defs.push(tool_def(
                 "grep_search",
-                "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages_by_reference.",
+                if cim_semantic_search {
+                    "Searches file contents with a regex. Prefer this for exact literals, identifiers, configuration, or documentation; use semantic_search for conceptual or behavior-based code discovery, search_symbols for declarations, and scan_usages_by_reference for references/callers."
+                } else {
+                    "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages_by_reference."
+                },
                 json!({
                     "type": "object",
                     "properties": {
@@ -1125,7 +1160,7 @@ impl ToolRegistry {
                 }
                 defs.push(tool_def(
                     &tool.name,
-                    mcp_tool_description(&tool.name, &tool.description),
+                    mcp_tool_description(&tool.name, &tool.description, cim_semantic_search),
                     mcp_tool_input_schema(&tool.name, tool.input_schema.clone()),
                 ));
             }
@@ -2247,15 +2282,32 @@ mod tests {
 
     #[test]
     fn semantic_search_description_is_overridden() {
-        let overridden = mcp_tool_description("semantic_search", "bifrost's raw description");
+        let overridden =
+            mcp_tool_description("semantic_search", "bifrost's raw description", false);
         assert!(overridden.contains("maximum number of final relevance-reranked results"));
         assert!(overridden.contains("may return fewer than k by design"));
         assert_ne!(overridden, "bifrost's raw description");
         // Other tools keep bifrost's description unchanged.
         assert_eq!(
-            mcp_tool_description("search_symbols", "bifrost's raw description"),
+            mcp_tool_description("search_symbols", "bifrost's raw description", false),
             "bifrost's raw description"
         );
+    }
+
+    #[test]
+    fn cim_semantic_descriptions_prefer_concept_search_without_mandating_it() {
+        let semantic = mcp_tool_description("semantic_search", "raw", true);
+        assert!(semantic.contains("Prefer this"));
+        assert!(semantic.contains("exact path or symbol hook"));
+        assert!(!semantic.to_ascii_lowercase().contains("always"));
+        assert!(!semantic.to_ascii_lowercase().contains("must"));
+
+        let symbols = mcp_tool_description("search_symbols", "raw", true);
+        assert!(symbols.contains("exact or partial symbol name"));
+        assert!(symbols.contains("use semantic_search instead"));
+        let summaries = mcp_tool_description("get_summaries", "raw", true);
+        assert!(summaries.contains("concrete target"));
+        assert!(summaries.contains("use semantic_search"));
     }
 
     #[test]
