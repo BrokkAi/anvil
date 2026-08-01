@@ -49,6 +49,7 @@ anvil [OPTIONS]
 | `--llm-stall-timeout-secs` | `ANVIL_LLM_STALL_TIMEOUT_SECS` | `60` | Allowed gap after streaming begins. |
 | `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep selected installation defaults process-local. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the Wasmtime parser/search fallback; without an OS sandbox, shell commands then have no execution sandbox. |
+| `--no-shell-minimizer` | `ANVIL_NO_SHELL_MINIMIZER` | `false` | Disable post-capture condensing of shell output for well-known tools (git, cargo, pytest, npm, ...). When condensing is enabled (the default), condensed results reference the raw output preserved under `.brokk/shell-output/` in the workspace. |
 
 `ANVIL_TRACE_JSONL=<path>` writes diagnostic LLM and step events to a local JSONL trace. Treat it as sensitive: prompts, responses, and operational metadata can contain project information.
 

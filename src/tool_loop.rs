@@ -5521,6 +5521,10 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
         request.tool_name,
         request.shell_sandboxed,
         request.outside_sandbox_once,
+        // Bifrost tools bound their own responses (`----- OMITTED` elision
+        // the model can follow up on), so the harness cap would only destroy
+        // structure they already budgeted.
+        registry.is_mcp_tool(request.tool_name),
         result,
     );
     asgard_relativize_output(registry, &mut execution.output);
@@ -5562,6 +5566,7 @@ fn tool_result_to_execution(
     tool_name: &str,
     shell_sandboxed: bool,
     outside_sandbox_once: bool,
+    truncation_exempt: bool,
     result: crate::tools::ToolResult,
 ) -> ToolExecution {
     let (status_prefix, failed) = match result.status {
@@ -5589,15 +5594,13 @@ fn tool_result_to_execution(
     } else {
         0
     };
-    if output.len() > MAX_TOOL_RESULT_BYTES.saturating_sub(reserved) {
-        // Truncate on a UTF-8 char boundary; otherwise an emoji or accented
-        // byte sequence could leave the slice mid-codepoint.
-        let mut cut = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
-        while !output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        output.truncate(cut);
-        output.push_str("\n... output truncated");
+    let budget = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
+    if !truncation_exempt && output.len() > budget {
+        // Keep both ends: the head carries the command and its first errors,
+        // the tail the final status lines the model usually needs.
+        output = crate::text::truncate_middle_utf8(&output, budget, |n| {
+            format!("\n[... {n} bytes elided ...]\n")
+        });
     }
     if sandbox_failure_hint {
         output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
@@ -6171,6 +6174,7 @@ mod tests {
             Arc::new(crate::skills::SkillRegistry::default()),
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
+            false,
         )
         .await;
         (cwd, registry)
@@ -8440,6 +8444,7 @@ mod tests {
                 command: command.to_string(),
                 timeout: Duration::from_secs(5),
             }],
+            false,
         )
         .await;
         (cwd, registry)
@@ -9483,7 +9488,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", false, false, result);
+        let exec = tool_result_to_execution("run_shell_command", false, false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -9495,7 +9500,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -9507,7 +9512,7 @@ mod tests {
             output: "curl: (6) Could not resolve host: example.com".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -9519,7 +9524,7 @@ mod tests {
             output: "npm ERR! request to https://registry.npmjs.org/vite failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -9533,7 +9538,7 @@ mod tests {
             output: "cargo: error[E0277]: the trait bound is not satisfied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -9547,7 +9552,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, true, result);
+        let exec = tool_result_to_execution("run_shell_command", true, true, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }

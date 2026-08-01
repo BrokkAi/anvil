@@ -17,7 +17,10 @@ const outputPath = path.resolve(
 // cargo-about handles the license files declared by Cargo packages. This
 // inventory catches standalone notices and native payloads that can otherwise
 // appear without anyone deciding whether an additional artifact notice is due.
-const auditedStandaloneNotices = new Set(["cfg_aliases/NOTICES.md"]);
+const auditedStandaloneNotices = new Set([
+  "anvil-minimizer/NOTICE",
+  "cfg_aliases/NOTICES.md",
+]);
 const auditedLinksPackages = new Set([
   "aws-lc-rs",
   "aws-lc-sys",
@@ -118,33 +121,6 @@ async function legalFile(metadata, name, relativePath, component, scope) {
   return { component, packageInfo, relativePath, scope, text };
 }
 
-async function sqliteNotice(metadata) {
-  const packageInfo = resolvedPackage(metadata, "libsqlite3-sys");
-  const relativePath = "sqlite3/sqlite3.c";
-  const source = await readFile(
-    path.join(packageRoot(packageInfo), relativePath),
-    "utf8",
-  );
-  const version = source.match(/^#define SQLITE_VERSION\s+"([^"]+)"/m)?.[1];
-  const notice = source.match(
-    /^\*\* The author disclaims copyright to this source code\. +In place of\n\*\* a legal notice, here is a blessing:\n\*\*\n\*\*    May you do good and not evil\.\n\*\*    May you find forgiveness for yourself and forgive others\.\n\*\*    May you share freely, never taking more than you give\./m,
-  )?.[0];
-  if (!version || !notice) {
-    throw new Error("could not find SQLite version and public-domain notice");
-  }
-  const text = notice
-    .split("\n")
-    .map((line) => line.replace(/^\*\* ?/, ""))
-    .join("\n");
-  return {
-    component: `SQLite ${version}`,
-    packageInfo,
-    relativePath: `${relativePath} (public-domain notice)`,
-    scope: "compiled from the bundled SQLite amalgamation",
-    text,
-  };
-}
-
 function render(sections) {
   const lines = [
     "ANVIL SUPPLEMENTAL THIRD-PARTY NOTICES",
@@ -189,7 +165,6 @@ async function main() {
       "cfg_aliases third-party attribution",
       "used while compiling target-specific dependency configuration",
     ),
-    await sqliteNotice(metadata),
     await legalFile(
       metadata,
       "zstd-sys",

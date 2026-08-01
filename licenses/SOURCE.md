@@ -19,3 +19,10 @@ license information, standalone notices, and exact source-package links for the
 locked Rust dependencies and vendored native components incorporated into
 official binaries. This includes the `brokk-acp-sandbox` crate compiled into the
 embedded `wasm32-wasip2` guest.
+
+The workspace crate `crates/anvil-minimizer` is vendored from the oh-my-pi
+project (https://github.com/can1357/oh-my-pi), `crates/pi-shell` at commit
+`09a7c865636457c50ed75fc3b1a7cc21ef72c105`, under the MIT license. That code in
+turn adapts MIT-licensed algorithms from `rtk-ai/rtk`. The upstream copyright
+notices and license texts for both projects are reproduced in
+`crates/anvil-minimizer/NOTICE`.

@@ -45,22 +45,6 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 ---
 
 ================================================================================
-SQLite 3.45.0
-================================================================================
-
-Rust package: libsqlite3-sys@0.28.0
-Package source: https://crates.io/crates/libsqlite3-sys/0.28.0
-Source notice: sqlite3/sqlite3.c (public-domain notice)
-Inclusion: compiled from the bundled SQLite amalgamation
-
-The author disclaims copyright to this source code.  In place of
-a legal notice, here is a blessing:
-
-   May you do good and not evil.
-   May you find forgiveness for yourself and forgive others.
-   May you share freely, never taking more than you give.
-
-================================================================================
 Zstandard
 ================================================================================
 

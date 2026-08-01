@@ -813,6 +813,9 @@ pub struct ToolRegistry {
     /// `set_canonical_root`, immediately after the registry is created and
     /// before any tool call runs; never mutated after that.
     canonical_root: std::sync::OnceLock<PathBuf>,
+    /// Post-capture shell-output minimizer; `None` when disabled via
+    /// `--no-shell-minimizer`.
+    shell_minimizer: Option<shell::ShellMinimizer>,
 }
 
 fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String> {
@@ -916,11 +919,13 @@ impl ToolRegistry {
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
         plugin_hooks: Vec<crate::plugins::HookCommand>,
+        shell_minimizer_enabled: bool,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
         // profile from a concurrent in-flight shell call.
         sandbox::cleanup_stale_policy_files();
+        shell::cleanup_stale_shell_outputs(&cwd);
 
         let mut mcp_clients = Vec::new();
         let mut mcp_tool_servers = HashMap::new();
@@ -969,6 +974,7 @@ impl ToolRegistry {
                 }
             }
         }
+        let shell_minimizer = shell_minimizer_enabled.then(|| shell::ShellMinimizer::new(&cwd));
         Self {
             cwd,
             additional_roots,
@@ -984,7 +990,16 @@ impl ToolRegistry {
             agents: RwLock::new(agents),
             plugin_hooks,
             canonical_root: std::sync::OnceLock::new(),
+            shell_minimizer,
         }
+    }
+
+    /// Whether `name` is served by a connected MCP server (in practice: a
+    /// Bifrost tool). Bifrost bounds its own responses and marks elisions
+    /// with `----- OMITTED` delimiters the model can act on, so its results
+    /// are exempt from the harness's tool-result truncation.
+    pub(crate) fn is_mcp_tool(&self, name: &str) -> bool {
+        self.mcp_tool_servers.contains_key(name)
     }
 
     /// Hooks contributed by enabled plugins at registry build time.
@@ -1601,6 +1616,7 @@ impl ToolRegistry {
                     policy,
                     outside_sandbox_once,
                     cancel,
+                    self.shell_minimizer.as_ref(),
                 )
                 .await
             }
@@ -2166,6 +2182,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             canonical_root: std::sync::OnceLock::new(),
+            shell_minimizer: None,
         }
     }
 
@@ -2190,6 +2207,7 @@ mod tests {
             agents: RwLock::new(Arc::new(reg)),
             plugin_hooks: Vec::new(),
             canonical_root: std::sync::OnceLock::new(),
+            shell_minimizer: None,
         }
     }
 
@@ -2382,6 +2400,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             canonical_root: std::sync::OnceLock::new(),
+            shell_minimizer: None,
         };
         let advertised: Vec<String> = registry
             .tool_definitions()

@@ -1,0 +1,27 @@
+[package]
+name = "anvil-minimizer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Vendored copy of oh-my-pi's pi-shell output minimizer (adapts MIT-licensed algorithms from rtk-ai/rtk; see NOTICE)."
+
+[dependencies]
+brush-parser = "0.3"
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+toml = "1.1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dev-dependencies]
+parking_lot = "0.12.5"
+
+# Vendored third-party code: never fail anvil's `-D warnings` clippy gate.
+[lints.rust]
+warnings = "allow"
+
+[lints.clippy]
+all = "allow"
+pedantic = "allow"
+nursery = "allow"
