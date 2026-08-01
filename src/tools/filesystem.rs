@@ -107,6 +107,14 @@ pub fn edit_file(
     edit_file_in_roots(cwd, &[], path, old_string, new_string, replace_all)
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct EditFileEntry {
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: bool,
+}
+
+#[cfg(test)]
 pub fn edit_file_in_roots(
     cwd: &Path,
     additional_roots: &[std::path::PathBuf],
@@ -115,10 +123,28 @@ pub fn edit_file_in_roots(
     new_string: &str,
     replace_all: bool,
 ) -> ToolResult {
-    if old_string.is_empty() {
+    edit_file_entries_in_roots(
+        cwd,
+        additional_roots,
+        path,
+        &[EditFileEntry {
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            replace_all,
+        }],
+    )
+}
+
+pub fn edit_file_entries_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+    edits: &[EditFileEntry],
+) -> ToolResult {
+    if edits.is_empty() {
         return ToolResult {
             status: ToolStatus::RequestError,
-            output: "`old_string` must not be empty".to_string(),
+            output: "`edits` must contain at least one entry".to_string(),
         };
     }
 
@@ -131,7 +157,7 @@ pub fn edit_file_in_roots(
             };
         }
     };
-    let content = match read_bounded_text(crate::sandbox_backend::global(), &resolved) {
+    let mut content = match read_bounded_text(crate::sandbox_backend::global(), &resolved) {
         Ok(Some(content)) => content,
         Ok(None) => {
             return ToolResult {
@@ -147,49 +173,97 @@ pub fn edit_file_in_roots(
         }
     };
 
-    let matches = content.matches(old_string).count();
+    let single_entry = edits.len() == 1;
+    let mut applied_entries = 0usize;
+    let mut total_replacements = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        let (updated, matches) = match apply_edit_to_content(path, &content, edit) {
+            Ok(result) => result,
+            Err(mut result) => {
+                if !single_entry {
+                    result.output = format!(
+                        "Applied {applied_entries} edit entr{} before failure at edits[{index}]: {}",
+                        if applied_entries == 1 { "y" } else { "ies" },
+                        result.output
+                    );
+                }
+                return result;
+            }
+        };
+        match atomic_write(&resolved, updated.as_bytes()) {
+            Ok(()) => {
+                content = updated;
+                applied_entries += 1;
+                total_replacements += matches;
+            }
+            Err(e) => {
+                return ToolResult {
+                    status: ToolStatus::RequestError,
+                    output: format!("Failed to edit '{}': {}", path, e),
+                };
+            }
+        }
+    }
+
+    ToolResult {
+        status: ToolStatus::Success,
+        output: if single_entry {
+            format!(
+                "Edited '{path}' ({total_replacements} replacement{})",
+                if total_replacements == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Edited '{path}' ({total_replacements} replacement{} across {applied_entries} edit entries)",
+                if total_replacements == 1 { "" } else { "s" }
+            )
+        },
+    }
+}
+
+fn apply_edit_to_content(
+    path: &str,
+    content: &str,
+    edit: &EditFileEntry,
+) -> Result<(String, usize), ToolResult> {
+    if edit.old_string.is_empty() {
+        return Err(ToolResult {
+            status: ToolStatus::RequestError,
+            output: "`old_string` must not be empty".to_string(),
+        });
+    }
+
+    let matches = content.matches(&edit.old_string).count();
     if matches == 0 {
-        return ToolResult {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: format!("No occurrences of `old_string` found in '{path}'"),
-        };
+        });
     }
-    if !replace_all && matches > 1 {
-        return ToolResult {
+    if !edit.replace_all && matches > 1 {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: format!(
                 "`old_string` occurs {matches} times in '{path}'. Provide more context or set `replace_all` to true."
             ),
-        };
+        });
     }
 
-    let updated = if replace_all {
-        content.replace(old_string, new_string)
+    let updated = if edit.replace_all {
+        content.replace(&edit.old_string, &edit.new_string)
     } else {
-        content.replacen(old_string, new_string, 1)
+        content.replacen(&edit.old_string, &edit.new_string, 1)
     };
     if updated.len() > WRITE_MAX_BYTES {
-        return ToolResult {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: format!(
                 "Edited content for '{path}' is {} bytes, exceeds cap of {WRITE_MAX_BYTES}",
                 updated.len()
             ),
-        };
+        });
     }
-    match atomic_write(&resolved, updated.as_bytes()) {
-        Ok(()) => ToolResult {
-            status: ToolStatus::Success,
-            output: format!(
-                "Edited '{path}' ({matches} replacement{})",
-                if matches == 1 { "" } else { "s" }
-            ),
-        },
-        Err(e) => ToolResult {
-            status: ToolStatus::RequestError,
-            output: format!("Failed to edit '{}': {}", path, e),
-        },
-    }
+    Ok((updated, matches))
 }
 
 #[cfg(test)]
@@ -1079,6 +1153,136 @@ mod tests {
 
         let r = edit_file(&cwd, "a.txt", "x", "z", true);
         assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "z y z\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_entries_apply_sequentially_to_created_text() {
+        let cwd = fresh_tmp_dir("edit-batch-sequential");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "BETA\ngamma".to_string(),
+                new_string: "delta\ngamma".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            r.output,
+            "Edited 'a.txt' (2 replacements across 2 edit entries)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\ndelta\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_entries_stop_on_failure_and_keep_prior_changes() {
+        let cwd = fresh_tmp_dir("edit-batch-fail");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "gamma".to_string(),
+                new_string: "GAMMA".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert!(
+            r.output.contains(
+                "Applied 1 edit entry before failure at edits[1]: No occurrences of `old_string` found in 'a.txt'"
+            ),
+            "{}",
+            r.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_single_entry_batch_matches_flat_behavior() {
+        let cwd = fresh_tmp_dir("edit-batch-single");
+        std::fs::write(cwd.join("a.txt"), "x y x\n").unwrap();
+
+        let ambiguous = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "x".to_string(),
+                new_string: "z".to_string(),
+                replace_all: false,
+            }],
+        );
+        assert!(matches!(ambiguous.status, ToolStatus::RequestError));
+        assert_eq!(
+            ambiguous.output,
+            "`old_string` occurs 2 times in 'a.txt'. Provide more context or set `replace_all` to true."
+        );
+
+        let missing = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "z".to_string(),
+                replace_all: false,
+            }],
+        );
+        assert!(matches!(missing.status, ToolStatus::RequestError));
+        assert_eq!(
+            missing.output,
+            "No occurrences of `old_string` found in 'a.txt'"
+        );
+
+        let replaced = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "x".to_string(),
+                new_string: "z".to_string(),
+                replace_all: true,
+            }],
+        );
+        assert!(
+            matches!(replaced.status, ToolStatus::Success),
+            "{}",
+            replaced.output
+        );
+        assert_eq!(replaced.output, "Edited 'a.txt' (2 replacements)");
         assert_eq!(
             std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
             "z y z\n"

@@ -5956,23 +5956,45 @@ fn build_editing_diff(
             .to_string(),
         "edit" => {
             let prior_text = prior.as_ref()?;
-            let old = parsed_input.get("old_string").and_then(Value::as_str)?;
-            let new = parsed_input.get("new_string").and_then(Value::as_str)?;
-            let replace_all = parsed_input
-                .get("replace_all")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if replace_all {
-                prior_text.replace(old, new)
-            } else {
-                prior_text.replacen(old, new, 1)
-            }
+            apply_edit_args_for_diff(prior_text, parsed_input)?
         }
         _ => return None,
     };
     let mut diff = Diff::new(PathBuf::from(path), new_text);
     diff.old_text = prior;
     Some(diff)
+}
+
+fn apply_edit_args_for_diff(prior_text: &str, parsed_input: &Value) -> Option<String> {
+    let mut text = prior_text.to_string();
+    if let Some(edits) = parsed_input.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            let old = edit.get("old_string").and_then(Value::as_str)?;
+            let new = edit.get("new_string").and_then(Value::as_str)?;
+            let replace_all = edit
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            text = if replace_all {
+                text.replace(old, new)
+            } else {
+                text.replacen(old, new, 1)
+            };
+        }
+        return Some(text);
+    }
+
+    let old = parsed_input.get("old_string").and_then(Value::as_str)?;
+    let new = parsed_input.get("new_string").and_then(Value::as_str)?;
+    let replace_all = parsed_input
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(if replace_all {
+        text.replace(old, new)
+    } else {
+        text.replacen(old, new, 1)
+    })
 }
 
 /// Run same-turn mutations before reads so read/search calls observe fresh

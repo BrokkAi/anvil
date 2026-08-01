@@ -249,16 +249,37 @@ pub(crate) fn summarize_tool_result(
         }
         "edit" => {
             let path = argument_str(arguments, "file_path").unwrap_or("?");
+            let edit_count = arguments
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map_or(1, Vec::len);
             let replace_all = arguments
-                .get("replace_all")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let scope = if replace_all {
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map(|edits| {
+                    edits.iter().any(|edit| {
+                        edit.get("replace_all")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    arguments
+                        .get("replace_all")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                });
+            let all_scope = if replace_all {
                 " (all occurrences)"
             } else {
                 ""
             };
-            format!("edit {path}{scope}: ok")
+            let count_scope = if edit_count > 1 {
+                format!(" ({edit_count} entries)")
+            } else {
+                String::new()
+            };
+            format!("edit {path}{all_scope}{count_scope}: ok")
         }
         "list_directory" => {
             let path = argument_str(arguments, "path").unwrap_or(".");

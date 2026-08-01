@@ -9,6 +9,7 @@ use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
 use sandbox::SandboxPolicy;
+use serde::de;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
@@ -45,13 +46,73 @@ struct WriteFileArgs {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+struct EditEntryArgs {
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Debug)]
 struct EditFileArgs {
+    file_path: String,
+    edits: Vec<EditEntryArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchEditFileArgs {
+    file_path: String,
+    edits: Vec<EditEntryArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlatEditFileArgs {
     file_path: String,
     old_string: String,
     new_string: String,
     #[serde(default)]
     replace_all: bool,
+}
+
+impl<'de> Deserialize<'de> for EditFileArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("edits").is_some() {
+            let args: BatchEditFileArgs =
+                deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+            return Ok(Self {
+                file_path: args.file_path,
+                edits: args.edits,
+            });
+        }
+
+        if value.get("old_string").is_some()
+            || value.get("new_string").is_some()
+            || value.get("replace_all").is_some()
+        {
+            let args: FlatEditFileArgs =
+                deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+            return Ok(Self {
+                file_path: args.file_path,
+                edits: vec![EditEntryArgs {
+                    old_string: args.old_string,
+                    new_string: args.new_string,
+                    replace_all: args.replace_all,
+                }],
+            });
+        }
+
+        let args: BatchEditFileArgs =
+            deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+        Ok(Self {
+            file_path: args.file_path,
+            edits: args.edits,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,13 +236,9 @@ impl BuiltinArgsContract for WriteFileArgs {
 
 #[cfg(test)]
 impl BuiltinArgsContract for EditFileArgs {
-    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "old_string", "new_string"];
-    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
-        ("file_path", "string"),
-        ("old_string", "string"),
-        ("new_string", "string"),
-        ("replace_all", "boolean"),
-    ];
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "edits"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("file_path", "string"), ("edits", "array")];
 }
 
 #[cfg(test)]
@@ -236,6 +293,14 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_json_value_with_path<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, String> {
+    let json = value.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| err.to_string())
 }
 
 fn parse_builtin_args<T: DeserializeOwned>(
@@ -950,7 +1015,7 @@ impl ToolRegistry {
         }
         if builtin_tools.contains("write_file") {
             let write_description = format!(
-                "Writes content to a specified file in the local filesystem, capped at {} bytes. Paths may be relative to the working directory or absolute paths inside it.",
+                "Writes content to a specified file in the local filesystem, capped at {} bytes. Use it to create files and to REPLACE a file's entire contents when editing would take more than a few hunks -- one write_file call is better than a chain of edits. Paths may be relative to the working directory or absolute paths inside it.",
                 filesystem::WRITE_MAX_BYTES
             );
             defs.push(tool_def(
@@ -975,7 +1040,7 @@ impl ToolRegistry {
         if builtin_tools.contains("edit") {
             defs.push(tool_def(
                 "edit",
-                "Replaces exact literal text within a file. By default, replaces a single occurrence. Set `replace_all` to true to replace every matching occurrence.",
+                "Replaces exact literal text within a file using one or more sequential edit entries. Each entry matches against the file content produced by previous entries, and each `old_string` must be the smallest text that uniquely identifies the change. If `old_string` is ambiguous, expand it with more context or set `replace_all` to true. Batch related changes to the same file into one call with multiple `edits` entries. If an entry fails, earlier entries remain applied and later entries are not attempted. For heavy rewrites -- many hunks or most of a file changing -- prefer `write_file` with the full new contents instead of a long edit chain.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -983,20 +1048,31 @@ impl ToolRegistry {
                             "type": "string",
                             "description": "Path to the file to modify. Relative paths are resolved against the working directory; absolute paths must remain inside it."
                         },
-                        "old_string": {
-                            "type": "string",
-                            "description": "The exact literal text to replace, including whitespace and indentation."
-                        },
-                        "new_string": {
-                            "type": "string",
-                            "description": "The exact literal text to replace `old_string` with."
-                        },
-                        "replace_all": {
-                            "type": "boolean",
-                            "description": "Replace all occurrences of old_string. Defaults to false."
+                        "edits": {
+                            "type": "array",
+                            "description": "Sequential exact-string replacements to apply to this file. Later entries see the content produced by earlier entries.",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": {
+                                        "type": "string",
+                                        "description": "The exact literal text to replace, including whitespace and indentation. Use the smallest text that uniquely identifies the change."
+                                    },
+                                    "new_string": {
+                                        "type": "string",
+                                        "description": "The exact literal text to replace `old_string` with."
+                                    },
+                                    "replace_all": {
+                                        "type": "boolean",
+                                        "description": "Replace all occurrences of old_string for this edit entry. Defaults to false."
+                                    }
+                                },
+                                "required": ["old_string", "new_string"]
+                            }
                         }
                     },
-                    "required": ["file_path", "old_string", "new_string"]
+                    "required": ["file_path", "edits"]
                 }),
             ));
         }
@@ -1418,15 +1494,18 @@ impl ToolRegistry {
                 };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
+                let path = args.file_path;
+                let edits: Vec<filesystem::EditFileEntry> = args
+                    .edits
+                    .into_iter()
+                    .map(|edit| filesystem::EditFileEntry {
+                        old_string: edit.old_string,
+                        new_string: edit.new_string,
+                        replace_all: edit.replace_all,
+                    })
+                    .collect();
                 run_blocking_filesystem_tool(move || {
-                    filesystem::edit_file_in_roots(
-                        &cwd,
-                        &additional_roots,
-                        &args.file_path,
-                        &args.old_string,
-                        &args.new_string,
-                        args.replace_all,
-                    )
+                    filesystem::edit_file_entries_in_roots(&cwd, &additional_roots, &path, &edits)
                 })
                 .await
             }
@@ -2395,6 +2474,36 @@ mod tests {
         assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
     }
 
+    #[tokio::test]
+    async fn edit_tool_schema_surfaces_batch_entries() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let edit = defs
+            .iter()
+            .find(|def| def.function.name == "edit")
+            .expect("edit should be advertised");
+
+        assert_eq!(
+            edit.function.parameters["required"],
+            json!(["file_path", "edits"])
+        );
+        assert!(
+            edit.function.parameters["properties"]["old_string"].is_null(),
+            "flat old_string must not be advertised at top level"
+        );
+        let edits = &edit.function.parameters["properties"]["edits"];
+        assert_eq!(edits["type"], "array");
+        assert_eq!(edits["minItems"], 1);
+        assert_eq!(
+            edits["items"]["required"],
+            json!(["old_string", "new_string"])
+        );
+        assert_eq!(
+            edits["items"]["properties"]["replace_all"]["type"],
+            "boolean"
+        );
+    }
+
     async fn assert_invalid_builtin_args(
         registry: &ToolRegistry,
         name: &str,
@@ -2453,9 +2562,11 @@ mod tests {
             "edit",
             json!({
                 "file_path": "x",
-                "old_string": "a",
-                "new_string": "b",
-                "replace_all": "yes"
+                "edits": [{
+                    "old_string": "a",
+                    "new_string": "b",
+                    "replace_all": "yes"
+                }]
             }),
             "replace_all",
         )
@@ -2506,6 +2617,38 @@ mod tests {
             "name",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn edit_tool_accepts_legacy_flat_args_as_one_entry_batch() {
+        let cwd = fresh_tmp_dir("edit-flat-compat");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let mut registry = registry_with_skills(vec![]);
+        registry.cwd = cwd.clone();
+
+        let result = registry
+            .execute(
+                "edit",
+                json!({
+                    "file_path": "a.txt",
+                    "old_string": "beta",
+                    "new_string": "BETA"
+                }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "{}",
+            result.output
+        );
+        assert_eq!(result.output, "Edited 'a.txt' (1 replacement)");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nBETA\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]
