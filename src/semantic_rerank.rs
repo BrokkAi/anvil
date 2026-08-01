@@ -170,7 +170,7 @@ pub(crate) async fn rerank_semantic_search(
         prefer_json_object: false,
     };
 
-    let response = stream_chat_no_visible_output_with_retry(
+    let mut response_future = Box::pin(stream_chat_no_visible_output_with_retry(
         llm.as_ref(),
         "semantic_search rerank",
         cancel,
@@ -187,8 +187,17 @@ pub(crate) async fn rerank_semantic_search(
             cancel: cancel.clone(),
             idle_timeouts: idle_timeout,
         },
-    )
-    .await;
+    ));
+    let response = match crate::cim::rerank_wall_timeout() {
+        Some(timeout) => match tokio::time::timeout(timeout, response_future.as_mut()).await {
+            Ok(response) => response,
+            Err(_) => Err(anyhow::anyhow!(
+                "semantic_search rerank exceeded CIM wall timeout of {} seconds",
+                timeout.as_secs()
+            )),
+        },
+        None => response_future.await,
+    };
 
     let response = match response {
         Ok(response) => response,

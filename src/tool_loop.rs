@@ -1945,6 +1945,9 @@ pub(crate) async fn run(
             "mcp_tool_timeout_seconds": crate::cim::mcp_tool_call_timeout()
                 .expect("CIM mode is enabled")
                 .as_secs(),
+            "rerank_wall_timeout_seconds": crate::cim::rerank_wall_timeout()
+                .expect("CIM mode is enabled")
+                .as_secs(),
             "call_ids": call_ids,
         }));
         if !calls.is_empty() {
