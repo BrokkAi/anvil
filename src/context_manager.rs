@@ -2378,6 +2378,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_calls_digest_catches_permission_denials() {
+        let mut history = Vec::new();
+        history.extend(tool_exchange_messages(
+            "c1",
+            "edit",
+            r#"{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            "Tool use denied by user.",
+        ));
+        history.extend(tool_exchange_messages(
+            "c2",
+            "run_shell_command",
+            r#"{"command":"rm -rf target"}"#,
+            "Tool use denied by auto permissions: destructive command outside approved scope",
+        ));
+        let digest = failed_tool_calls_digest(&history).expect("digest present");
+        assert!(digest.contains("1. `edit` args="), "{digest}");
+        assert!(digest.contains("Tool use denied by user."), "{digest}");
+        assert!(digest.contains("2. `run_shell_command` args="), "{digest}");
+    }
+
+    #[test]
     fn failed_tool_calls_digest_truncates_long_arguments() {
         let long_args = format!(r#"{{"pattern":"{}"}}"#, "x".repeat(600));
         let mut history = Vec::new();

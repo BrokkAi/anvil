@@ -32,9 +32,14 @@ pub enum ToolStatus {
 
 /// Whether a rendered tool result text represents a failure. Matches the
 /// `"Error: "` / `"Internal error: "` status prefixes `tool_result_to_execution`
-/// applies in `tool_loop.rs` for `ToolStatus::RequestError` / `InternalError`.
+/// applies in `tool_loop.rs` for `ToolStatus::RequestError` / `InternalError`,
+/// plus the `"Tool use denied"` prefix every permission-gate rejection uses
+/// (user rejections, auto-permission denials, read-only mode, oversized
+/// permission cards -- see `tool_loop.rs` / `tool_loop/announce.rs`).
 pub(crate) fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Internal error:")
+    result.starts_with("Error:")
+        || result.starts_with("Internal error:")
+        || result.starts_with("Tool use denied")
 }
 
 #[derive(Debug, Deserialize)]
