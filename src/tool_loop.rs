@@ -2001,9 +2001,11 @@ pub(crate) async fn run(
                     "query_manifest_sha256": config.query_manifest_sha256,
                     "query_count": calls.len(),
                     "status": "failed",
-                    "results": exchanges.iter().map(|exchange| serde_json::json!({
+                    "failures": exchanges.iter()
+                        .filter(|exchange| exchange.status == ToolExchangeStatus::Failed)
+                        .map(|exchange| serde_json::json!({
                         "call_id": exchange.call_id,
-                        "status": exchange.status.as_str(),
+                        "error": exchange.result,
                     })).collect::<Vec<_>>(),
                 }));
                 return LoopOutcome::setup_failure(
