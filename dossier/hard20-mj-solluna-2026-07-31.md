@@ -452,3 +452,8 @@ wins; pebble 59/59. All six losses are hidden-suite near-misses
 (textual 19/20, cattrs 68/69, opa-template 4/5, opa-rego 22/25, psm
 67/72, sqlfmt 28/32). Cost sits at vanilla's published price with the
 full tool catalog. AAr2 launched at 20 threads; ABr1 mid-flight.
+
+**Arm A run 2: 13/20, $3.81/task, 1.25h at 20 threads. Solo arm final:
+27/40 (67.5%), ~$3.78/task.** dynamodb won BOTH runs — the wall is
+down for good. Flips vs run 1 (bandit 88->86/88, cliffy 37->36/37,
+obsidian, cattrs, sqlfmt) confirm the near-miss band is stochastic.
