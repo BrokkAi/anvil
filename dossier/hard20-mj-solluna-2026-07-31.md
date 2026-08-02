@@ -484,3 +484,31 @@ obsidian p2p loss (duo-specific failure modes, both flipped to wins in
 r2); the completion protocol + round cap are now default-on in prod
 anvil/mj pending real-session validation per the no-benchmark-fitting
 rule.
+
+### CORRECTION (2026-08-02, prompted by owner): A/B costs were understated; duo cost advantage retracted
+
+The harness cost helper subtracted cachedInputTokens from inputTokens
+(trials.json convention), but mj/anvil rows report inputTokens as
+FRESH-ONLY — every fresh-input dollar was zeroed and reasoning tokens
+skipped output billing (recorded $3.1394 reproduced exactly from the
+buggy formula; my spec error in the codex brief). True costs, recomputed
+from trace usage (newest archive per task, reasoning billed as output):
+
+| arm | r1 | r2 | arm avg |
+|---|---|---|---|
+| solo | $5.50 | $5.78 | **$5.64/task** |
+| duo | $4.89 | $6.66 | **$5.78/task** (sol $5.45 + luna $0.32) |
+
+**Retracted**: the duo's cost advantage (truth: parity) and "clears the
+old vanilla bar on both axes" (vanilla's published $3.47 is true-cost;
+we are ~1.6x). **Stands**: the duo's +4-task score edge, all
+trace-derived analysis, and the completion protocol's step/cost
+reductions (solo fell $8.6 -> $5.6/task vs run 7's config).
+
+The answer to why delegation barely moves cost: **sol-in-duo still
+spends 97% of solo-sol's dollars** (~89 req/task over its own growing
+prefix — briefs, critical report review, re-verification, finalization
+are all sol-priced), while luna's 7M tokens/task cost $0.32. A cheap
+subagent only saves money on work the primary actually stops doing;
+today delegation is additive, not substitutive. Harness fixed in
+brokkbench e3a01c4ad02.
