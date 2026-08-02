@@ -457,3 +457,30 @@ full tool catalog. AAr2 launched at 20 threads; ABr1 mid-flight.
 27/40 (67.5%), ~$3.78/task.** dynamodb won BOTH runs — the wall is
 down for good. Flips vs run 1 (bandit 88->86/88, cliffy 37->36/37,
 obsidian, cattrs, sqlfmt) confirm the near-miss band is stochastic.
+
+### Internal A/B verdict (2026-08-02): the duo earns its seat
+
+| arm | r1 | r2 | total | avg $/task |
+|---|---|---|---|---|
+| solo sol (vanilla-sol-on-anvil) | 14/20 $3.75 | 13/20 $3.81 | **27/40 (67.5%)** | **$3.78** |
+| sol+luna (duo) | 14/20 $2.71 | 17/20 $3.74 | **31/40 (77.5%)** | **$3.23** |
+
+Duo leads on BOTH axes: +4 tasks and -$0.55/task — luna absorbing
+read-heavy work shrinks sol's prefix spend, so delegation now PAYS
+rather than taxes. ABr2's 17/20 is the best single run of the
+campaign. Honest stats: per-task differences are mixed (duo better on
+5 tasks, solo on 3; sign-test soft at n=8 differing), so the score
+edge is suggestive rather than proven; the cost edge is consistent
+across runs. Task-level texture: textual and opa-template went 0/2
+solo -> 2/2 duo (fresh-context subagent reads); dynamodb went 2/2
+solo -> 1/2 duo (delegation hurts the long-context task); opa-rego and
+python-statemachine are 0/4 across both arms (the irreducible pair).
+For historical context only: the duo's 77.5% at $3.23 clears the old
+vanilla bar (76% at $3.47) on both axes — the original campaign goal,
+reached via scaffold economics rather than coordination machinery.
+
+Open follow-ups: audit ABr1's tengo 0/23-at-$0.41 early death and
+obsidian p2p loss (duo-specific failure modes, both flipped to wins in
+r2); the completion protocol + round cap are now default-on in prod
+anvil/mj pending real-session validation per the no-benchmark-fitting
+rule.
