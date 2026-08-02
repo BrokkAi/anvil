@@ -380,3 +380,40 @@ Harness bug noted: `costUsd` is 0.00 in every run-8 result row; token
 counts intact, engine cost calc broken.
 
 Score history: 12, 13, 13, 9/16k, 10/15k, **16**, 9/14k(max 15).
+
+### Probe experiments E1/E2: the step count was scaffold-shaped all along (2026-08-02)
+
+Prompted by the owner's differential challenge ("how is this different in
+mini-swe?"): vanilla trajectories from the published artifacts show
+mini-swe-agent runs with **zero limits** (step/cost/wall all 0) and no
+budget language — same model, no counterweight, 25-36 steps on
+bandit/cliffy. The "satisfaction criterion" story was wrong. Measured
+head-to-head (bandit): identical avg prefix (~48k tok), identical
+shell-batching density (3.5 vs 3.0 ops/cmd); the 4.6x step differential
+= micro-action granularity (read/semantic/plan calls at one request
+each) + loops vanilla never enters (22 git-diff self-reviews, 29
+verification episodes). Vanilla passed without ever running the repo
+suite; its prompt scripts a 6-phase linear workflow with an explicit
+terminal command.
+
+Two 3-task probes (bandit/cliffy/fd; solo sol+high; DR off), one seed:
+
+| arm | steps (b/c/f) | $ (b/c/f) | f2p |
+|---|---|---|---|
+| run 8 (full catalog) | 116/160/64 | 6.11/10.09/3.07 | 83-88 F / 0-37 F / W |
+| E1 script transplant (full catalog + mswe 6-phase + "commit and end; do not re-inspect") | 55/61/54 | 3.50/3.80/2.87 | **88/88 W** / 36-37 F / W |
+| E2 catalog cut (shell+edit+write only) | 35/37/45 | 2.04/2.86/2.62 | 86-88 F / 0-37 F / W |
+| vanilla (published) | 25-36 | 2.6-4.4 | pass 3/4 / pass 2/4 / — |
+
+Both levers real: the completion script halves steps with the full
+catalog; the catalog cut reaches vanilla step counts and vanilla-or-
+below cost. E1's outcomes were the best of any sol arm on these tasks
+(bandit 88/88 at $3.50 — vanilla's average price — and cliffy 36/37 vs
+run 8's 0/37). n=1/cell; needs replication. Conclusion: **the tool
+catalog defines action granularity and the prompt defines the episode's
+terminal state; step count follows the scaffold, not a model-internal
+criterion.** Next candidates: E1+E2 combined arm; full-20 run of the
+best arm. Probe knobs: BPR_INSTRUCTION_SUFFIX_FILE,
+BPR_AGENT_TOOL_ALLOWLIST (brokkbench, uncommitted at probe time).
+Latent harness bug found: without MJ_EITRI_MODEL the engine takes a
+legacy --thor CLI path that current mj rejects (exit 2, instant).
