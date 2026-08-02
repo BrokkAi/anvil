@@ -128,6 +128,7 @@ struct Selection {
 struct RankedCandidate<'a> {
     candidate: &'a Candidate,
     declarations: Vec<&'a DeclarationLocator>,
+    declaration_fallback: bool,
 }
 
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
@@ -286,6 +287,7 @@ async fn rerank_one_semantic_search(
             context_bytes: 0,
             selected_count: 0,
             final_count: 0,
+            declaration_fallback_count: 0,
             fallback_reason: None,
             usage: TokenUsage::default(),
             utility: &utility,
@@ -394,6 +396,10 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: 0,
                 final_count: ordered.len(),
+                declaration_fallback_count: ordered
+                    .iter()
+                    .filter(|selected| selected.declaration_fallback)
+                    .count(),
                 fallback_reason: Some("provider_failure"),
                 usage: TokenUsage::default(),
                 utility: &utility,
@@ -457,6 +463,10 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: 0,
                 final_count: ordered.len(),
+                declaration_fallback_count: ordered
+                    .iter()
+                    .filter(|selected| selected.declaration_fallback)
+                    .count(),
                 fallback_reason: Some("malformed_output"),
                 usage,
                 utility: &utility,
@@ -504,6 +514,10 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: selected.len(),
                 final_count: ordered.len(),
+                declaration_fallback_count: ordered
+                    .iter()
+                    .filter(|selected| selected.declaration_fallback)
+                    .count(),
                 fallback_reason: Some("invalid_selection"),
                 usage,
                 utility: &utility,
@@ -536,6 +550,10 @@ async fn rerank_one_semantic_search(
         context_bytes,
         selected_count: selected.len(),
         final_count: ordered.len(),
+        declaration_fallback_count: ordered
+            .iter()
+            .filter(|selected| selected.declaration_fallback)
+            .count(),
         fallback_reason: None,
         usage,
         utility: &utility,
@@ -727,11 +745,10 @@ async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
             .collect();
         let summary_targets: Vec<String> = symbols.iter().chain(&files).cloned().collect();
 
-        fetch_symbol_context(registry, candidates, &symbols).await;
-        fetch_summary_context(registry, candidates, &summary_targets).await;
-        if available_prompt_bytes(candidates) >= MAX_TOTAL_CONTEXT_BYTES {
-            break;
+        if available_private_context_bytes(candidates) < MAX_TOTAL_CONTEXT_BYTES {
+            fetch_symbol_context(registry, candidates, &symbols).await;
         }
+        fetch_summary_context(registry, candidates, &summary_targets).await;
     }
 }
 
@@ -789,20 +806,11 @@ async fn fetch_summary_context(
     }
 }
 
-fn available_prompt_bytes(candidates: &[Candidate]) -> usize {
+fn available_private_context_bytes(candidates: &[Candidate]) -> usize {
     candidates
         .iter()
-        .map(|candidate| {
-            let declarations = candidate
-                .declarations
-                .iter()
-                .map(|declaration| render_declaration_for_prompt(declaration).len())
-                .sum::<usize>();
-            let context = candidate.context.as_ref().map_or(0, String::len);
-            declarations
-                .saturating_add(context)
-                .min(MAX_CANDIDATE_CONTEXT_BYTES)
-        })
+        .filter_map(|candidate| candidate.context.as_ref())
+        .map(String::len)
         .sum()
 }
 
@@ -1132,46 +1140,38 @@ fn order_candidates<'a>(
         let Some(candidate) = by_id.get(selection.id.as_str()).copied() else {
             return Err(format!("unknown candidate id {}", selection.id));
         };
-        if selection.declarations.len() > MAX_SELECTED_DECLARATIONS {
-            return Err(format!(
-                "candidate {} selected more than {MAX_SELECTED_DECLARATIONS} declarations",
-                selection.id
-            ));
-        }
-        if candidate.declarations.is_empty() && !selection.declarations.is_empty() {
-            return Err(format!("candidate {} has no declaration ids", selection.id));
-        }
-        if !candidate.declarations.is_empty() && selection.declarations.is_empty() {
-            return Err(format!(
-                "candidate {} must select at least one declaration",
-                selection.id
-            ));
-        }
         let declarations_by_id: HashMap<&str, &DeclarationLocator> = candidate
             .declarations
             .iter()
             .map(|declaration| (declaration.id.as_str(), declaration))
             .collect();
         let mut declaration_seen = HashSet::new();
-        let mut declarations = Vec::with_capacity(selection.declarations.len());
+        let mut declarations =
+            Vec::with_capacity(selection.declarations.len().min(MAX_SELECTED_DECLARATIONS));
         for id in &selection.declarations {
             if !declaration_seen.insert(id.as_str()) {
-                return Err(format!(
-                    "candidate {} repeated declaration id {id}",
-                    selection.id
-                ));
+                continue;
             }
-            let Some(declaration) = declarations_by_id.get(id.as_str()).copied() else {
-                return Err(format!(
-                    "candidate {} selected unknown declaration id {id}",
-                    selection.id
-                ));
-            };
-            declarations.push(declaration);
+            if let Some(declaration) = declarations_by_id.get(id.as_str()).copied() {
+                declarations.push(declaration);
+                if declarations.len() == MAX_SELECTED_DECLARATIONS {
+                    break;
+                }
+            }
+        }
+        let declaration_fallback = declarations.is_empty() && !candidate.declarations.is_empty();
+        if declaration_fallback {
+            declarations.extend(
+                candidate
+                    .declarations
+                    .iter()
+                    .take(MAX_SELECTED_DECLARATIONS),
+            );
         }
         ordered.push(RankedCandidate {
             candidate,
             declarations,
+            declaration_fallback,
         });
     }
     Ok(ordered)
@@ -1188,6 +1188,7 @@ fn rrf_fallback(candidates: &[Candidate], final_k: usize) -> Vec<RankedCandidate
                 .iter()
                 .take(MAX_SELECTED_DECLARATIONS)
                 .collect(),
+            declaration_fallback: !candidate.declarations.is_empty(),
         })
         .collect()
 }
@@ -1203,6 +1204,7 @@ struct RerankTrace<'a> {
     context_bytes: usize,
     selected_count: usize,
     final_count: usize,
+    declaration_fallback_count: usize,
     fallback_reason: Option<&'a str>,
     usage: TokenUsage,
     utility: &'a crate::utility_model::UtilityModelSelection,
@@ -1261,6 +1263,7 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "context_bytes": trace.context_bytes,
         "reranker_selected_count": trace.selected_count,
         "selected_final_count": trace.final_count,
+        "declaration_selection_fallback_count": trace.declaration_fallback_count,
         "fallback": trace.fallback_reason.is_some(),
         "fallback_reason": trace.fallback_reason,
         "utility_model": trace.utility.model,
@@ -1718,7 +1721,7 @@ mod tests {
             .as_deref()
             .expect("compact outline is attached");
         assert_eq!(context, "src/config.rs (42 lines)\n- Config\n  - load");
-        assert_eq!(available_prompt_bytes(&candidates), context.len());
+        assert_eq!(available_private_context_bytes(&candidates), context.len());
     }
 
     #[test]
@@ -1752,6 +1755,10 @@ mod tests {
         assert!(!rendered.contains("fn load(path: &Path)"));
         assert!(!rendered.contains("PRIVATE_BODY_SENTINEL"));
         assert!(!rendered.contains("```"));
+
+        let fallback = order_candidates(&candidates, &[selection("f1")], 20).unwrap();
+        assert!(fallback[0].declaration_fallback);
+        assert_eq!(fallback[0].declarations.len(), 2);
     }
 
     fn live_candidate(
