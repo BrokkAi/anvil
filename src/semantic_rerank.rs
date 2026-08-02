@@ -22,6 +22,7 @@
 //! provider failure cannot silently change the experimental treatment.
 //! Bifrost's raw three-list payload is never exposed to the model.
 
+use futures::future::join_all;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,7 @@ const OVERFETCH_MULTIPLIER: usize = 2;
 const MAX_CANDIDATE_CONTEXT_BYTES: usize = 8_000;
 const MAX_TOTAL_CONTEXT_BYTES: usize = 120_000;
 const CONTEXT_FETCH_BATCH: usize = 8;
+const MAX_SELECTED_DECLARATIONS: usize = 5;
 const RRF_RANK_CONSTANT: f64 = 60.0;
 
 const MAX_LINE_CHARS: usize = 2048;
@@ -96,10 +98,36 @@ struct Candidate {
     location: Option<String>,
     /// Truncated source (symbols) or rendered summary (files), if fetched.
     context: Option<String>,
+    /// Structured declaration signatures supplied by bifrost. These are
+    /// prompt-local choices for the utility model and compact locators for the
+    /// calling agent; they are never reconstructed from source text.
+    declarations: Vec<DeclarationLocator>,
     /// Reciprocal-rank score accumulated across the active retrieval legs.
     rrf_score: f64,
     /// First raw-list position, used to make equal RRF scores deterministic.
     first_seen: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DeclarationLocator {
+    id: String,
+    symbol: String,
+    kind: String,
+    path: String,
+    start_line: u64,
+    end_line: u64,
+    signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selection {
+    id: String,
+    declarations: Vec<String>,
+}
+
+struct RankedCandidate<'a> {
+    candidate: &'a Candidate,
+    declarations: Vec<&'a DeclarationLocator>,
 }
 
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
@@ -114,33 +142,128 @@ pub(crate) async fn rerank_semantic_search(
     idle_timeout: IdleTimeouts,
     cancel: &CancellationToken,
 ) -> RerankOutcome {
-    let utility = crate::utility_model::select(model);
     let started = Instant::now();
     let final_k = match parse_final_k(args) {
         Ok(k) => k,
         Err(message) => return RerankOutcome::error(message),
     };
-    let query = args
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let (bifrost_args, base_k) = prepare_bifrost_args(args, final_k);
+    let queries = match parse_queries(args) {
+        Ok(queries) => queries,
+        Err(message) => return RerankOutcome::error(message),
+    };
+    append_trace_record(json!({
+        "type": "semantic_search_batch",
+        "phase": "start",
+        "query_count": queries.len(),
+        "requested_final_k_per_query": final_k,
+    }));
+    let query_count = queries.len();
+    let outcomes = join_all(queries.iter().enumerate().map(|(query_index, query)| {
+        rerank_one_semantic_search(
+            llm,
+            model,
+            registry,
+            prior_messages,
+            query,
+            query_index,
+            query_count,
+            final_k,
+            idle_timeout,
+            cancel,
+        )
+    }))
+    .await;
+
+    let mut usage = TokenUsage::default();
+    let mut usage_model: Option<String> = None;
+    let mut failed = false;
+    let mut sections = Vec::with_capacity(outcomes.len());
+    for ((query_index, query), outcome) in queries.iter().enumerate().zip(outcomes) {
+        usage.add(outcome.usage);
+        if let Some(model) = outcome.usage_model {
+            if let Some(existing) = &usage_model {
+                assert_eq!(
+                    existing, &model,
+                    "one semantic-search batch must use one utility model"
+                );
+            } else {
+                usage_model = Some(model);
+            }
+        }
+        failed |= outcome.failed;
+        sections.push(format!(
+            "Query {} of {}: \"{}\"\n{}",
+            query_index + 1,
+            query_count,
+            query,
+            outcome.output
+        ));
+    }
+    append_trace_record(json!({
+        "type": "semantic_search_batch",
+        "phase": "complete",
+        "query_count": query_count,
+        "requested_final_k_per_query": final_k,
+        "failed": failed,
+        "elapsed_millis": started.elapsed().as_millis(),
+    }));
+    RerankOutcome {
+        output: sections.join("\n\n"),
+        failed,
+        usage,
+        usage_model,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rerank_one_semantic_search(
+    llm: &Arc<dyn LlmBackend>,
+    model: &str,
+    registry: &ToolRegistry,
+    prior_messages: &[ChatMessage],
+    query: &str,
+    query_index: usize,
+    query_count: usize,
+    final_k: usize,
+    idle_timeout: IdleTimeouts,
+    cancel: &CancellationToken,
+) -> RerankOutcome {
+    let utility = crate::utility_model::select(model);
+    let started = Instant::now();
+    let (bifrost_args, base_k) = prepare_bifrost_args(query, final_k);
 
     // 1. Underlying search. A hard failure here is the model's to see.
-    trace_phase("retrieval_start", &query, &utility, started, None);
+    trace_phase(
+        "retrieval_start",
+        query,
+        query_index,
+        query_count,
+        &utility,
+        started,
+        None,
+    );
     let raw = match registry
         .call_bifrost_tool_raw("semantic_search", bifrost_args)
         .await
     {
         Ok(value) => {
-            trace_phase("retrieval_complete", &query, &utility, started, None);
+            trace_phase(
+                "retrieval_complete",
+                query,
+                query_index,
+                query_count,
+                &utility,
+                started,
+                None,
+            );
             value
         }
         Err(err) => {
             trace_phase(
                 "retrieval_error",
-                &query,
+                query,
+                query_index,
+                query_count,
                 &utility,
                 started,
                 Some(&format!("{err:#}")),
@@ -153,6 +276,9 @@ pub(crate) async fn rerank_semantic_search(
     let mut candidates = parse_candidates(&raw);
     if candidates.is_empty() {
         trace_rerank(RerankTrace {
+            query,
+            query_index,
+            query_count,
             raw: &raw,
             final_k,
             base_k,
@@ -165,32 +291,56 @@ pub(crate) async fn rerank_semantic_search(
             utility: &utility,
         });
         return RerankOutcome::passthrough(
-            render_unified(&query, &[], 0, notes(&raw)),
+            render_unified(query, &[], 0, notes(&raw), false),
             TokenUsage::default(),
         );
     }
 
     // 3. Fetch source / summaries for the candidates (best effort).
-    trace_phase("context_fetch_start", &query, &utility, started, None);
+    trace_phase(
+        "context_fetch_start",
+        query,
+        query_index,
+        query_count,
+        &utility,
+        started,
+        None,
+    );
     fetch_context(registry, &mut candidates).await;
-    trace_phase("context_fetch_complete", &query, &utility, started, None);
+    trace_phase(
+        "context_fetch_complete",
+        query,
+        query_index,
+        query_count,
+        &utility,
+        started,
+        None,
+    );
     let context_bytes = bound_candidate_context(&mut candidates);
 
     // 4. Disposable relevance turn on top of the live conversation.
     let mut messages = prefix_for_rerank(prior_messages);
     messages.push(ChatMessage::user(build_rerank_prompt(
-        &query,
+        query,
         &candidates,
         final_k,
     )));
     let structured = StructuredOutputRequest {
         schema_name: "semantic_rerank".to_string(),
-        schema: rerank_schema(),
+        schema: rerank_schema(final_k),
         allow_coercion: true,
         prefer_json_object: false,
     };
 
-    trace_phase("utility_request_start", &query, &utility, started, None);
+    trace_phase(
+        "utility_request_start",
+        query,
+        query_index,
+        query_count,
+        &utility,
+        started,
+        None,
+    );
     let response = stream_chat_no_visible_output_with_retry(
         llm.as_ref(),
         "semantic_search rerank",
@@ -216,7 +366,9 @@ pub(crate) async fn rerank_semantic_search(
         Err(err) => {
             trace_phase(
                 "utility_request_error",
-                &query,
+                query,
+                query_index,
+                query_count,
                 &utility,
                 started,
                 Some(&format!("{err:#}")),
@@ -232,6 +384,9 @@ pub(crate) async fn rerank_semantic_search(
             );
             let ordered = rrf_fallback(&candidates, final_k);
             trace_rerank(RerankTrace {
+                query,
+                query_index,
+                query_count,
                 raw: &raw,
                 final_k,
                 base_k,
@@ -244,26 +399,37 @@ pub(crate) async fn rerank_semantic_search(
                 utility: &utility,
             });
             return RerankOutcome::passthrough(
-                render_unified(&query, &ordered, candidates.len(), notes(&raw)),
+                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
                 TokenUsage::default(),
             );
         }
     };
-    trace_phase("utility_request_complete", &query, &utility, started, None);
+    trace_phase(
+        "utility_request_complete",
+        query,
+        query_index,
+        query_count,
+        &utility,
+        started,
+        None,
+    );
     let usage = response.usage();
     let text = match response {
         LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
     };
 
-    // 5. A well-formed empty or all-unknown selection is valid and final. Only
-    // malformed structured output invokes fallback.
-    let selected = match parse_selected_ids(&text) {
+    // 5. A well-formed empty selection is valid and final. Malformed JSON,
+    // unknown candidate ids, and invalid declaration choices invoke the
+    // ordinary fallback or fail closed in CIM mode.
+    let selected = match parse_selections(&text) {
         Some(selected) => selected,
         None => {
             if crate::cim::enabled() {
                 trace_phase(
                     "utility_output_error",
-                    &query,
+                    query,
+                    query_index,
+                    query_count,
                     &utility,
                     started,
                     Some("malformed structured output"),
@@ -281,6 +447,9 @@ pub(crate) async fn rerank_semantic_search(
             );
             let ordered = rrf_fallback(&candidates, final_k);
             trace_rerank(RerankTrace {
+                query,
+                query_index,
+                query_count,
                 raw: &raw,
                 final_k,
                 base_k,
@@ -293,17 +462,63 @@ pub(crate) async fn rerank_semantic_search(
                 utility: &utility,
             });
             let mut outcome = RerankOutcome::passthrough(
-                render_unified(&query, &ordered, candidates.len(), notes(&raw)),
+                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
                 usage,
             );
             outcome.usage_model = Some(utility.model.clone());
             return outcome;
         }
     };
-    let ordered = order_candidates(&candidates, &selected, final_k);
+    let ordered = match order_candidates(&candidates, &selected, final_k) {
+        Ok(ordered) => ordered,
+        Err(error) => {
+            if crate::cim::enabled() {
+                trace_phase(
+                    "utility_output_error",
+                    query,
+                    query_index,
+                    query_count,
+                    &utility,
+                    started,
+                    Some(&error),
+                );
+                return RerankOutcome {
+                    output: format!(
+                        "Error: semantic_search reranker returned invalid selections in CIM mode: {error}"
+                    ),
+                    failed: true,
+                    usage,
+                    usage_model: Some(utility.model.clone()),
+                };
+            }
+            tracing::warn!(%error, "semantic_search rerank returned invalid selections; using reciprocal-rank fusion");
+            let ordered = rrf_fallback(&candidates, final_k);
+            trace_rerank(RerankTrace {
+                query,
+                query_index,
+                query_count,
+                raw: &raw,
+                final_k,
+                base_k,
+                deduplicated_count: candidates.len(),
+                context_bytes,
+                selected_count: selected.len(),
+                final_count: ordered.len(),
+                fallback_reason: Some("invalid_selection"),
+                usage,
+                utility: &utility,
+            });
+            let mut outcome = RerankOutcome::passthrough(
+                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
+                usage,
+            );
+            outcome.usage_model = Some(utility.model.clone());
+            return outcome;
+        }
+    };
 
     tracing::debug!(
-        query = %query,
+            query = %query,
         candidates = candidates.len(),
         selected = ordered.len(),
         cached_read_tokens = usage.cached_read_tokens,
@@ -311,6 +526,9 @@ pub(crate) async fn rerank_semantic_search(
         "semantic_search reranked"
     );
     trace_rerank(RerankTrace {
+        query,
+        query_index,
+        query_count,
         raw: &raw,
         final_k,
         base_k,
@@ -322,7 +540,7 @@ pub(crate) async fn rerank_semantic_search(
         usage,
         utility: &utility,
     });
-    let output = render_unified(&query, &ordered, candidates.len(), notes(&raw));
+    let output = render_unified(query, &ordered, candidates.len(), notes(&raw), false);
     let mut outcome = RerankOutcome::passthrough(output, usage);
     outcome.usage_model = Some(utility.model.clone());
     outcome
@@ -350,14 +568,51 @@ fn parse_final_k(args: &Value) -> Result<usize, String> {
     Ok(k as usize)
 }
 
-fn prepare_bifrost_args(args: &Value, final_k: usize) -> (Value, usize) {
+fn parse_queries(args: &Value) -> Result<Vec<String>, String> {
+    let Some(object) = args.as_object() else {
+        return Err("Invalid arguments for `semantic_search`: expected an object".to_string());
+    };
+    let Some(values) = object.get("queries").and_then(Value::as_array) else {
+        return Err(
+            "Invalid arguments for `semantic_search`: queries must be an array of 1 through 3 strings"
+                .to_string(),
+        );
+    };
+    if !(1..=3).contains(&values.len()) {
+        return Err(
+            "Invalid arguments for `semantic_search`: queries must contain 1 through 3 strings"
+                .to_string(),
+        );
+    }
+    let mut seen = HashSet::new();
+    let mut queries = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(query) = value.as_str() else {
+            return Err(
+                "Invalid arguments for `semantic_search`: every query must be a string".to_string(),
+            );
+        };
+        let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() || normalized != query {
+            return Err(
+                "Invalid arguments for `semantic_search`: queries must be nonempty and have normalized whitespace"
+                    .to_string(),
+            );
+        }
+        if !seen.insert(query.to_lowercase()) {
+            return Err(
+                "Invalid arguments for `semantic_search`: queries must be unique ignoring case"
+                    .to_string(),
+            );
+        }
+        queries.push(query.to_string());
+    }
+    Ok(queries)
+}
+
+fn prepare_bifrost_args(query: &str, final_k: usize) -> (Value, usize) {
     let base_k = final_k * OVERFETCH_MULTIPLIER;
-    let mut bifrost_args = args.clone();
-    let object = bifrost_args
-        .as_object_mut()
-        .expect("parse_final_k established that semantic_search arguments are an object");
-    object.insert("k".to_string(), json!(base_k));
-    (bifrost_args, base_k)
+    (json!({ "query": query, "k": base_k }), base_k)
 }
 
 /// Parse every realized item from `semantic_search`'s three legs into one
@@ -392,6 +647,7 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
                         signals: vec![signal],
                         location: None,
                         context: None,
+                        declarations: Vec::new(),
                         rrf_score: 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0),
                         first_seen,
                     });
@@ -419,6 +675,7 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
                         signals: vec!["coedit"],
                         location: None,
                         context: None,
+                        declarations: Vec::new(),
                         rrf_score: 1.0 / (RRF_RANK_CONSTANT + rank as f64 + 1.0),
                         first_seen,
                     });
@@ -468,10 +725,11 @@ async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
             .filter(|candidate| candidate.kind == CandidateKind::File)
             .map(|candidate| candidate.name.clone())
             .collect();
+        let summary_targets: Vec<String> = symbols.iter().chain(&files).cloned().collect();
 
         fetch_symbol_context(registry, candidates, &symbols).await;
-        fetch_file_context(registry, candidates, &files).await;
-        if available_context_bytes(candidates) >= MAX_TOTAL_CONTEXT_BYTES {
+        fetch_summary_context(registry, candidates, &summary_targets).await;
+        if available_prompt_bytes(candidates) >= MAX_TOTAL_CONTEXT_BYTES {
             break;
         }
     }
@@ -504,23 +762,23 @@ async fn fetch_symbol_context(
     }
 }
 
-async fn fetch_file_context(
+async fn fetch_summary_context(
     registry: &ToolRegistry,
     candidates: &mut [Candidate],
-    files: &[String],
+    targets: &[String],
 ) {
-    if files.is_empty() {
+    if targets.is_empty() {
         return;
     }
     match registry
-        .call_bifrost_tool_raw("get_summaries", json!({ "targets": files }))
+        .call_bifrost_tool_raw("get_summaries", json!({ "targets": targets }))
         .await
     {
         Ok(value) => attach_summaries(candidates, &value),
-        Err(_) if files.len() > 1 => {
-            for file in files {
+        Err(_) if targets.len() > 1 => {
+            for target in targets {
                 if let Ok(value) = registry
-                    .call_bifrost_tool_raw("get_summaries", json!({ "targets": [file] }))
+                    .call_bifrost_tool_raw("get_summaries", json!({ "targets": [target] }))
                     .await
                 {
                     attach_summaries(candidates, &value);
@@ -531,11 +789,20 @@ async fn fetch_file_context(
     }
 }
 
-fn available_context_bytes(candidates: &[Candidate]) -> usize {
+fn available_prompt_bytes(candidates: &[Candidate]) -> usize {
     candidates
         .iter()
-        .filter_map(|candidate| candidate.context.as_ref())
-        .map(|context| context.len().min(MAX_CANDIDATE_CONTEXT_BYTES))
+        .map(|candidate| {
+            let declarations = candidate
+                .declarations
+                .iter()
+                .map(|declaration| render_declaration_for_prompt(declaration).len())
+                .sum::<usize>();
+            let context = candidate.context.as_ref().map_or(0, String::len);
+            declarations
+                .saturating_add(context)
+                .min(MAX_CANDIDATE_CONTEXT_BYTES)
+        })
         .sum()
 }
 
@@ -545,10 +812,24 @@ fn bound_candidate_context(candidates: &mut [Candidate]) -> usize {
     let mut remaining = MAX_TOTAL_CONTEXT_BYTES;
     let mut used = 0;
     for candidate in candidates {
+        let mut candidate_remaining = remaining.min(MAX_CANDIDATE_CONTEXT_BYTES);
+        let mut declarations = Vec::new();
+        for mut declaration in std::mem::take(&mut candidate.declarations) {
+            declaration.id = format!("{}d{}", candidate.id, declarations.len() + 1);
+            let bytes = render_declaration_for_prompt(&declaration).len();
+            if bytes > candidate_remaining {
+                break;
+            }
+            candidate_remaining -= bytes;
+            remaining -= bytes;
+            used += bytes;
+            declarations.push(declaration);
+        }
+        candidate.declarations = declarations;
         let Some(context) = candidate.context.take() else {
             continue;
         };
-        let limit = remaining.min(MAX_CANDIDATE_CONTEXT_BYTES);
+        let limit = candidate_remaining.min(remaining);
         if limit == 0 {
             continue;
         }
@@ -604,27 +885,32 @@ fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
     }
 }
 
-/// Attach rendered, truncated summaries to file candidates from a
-/// `get_summaries` result (`{ summaries: [{label,path,preamble,elements:[{text}]}] }`).
+/// Attach structured declaration signatures to every matching candidate and
+/// rendered summaries as private context for file candidates.
 fn attach_summaries(candidates: &mut [Candidate], result: &Value) {
-    let mut by_path: HashMap<&str, &Value> = HashMap::new();
     if let Some(summaries) = result.get("summaries").and_then(Value::as_array) {
-        for block in summaries {
-            let key = block
-                .get("path")
-                .and_then(Value::as_str)
-                .or_else(|| block.get("label").and_then(Value::as_str));
-            if let Some(key) = key {
-                by_path.entry(key).or_insert(block);
+        for candidate in candidates.iter_mut() {
+            let matching: Vec<&Value> = summaries
+                .iter()
+                .filter(|block| match candidate.kind {
+                    CandidateKind::Symbol => {
+                        block.get("label").and_then(Value::as_str) == Some(candidate.name.as_str())
+                    }
+                    CandidateKind::File => {
+                        block.get("path").and_then(Value::as_str) == Some(candidate.name.as_str())
+                            || block.get("label").and_then(Value::as_str)
+                                == Some(candidate.name.as_str())
+                    }
+                })
+                .collect();
+            if candidate.kind == CandidateKind::File
+                && let Some(block) = matching.first()
+            {
+                candidate.context = Some(sample_summary(&render_summary_block(block)));
             }
-        }
-    }
-    for candidate in candidates
-        .iter_mut()
-        .filter(|c| c.kind == CandidateKind::File)
-    {
-        if let Some(block) = by_path.get(candidate.name.as_str()) {
-            candidate.context = Some(sample_summary(&render_summary_block(block)));
+            for block in matching {
+                attach_declarations(candidate, block);
+            }
         }
     }
 
@@ -660,6 +946,57 @@ fn attach_summaries(candidates: &mut [Candidate], result: &Value) {
             candidate.context = Some(match loc {
                 Some(loc) => format!("{path} ({loc} lines)\n{}", lines.join("\n")),
                 None => lines.join("\n"),
+            });
+        }
+    }
+}
+
+fn attach_declarations(candidate: &mut Candidate, block: &Value) {
+    let Some(elements) = block.get("elements").and_then(Value::as_array) else {
+        return;
+    };
+    for element in elements {
+        if element.get("presentation").and_then(Value::as_str) == Some("sampled_excerpt") {
+            continue;
+        }
+        let Some(signature) = element.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let signature = signature.trim();
+        if signature.is_empty() {
+            continue;
+        }
+        let Some(symbol) = element.get("symbol").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(kind) = element.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = element.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(start_line) = element.get("start_line").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(end_line) = element.get("end_line").and_then(Value::as_u64) else {
+            continue;
+        };
+        let duplicate = candidate.declarations.iter().any(|declaration| {
+            declaration.symbol == symbol
+                && declaration.path == path
+                && declaration.start_line == start_line
+                && declaration.end_line == end_line
+                && declaration.signature == signature
+        });
+        if !duplicate {
+            candidate.declarations.push(DeclarationLocator {
+                id: String::new(),
+                symbol: symbol.to_string(),
+                kind: kind.to_string(),
+                path: path.to_string(),
+                start_line,
+                end_line,
+                signature: signature.to_string(),
             });
         }
     }
@@ -703,13 +1040,19 @@ fn build_rerank_prompt(query: &str, candidates: &[Candidate], final_k: usize) ->
     let mut out = String::new();
     out.push_str(
         "A code search just ran for the query below and returned these candidate results. \
-Each candidate has an id, the symbol or file it refers to, and (when available) its source \
-or file summary. Decide which candidates are genuinely relevant to the query and the task \
-in this conversation, then return their ids ordered most-relevant first. Omit irrelevant ones.\n\n",
+Each candidate has an id, the symbol or file it refers to, structured declaration signatures \
+with ids, and (when available) private source or file-summary context. Decide which candidates \
+are genuinely relevant to the query and the task in this conversation. For every selected \
+candidate that has declaration ids, choose the one through five declarations most useful for \
+locating the relevant implementation. Omit irrelevant candidates.\n\n",
     );
     out.push_str(&format!(
-        "Respond with ONLY a JSON object of the form {{\"relevant\": [\"<id>\", ...]}} using \
-the exact ids shown. Select at most {final_k}. If nothing is relevant, return \
+        "Respond with ONLY a JSON object of the form {{\"relevant\": \
+[{{\"id\":\"<candidate-id>\",\"declarations\":[\"<declaration-id>\", ...]}}]}} using \
+the exact ids shown. Select at most {final_k} candidates and at most \
+{MAX_SELECTED_DECLARATIONS} declarations per candidate. A selected candidate with declaration \
+ids must select at least one; a candidate with no declaration ids must use an empty array. \
+If nothing is relevant, return \
 {{\"relevant\": []}}.\n\n"
     ));
     out.push_str("<query>\n");
@@ -734,6 +1077,14 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
         out.push_str(location);
         out.push('\n');
     }
+    if candidate.declarations.is_empty() {
+        out.push_str("(no structured signatures available)\n");
+    } else {
+        out.push_str("Structured signatures:\n");
+        for declaration in &candidate.declarations {
+            out.push_str(&render_declaration_for_prompt(declaration));
+        }
+    }
     match &candidate.context {
         Some(context) => {
             out.push_str("```\n");
@@ -745,35 +1096,106 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
     out
 }
 
-/// Resolve the model's selected ids back to candidates, preserving the model's
-/// order and dropping unknown/duplicate ids.
+fn render_declaration_for_prompt(declaration: &DeclarationLocator) -> String {
+    format!(
+        "[{}] {} {} at {}:{}-{}\n{}\n",
+        declaration.id,
+        declaration.kind,
+        declaration.symbol,
+        declaration.path,
+        declaration.start_line,
+        declaration.end_line,
+        declaration.signature
+    )
+}
+
+/// Resolve the model's selected ids back to candidates, preserving model order
+/// and rejecting unknown or duplicate candidate/declaration ids.
 fn order_candidates<'a>(
     candidates: &'a [Candidate],
-    selected: &[String],
+    selected: &[Selection],
     final_k: usize,
-) -> Vec<&'a Candidate> {
+) -> Result<Vec<RankedCandidate<'a>>, String> {
     let by_id: HashMap<&str, &Candidate> = candidates.iter().map(|c| (c.id.as_str(), c)).collect();
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
-    for id in selected {
-        if !seen.insert(id.as_str()) {
-            continue;
-        }
-        if let Some(candidate) = by_id.get(id.as_str()) {
-            ordered.push(*candidate);
-            if ordered.len() == final_k {
-                break;
-            }
-        }
+    if selected.len() > final_k {
+        return Err(format!(
+            "selected {} candidates, exceeding k={final_k}",
+            selected.len()
+        ));
     }
-    ordered
+    for selection in selected {
+        if !seen.insert(selection.id.as_str()) {
+            return Err(format!("duplicate candidate id {}", selection.id));
+        }
+        let Some(candidate) = by_id.get(selection.id.as_str()).copied() else {
+            return Err(format!("unknown candidate id {}", selection.id));
+        };
+        if selection.declarations.len() > MAX_SELECTED_DECLARATIONS {
+            return Err(format!(
+                "candidate {} selected more than {MAX_SELECTED_DECLARATIONS} declarations",
+                selection.id
+            ));
+        }
+        if candidate.declarations.is_empty() && !selection.declarations.is_empty() {
+            return Err(format!("candidate {} has no declaration ids", selection.id));
+        }
+        if !candidate.declarations.is_empty() && selection.declarations.is_empty() {
+            return Err(format!(
+                "candidate {} must select at least one declaration",
+                selection.id
+            ));
+        }
+        let declarations_by_id: HashMap<&str, &DeclarationLocator> = candidate
+            .declarations
+            .iter()
+            .map(|declaration| (declaration.id.as_str(), declaration))
+            .collect();
+        let mut declaration_seen = HashSet::new();
+        let mut declarations = Vec::with_capacity(selection.declarations.len());
+        for id in &selection.declarations {
+            if !declaration_seen.insert(id.as_str()) {
+                return Err(format!(
+                    "candidate {} repeated declaration id {id}",
+                    selection.id
+                ));
+            }
+            let Some(declaration) = declarations_by_id.get(id.as_str()).copied() else {
+                return Err(format!(
+                    "candidate {} selected unknown declaration id {id}",
+                    selection.id
+                ));
+            };
+            declarations.push(declaration);
+        }
+        ordered.push(RankedCandidate {
+            candidate,
+            declarations,
+        });
+    }
+    Ok(ordered)
 }
 
-fn rrf_fallback(candidates: &[Candidate], final_k: usize) -> Vec<&Candidate> {
-    candidates.iter().take(final_k).collect()
+fn rrf_fallback(candidates: &[Candidate], final_k: usize) -> Vec<RankedCandidate<'_>> {
+    candidates
+        .iter()
+        .take(final_k)
+        .map(|candidate| RankedCandidate {
+            candidate,
+            declarations: candidate
+                .declarations
+                .iter()
+                .take(MAX_SELECTED_DECLARATIONS)
+                .collect(),
+        })
+        .collect()
 }
 
 struct RerankTrace<'a> {
+    query: &'a str,
+    query_index: usize,
+    query_count: usize,
     raw: &'a Value,
     final_k: usize,
     base_k: usize,
@@ -789,6 +1211,8 @@ struct RerankTrace<'a> {
 fn trace_phase(
     phase: &str,
     query: &str,
+    query_index: usize,
+    query_count: usize,
     utility: &crate::utility_model::UtilityModelSelection,
     started: Instant,
     error: Option<&str>,
@@ -797,6 +1221,8 @@ fn trace_phase(
         "type": "semantic_search_phase",
         "phase": phase,
         "query": query,
+        "query_index": query_index,
+        "query_count": query_count,
         "elapsed_millis": started.elapsed().as_millis(),
         "utility_model": utility.model,
         "utility_reasoning_effort": utility.reasoning_effort,
@@ -815,6 +1241,9 @@ fn trace_rerank(trace: RerankTrace<'_>) {
     };
     append_trace_record(json!({
         "type": "semantic_search_rerank",
+        "query": trace.query,
+        "query_index": trace.query_index,
+        "query_count": trace.query_count,
         "requested_final_k": trace.final_k,
         "forwarded_base_k": trace.base_k,
         "retrieval_profile": diagnostic(trace.raw, "retrieval_profile"),
@@ -855,9 +1284,10 @@ fn diagnostic<'a>(raw: &'a Value, key: &str) -> Option<&'a Value> {
 
 fn render_unified(
     query: &str,
-    ordered: &[&Candidate],
+    ordered: &[RankedCandidate<'_>],
     candidate_count: usize,
     notes: Option<String>,
+    fallback: bool,
 ) -> String {
     let mut out = format!(
         "Reranked {} relevant result(s) (from {} candidates) for query: \"{}\"\n",
@@ -869,8 +1299,14 @@ fn render_unified(
         out.push_str(&notes);
         out.push('\n');
     }
+    if fallback {
+        out.push_str(
+            "Reranker fallback: results use reciprocal-rank fusion and Bifrost-order signatures.\n",
+        );
+    }
     out.push('\n');
-    for (rank, candidate) in ordered.iter().enumerate() {
+    for (rank, selected) in ordered.iter().enumerate() {
+        let candidate = selected.candidate;
         let kind = match candidate.kind {
             CandidateKind::Symbol => "symbol",
             CandidateKind::File => "file",
@@ -885,10 +1321,24 @@ fn render_unified(
         if let Some(location) = &candidate.location {
             out.push_str(&format!("   {location}\n"));
         }
-        if let Some(context) = &candidate.context {
-            out.push_str("```\n");
-            out.push_str(context);
-            out.push_str("\n```\n");
+        if selected.declarations.is_empty() {
+            out.push_str("   signature unavailable\n");
+        } else {
+            for declaration in &selected.declarations {
+                out.push_str(&format!(
+                    "   {} {} at {}:{}-{}\n",
+                    declaration.kind,
+                    declaration.symbol,
+                    declaration.path,
+                    declaration.start_line,
+                    declaration.end_line
+                ));
+                for line in declaration.signature.lines() {
+                    out.push_str("      ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
         }
         out.push('\n');
     }
@@ -905,22 +1355,38 @@ fn notes(raw: &Value) -> Option<String> {
     }
 }
 
-fn rerank_schema() -> Value {
+fn rerank_schema(final_k: usize) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "relevant": { "type": "array", "items": { "type": "string" } }
+            "relevant": {
+                "type": "array",
+                "maxItems": final_k,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "declarations": {
+                            "type": "array",
+                            "maxItems": MAX_SELECTED_DECLARATIONS,
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["id", "declarations"],
+                    "additionalProperties": false
+                }
+            }
         },
         "required": ["relevant"],
         "additionalProperties": false
     })
 }
 
-/// Parse `{"relevant": ["id", ...]}` from a model response. Native
+/// Parse the strict candidate/declaration selection object from a model response. Native
 /// structured-output backends return clean JSON by construction; the prompt
 /// instructs the rest to do the same. Anything that doesn't parse yields `None`,
 /// which invokes deterministic RRF fallback -- no bespoke extraction needed.
-fn parse_selected_ids(text: &str) -> Option<Vec<String>> {
+fn parse_selections(text: &str) -> Option<Vec<Selection>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let object = value.as_object()?;
     if object.len() != 1 {
@@ -929,7 +1395,20 @@ fn parse_selected_ids(text: &str) -> Option<Vec<String>> {
     let array = object.get("relevant")?.as_array()?;
     array
         .iter()
-        .map(|value| value.as_str().map(str::to_string))
+        .map(|value| {
+            let object = value.as_object()?;
+            if object.len() != 2 {
+                return None;
+            }
+            let id = object.get("id")?.as_str()?.to_string();
+            let declarations = object
+                .get("declarations")?
+                .as_array()?
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Selection { id, declarations })
+        })
         .collect()
 }
 
@@ -1035,23 +1514,39 @@ mod tests {
 
     #[test]
     fn final_k_defaults_and_validates_model_boundary() {
-        assert_eq!(parse_final_k(&json!({ "query": "x" })), Ok(20));
-        assert_eq!(parse_final_k(&json!({ "query": "x", "k": 1 })), Ok(1));
-        assert_eq!(parse_final_k(&json!({ "query": "x", "k": 20 })), Ok(20));
+        assert_eq!(parse_final_k(&json!({ "queries": ["x"] })), Ok(20));
+        assert_eq!(parse_final_k(&json!({ "queries": ["x"], "k": 1 })), Ok(1));
+        assert_eq!(parse_final_k(&json!({ "queries": ["x"], "k": 20 })), Ok(20));
         for invalid in [json!(0), json!(21), json!(1.5), json!("20"), Value::Null] {
             assert!(parse_final_k(&json!({ "k": invalid })).is_err());
         }
     }
 
     #[test]
+    fn queries_validate_normalization_uniqueness_and_batch_limit() {
+        assert_eq!(
+            parse_queries(&json!({ "queries": ["find auth", "locate refresh"] })),
+            Ok(vec!["find auth".to_string(), "locate refresh".to_string()])
+        );
+        for invalid in [
+            json!({ "query": "old scalar" }),
+            json!({ "queries": [] }),
+            json!({ "queries": ["one", "two", "three", "four"] }),
+            json!({ "queries": [" leading"] }),
+            json!({ "queries": ["Same", "same"] }),
+        ] {
+            assert!(parse_queries(&invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
     fn bifrost_receives_twice_the_final_k() {
         for final_k in [1, 7, 20] {
-            let args = json!({ "query": "needle", "k": final_k });
-            let (forwarded, base_k) = prepare_bifrost_args(&args, final_k);
+            let (forwarded, base_k) = prepare_bifrost_args("needle", final_k);
             assert_eq!(base_k, 2 * final_k);
             assert_eq!(forwarded["k"], 2 * final_k);
             assert_eq!(forwarded["query"], "needle");
-            assert_eq!(args["k"], final_k);
+            assert!(forwarded.get("queries").is_none());
         }
     }
 
@@ -1082,61 +1577,65 @@ mod tests {
     #[test]
     fn parses_relevant_object_and_rejects_non_json() {
         assert_eq!(
-            parse_selected_ids(r#"{"relevant":["s1","f2"]}"#),
-            Some(vec!["s1".to_string(), "f2".to_string()])
+            parse_selections(
+                r#"{"relevant":[{"id":"s1","declarations":["s1d1"]},{"id":"f2","declarations":[]}]}"#
+            ),
+            Some(vec![
+                Selection {
+                    id: "s1".to_string(),
+                    declarations: vec!["s1d1".to_string()]
+                },
+                Selection {
+                    id: "f2".to_string(),
+                    declarations: Vec::new()
+                }
+            ])
         );
-        assert_eq!(
-            parse_selected_ids("  {\"relevant\": []}  "),
-            Some(Vec::new())
-        );
+        assert_eq!(parse_selections("  {\"relevant\": []}  "), Some(Vec::new()));
         // Non-JSON / fenced output does not parse; the caller falls back to
         // raw passthrough.
+        assert_eq!(parse_selections("```json\n{\"relevant\": []}\n```"), None);
+        assert_eq!(parse_selections("no json here"), None);
+        assert_eq!(parse_selections(r#"{"relevant":["s1",3]}"#), None);
         assert_eq!(
-            parse_selected_ids("```json\n{\"relevant\": [\"s3\"]}\n```"),
-            None
-        );
-        assert_eq!(parse_selected_ids("no json here"), None);
-        assert_eq!(parse_selected_ids(r#"{"relevant":["s1",3]}"#), None);
-        assert_eq!(
-            parse_selected_ids(r#"{"relevant":[],"unexpected":true}"#),
+            parse_selections(r#"{"relevant":[],"unexpected":true}"#),
             None
         );
     }
 
     #[test]
-    fn order_candidates_preserves_model_order_and_drops_unknown() {
+    fn order_candidates_preserves_model_order_and_rejects_unknown() {
         let candidates = parse_candidates(&json!({
             "vector_ranked": [
                 { "fqfn": "a.B.c", "score": 0.9 },
                 { "fqfn": "a.B.d", "score": 0.5 }
             ]
         }));
-        let selected = vec![
-            "s2".to_string(),
-            "nope".to_string(),
-            "s1".to_string(),
-            "s2".to_string(),
-        ];
-        let ordered = order_candidates(&candidates, &selected, 20);
-        let names: Vec<&str> = ordered.iter().map(|c| c.name.as_str()).collect();
+        let selected = vec![selection("s2"), selection("s1")];
+        let ordered = order_candidates(&candidates, &selected, 20).unwrap();
+        let names: Vec<&str> = ordered
+            .iter()
+            .map(|selected| selected.candidate.name.as_str())
+            .collect();
         assert_eq!(names, vec!["a.B.d", "a.B.c"]);
+        assert!(order_candidates(&candidates, &[selection("nope")], 20).is_err());
+        assert!(order_candidates(&candidates, &[selection("s1"), selection("s1")], 20).is_err());
     }
 
     #[test]
-    fn valid_empty_fewer_and_overlong_selections_are_final() {
+    fn valid_empty_and_fewer_selections_are_final_but_overlong_is_invalid() {
         let candidates = parse_candidates(&json!({
             "vector_ranked": (0..6)
                 .map(|i| json!({ "fqfn": format!("item::{i}") }))
                 .collect::<Vec<_>>()
         }));
-        assert!(order_candidates(&candidates, &[], 3).is_empty());
+        assert!(order_candidates(&candidates, &[], 3).unwrap().is_empty());
 
-        let fewer = order_candidates(&candidates, &["s2".to_string()], 3);
+        let fewer = order_candidates(&candidates, &[selection("s2")], 3).unwrap();
         assert_eq!(fewer.len(), 1);
 
-        let selected: Vec<String> = (1..=6).map(|i| format!("s{i}")).collect();
-        let capped = order_candidates(&candidates, &selected, 3);
-        assert_eq!(capped.len(), 3);
+        let selected: Vec<Selection> = (1..=6).map(|i| selection(&format!("s{i}"))).collect();
+        assert!(order_candidates(&candidates, &selected, 3).is_err());
     }
 
     #[test]
@@ -1156,11 +1655,11 @@ mod tests {
         }));
         let first: Vec<&str> = rrf_fallback(&candidates, 2)
             .iter()
-            .map(|candidate| candidate.name.as_str())
+            .map(|candidate| candidate.candidate.name.as_str())
             .collect();
         let second: Vec<&str> = rrf_fallback(&candidates, 2)
             .iter()
-            .map(|candidate| candidate.name.as_str())
+            .map(|candidate| candidate.candidate.name.as_str())
             .collect();
         assert_eq!(first, vec!["both", "vector_only"]);
         assert_eq!(second, first);
@@ -1219,7 +1718,40 @@ mod tests {
             .as_deref()
             .expect("compact outline is attached");
         assert_eq!(context, "src/config.rs (42 lines)\n- Config\n  - load");
-        assert_eq!(available_context_bytes(&candidates), context.len());
+        assert_eq!(available_prompt_bytes(&candidates), context.len());
+    }
+
+    #[test]
+    fn public_locator_cards_use_classifier_selected_bifrost_signatures_only() {
+        let mut candidates = parse_candidates(&json!({
+            "coedit_ranked": [{ "path": "src/config.rs", "score": 1.0 }]
+        }));
+        attach_summaries(
+            &mut candidates,
+            &json!({
+                "summaries": [{
+                    "label": "src/config.rs",
+                    "path": "src/config.rs",
+                    "preamble": "PRIVATE_BODY_SENTINEL",
+                    "elements": [
+                        {"path":"src/config.rs","symbol":"load","kind":"function","start_line":10,"end_line":12,"text":"fn load(path: &Path) -> Config"},
+                        {"path":"src/config.rs","symbol":"save","kind":"function","start_line":20,"end_line":23,"text":"fn save(config: &Config)"}
+                    ]
+                }]
+            }),
+        );
+        bound_candidate_context(&mut candidates);
+        let selected = vec![Selection {
+            id: "f1".to_string(),
+            declarations: vec!["f1d2".to_string()],
+        }];
+        let ordered = order_candidates(&candidates, &selected, 20).unwrap();
+        let rendered = render_unified("configuration persistence", &ordered, 1, None, false);
+
+        assert!(rendered.contains("fn save(config: &Config)"));
+        assert!(!rendered.contains("fn load(path: &Path)"));
+        assert!(!rendered.contains("PRIVATE_BODY_SENTINEL"));
+        assert!(!rendered.contains("```"));
     }
 
     fn live_candidate(
@@ -1236,6 +1768,7 @@ mod tests {
             signals,
             location: None,
             context: Some(context.to_string()),
+            declarations: Vec::new(),
             rrf_score: 0.0,
             first_seen: 0,
         }
@@ -1292,7 +1825,7 @@ mod tests {
         let messages = vec![ChatMessage::user(prompt)];
         let structured = StructuredOutputRequest {
             schema_name: "semantic_rerank".to_string(),
-            schema: rerank_schema(),
+            schema: rerank_schema(20),
             allow_coercion: true,
             prefer_json_object: false,
         };
@@ -1327,22 +1860,33 @@ mod tests {
         };
         eprintln!("deepseek-v4-flash raw rerank response:\n{text}");
 
-        let selected = parse_selected_ids(&text).expect("response parses as {\"relevant\": [...]}");
+        let selected = parse_selections(&text).expect("response parses as {\"relevant\": [...]}");
         let valid: std::collections::HashSet<&str> =
             candidates.iter().map(|c| c.id.as_str()).collect();
         assert!(!selected.is_empty(), "expected at least one relevant id");
         assert!(
-            selected.iter().all(|id| valid.contains(id.as_str())),
+            selected
+                .iter()
+                .all(|selection| valid.contains(selection.id.as_str())),
             "all returned ids must be known candidate ids, got {selected:?}"
         );
         assert!(
-            selected.iter().any(|id| id == "s1" || id == "f1"),
+            selected
+                .iter()
+                .any(|selection| selection.id == "s1" || selection.id == "f1"),
             "expected a config-parsing candidate (s1/f1) to be judged relevant, got {selected:?}"
         );
         // The trivially-irrelevant UI button should not be selected.
         assert!(
-            !selected.iter().any(|id| id == "f2"),
+            !selected.iter().any(|selection| selection.id == "f2"),
             "did not expect the UI button file to be relevant, got {selected:?}"
         );
+    }
+
+    fn selection(id: &str) -> Selection {
+        Selection {
+            id: id.to_string(),
+            declarations: Vec::new(),
+        }
     }
 }

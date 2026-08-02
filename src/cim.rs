@@ -75,6 +75,9 @@ fn load_config(path: &Path) -> Result<CimConfig> {
     if parsed.k != CIM_FINAL_K {
         bail!("CIM semantic-search k must be exactly {CIM_FINAL_K}");
     }
+    if parsed.queries.len() > 3 {
+        bail!("CIM semantic queries must contain at most 3 entries");
+    }
     let mut seen = HashSet::new();
     for query in &parsed.queries {
         if query.trim().is_empty() {
@@ -98,16 +101,16 @@ fn load_config(path: &Path) -> Result<CimConfig> {
 pub(crate) fn synthetic_step(config: &CimConfig) -> ForcedStep {
     ForcedStep {
         assistant_text: String::new(),
-        tool_calls: config
-            .queries
-            .iter()
-            .enumerate()
-            .map(|(index, query)| PrefixToolCall {
-                id: format!("cim-step-0-query-{index:03}"),
+        tool_calls: if config.queries.is_empty() {
+            Vec::new()
+        } else {
+            vec![PrefixToolCall {
+                id: "cim-step-0-semantic-search".to_string(),
                 name: "semantic_search".to_string(),
-                arguments: serde_json::json!({ "query": query, "k": config.k }).to_string(),
-            })
-            .collect(),
+                arguments: serde_json::json!({ "queries": config.queries, "k": config.k })
+                    .to_string(),
+            }]
+        },
         message: None,
     }
 }
@@ -144,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_wrong_k_and_duplicate_queries() {
+    fn config_rejects_wrong_k_duplicate_and_overlong_queries() {
         let wrong_k = config_file(serde_json::json!({
             "schema_version": 1,
             "query_manifest_sha256": "abc",
@@ -170,6 +173,19 @@ mod tests {
                 .to_string()
                 .contains("unique")
         );
+
+        let too_many = config_file(serde_json::json!({
+            "schema_version": 1,
+            "query_manifest_sha256": "abc",
+            "k": 20,
+            "queries": ["one", "two", "three", "four"],
+        }));
+        assert!(
+            load_config(too_many.path())
+                .unwrap_err()
+                .to_string()
+                .contains("at most 3")
+        );
     }
 
     #[test]
@@ -182,13 +198,26 @@ mod tests {
                 "locate token refresh".to_string(),
             ],
         });
-        assert_eq!(step.tool_calls.len(), 2);
-        assert_eq!(step.tool_calls[0].id, "cim-step-0-query-000");
+        assert_eq!(step.tool_calls.len(), 1);
+        assert_eq!(step.tool_calls[0].id, "cim-step-0-semantic-search");
         assert_eq!(step.tool_calls[0].name, "semantic_search");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&step.tool_calls[0].arguments).unwrap(),
-            serde_json::json!({"query": "find auth flow", "k": 20})
+            serde_json::json!({
+                "queries": ["find auth flow", "locate token refresh"],
+                "k": 20
+            })
         );
+    }
+
+    #[test]
+    fn synthetic_step_with_no_queries_has_no_tool_call() {
+        let step = synthetic_step(&CimConfig {
+            query_manifest_sha256: "abc".to_string(),
+            k: 20,
+            queries: Vec::new(),
+        });
+        assert!(step.tool_calls.is_empty());
     }
 
     #[test]

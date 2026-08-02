@@ -688,19 +688,20 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 ///
 /// `semantic_search` results are transparently reranked by the harness (see
 /// `crate::semantic_rerank`), so the model receives a single relevance-ordered
-/// list of hits with source/summaries -- not bifrost's three raw ranked lists.
+/// query-local lists of signature locators -- not bifrost's three raw ranked lists.
 fn mcp_tool_description<'a>(name: &str, original: &'a str, cim_semantic_search: bool) -> &'a str {
-    const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Given a natural-language \
-        query, returns a single relevance-ordered list of symbols and files, each with its source \
-        or a summary. k is the maximum number of final relevance-reranked results. The reranker \
+    const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Accepts one to three \
+        natural-language queries and independently returns a relevance-ordered list of compact \
+        symbol/file locators with exact declaration signatures for each query. k is the maximum \
+        number of final relevance-reranked results per query. Each query has its own rerank and \
         may return fewer than k by design when fewer candidates are relevant.";
     const CIM_SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Prefer this for locating \
         source code by behavior, intent, concept, or symptom, especially in an unfamiliar area or \
-        when the task provides no exact path or symbol hook. Given a natural-language query, it \
-        returns a single relevance-ordered list of symbols and files, each with source or a \
-        summary. Use exact symbol or regex tools when the task already supplies a direct hook. k \
-        is the maximum number of final relevance-reranked results; the reranker may return fewer \
-        than k by design when fewer candidates are relevant.";
+        when the task provides no exact path or symbol hook. Given one to three distinct \
+        natural-language queries, it independently returns a relevance-ordered list of compact \
+        symbol/file locators with exact signatures for each query. Use exact symbol or regex \
+        tools when the task already supplies a direct hook. k is the maximum number of final \
+        relevance-reranked results per query; each reranker may return fewer than k by design.";
     const CIM_SEARCH_SYMBOLS: &str = "Find indexed declarations by exact or partial symbol name. \
         Prefer this when the task already supplies a class, function, method, field, module, or \
         other identifier; use semantic_search instead when you need to locate an implementation \
@@ -723,28 +724,31 @@ fn mcp_tool_description<'a>(name: &str, original: &'a str, cim_semantic_search: 
     }
 }
 
-fn mcp_tool_input_schema(name: &str, mut original: serde_json::Value) -> serde_json::Value {
+fn mcp_tool_input_schema(name: &str, original: serde_json::Value) -> serde_json::Value {
     if name != "semantic_search" {
         return original;
     }
-    let Some(properties) = original
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        tracing::warn!("semantic_search input schema has no properties object");
-        return original;
-    };
-    properties.insert(
-        "k".to_string(),
-        json!({
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 20,
-            "default": 20,
-            "description": "Maximum number of final relevance-reranked results. The reranker may return fewer than k by design when fewer candidates are relevant."
-        }),
-    );
-    original
+    json!({
+        "type": "object",
+        "properties": {
+            "queries": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": { "type": "string" },
+                "description": "One to three distinct, non-redundant natural-language code-search queries. Each query is retrieved and reranked independently."
+            },
+            "k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 20,
+                "description": "Maximum number of final relevance-reranked results per query. A reranker may return fewer than k by design when fewer candidates are relevant."
+            }
+        },
+        "required": ["queries"],
+        "additionalProperties": false
+    })
 }
 
 /// Unified tool registry: filesystem tools + shell + configured
@@ -2311,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_k_schema_is_overridden() {
+    fn semantic_search_batch_and_k_schema_are_overridden() {
         let schema = mcp_tool_input_schema(
             "semantic_search",
             json!({
@@ -2334,8 +2338,14 @@ mod tests {
                 .unwrap()
                 .contains("may return fewer than k by design")
         );
-        assert_eq!(schema["properties"]["query"]["type"], "string");
-        assert_eq!(schema["required"], json!(["query"]));
+        let queries = &schema["properties"]["queries"];
+        assert_eq!(queries["type"], "array");
+        assert_eq!(queries["minItems"], 1);
+        assert_eq!(queries["maxItems"], 3);
+        assert_eq!(queries["items"]["type"], "string");
+        assert!(schema["properties"].get("query").is_none());
+        assert_eq!(schema["required"], json!(["queries"]));
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
