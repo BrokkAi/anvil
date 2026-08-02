@@ -444,3 +444,11 @@ Benchmark reframed per owner: **vanilla-sol-on-anvil vs
 sol+luna-on-anvil**, both arms DR-off, 2 runs/arm with run 2 gated on
 run-1 sanity; the bar is the other arm, not the overfit mswe published
 numbers. Arm A (solo) run 1 launched.
+
+**Arm A run 1 (solo sol, new prompts, DR-off): 14/20, $3.75/task avg,
+1.6h sweep.** First outright dynamodb WIN of the campaign (37/37 f2p +
+p2p green, $9.98); bandit 88/88 and cliffy 37/37 replicate the probe
+wins; pebble 59/59. All six losses are hidden-suite near-misses
+(textual 19/20, cattrs 68/69, opa-template 4/5, opa-rego 22/25, psm
+67/72, sqlfmt 28/32). Cost sits at vanilla's published price with the
+full tool catalog. AAr2 launched at 20 threads; ABr1 mid-flight.
