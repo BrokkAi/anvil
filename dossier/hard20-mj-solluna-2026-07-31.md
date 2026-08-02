@@ -417,3 +417,12 @@ best arm. Probe knobs: BPR_INSTRUCTION_SUFFIX_FILE,
 BPR_AGENT_TOOL_ALLOWLIST (brokkbench, uncommitted at probe time).
 Latent harness bug found: without MJ_EITRI_MODEL the engine takes a
 legacy --thor CLI path that current mj rejects (exit 2, instant).
+
+**E3 (script + minimal catalog combined, same 3 tasks)**: bandit 86/88 F
+at 37 steps/$2.68; **cliffy 37/37 W — the first full cliffy pass of the
+campaign** — at 29 steps/$2.71; fd W at 53/$2.64. Grid summary (avg
+$/task, task-wins of 3): run8 $6.42, 1; E1 $3.39, 2; E2 $2.51, 1; E3
+$2.68, 2. Outcome differences between probe arms are within n=1
+hidden-suite variance (bandit 83-88/88 across arms; cliffy spans
+0, 36/37, 37/37); the cost differences are large and consistent. Every
+probe arm ran DR-off. Decision pending: full-20 of a probe arm.
