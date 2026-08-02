@@ -426,3 +426,21 @@ $2.68, 2. Outcome differences between probe arms are within n=1
 hidden-suite variance (bandit 83-88/88 across arms; cliffy spans
 0, 36/37, 37/37); the cost differences are large and consistent. Every
 probe arm ran DR-off. Decision pending: full-20 of a probe arm.
+
+### Prod generalization landed; internal A/B begins (2026-08-02)
+
+Plan approved and executed: anvil gains a default-on # Completion
+section (checklist-bounded episodes, no speculative re-verification),
+cross-type batching guidance, and update_plan batching (anvil
+`34895aa`); mj's review correction loop is bounded
+(max_correction_rounds default 1, verification-only re-reviews,
+mjolnir `3c528d3`, closes mj#535); the harness computes costUsd from
+usageByModel tokens (fail-to-None, never silent zero) and the fatal
+legacy --thor path is gone (brokkbench `32a53d3`). Snapshots: anvil
+0.24.2 `12b3909a`, mj 1.3.0 `27fa97af`. Smoke (fd, no MJ env pins):
+SUCCESS 43/43, 45 steps, costUsd $1.90 populated, 8m.
+
+Benchmark reframed per owner: **vanilla-sol-on-anvil vs
+sol+luna-on-anvil**, both arms DR-off, 2 runs/arm with run 2 gated on
+run-1 sanity; the bar is the other arm, not the overfit mswe published
+numbers. Arm A (solo) run 1 launched.
