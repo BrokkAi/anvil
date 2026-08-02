@@ -1853,7 +1853,7 @@ fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> Too
 pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
     tool_def(
         "update_plan",
-        "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time.",
+        "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time. Plan updates are bookkeeping: include this call in the same response as your next tool call rather than spending a response on it alone.",
         json!({
             "type": "object",
             "properties": {

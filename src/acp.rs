@@ -4990,7 +4990,8 @@ fn build_system_prompt(
         SessionMode::Lutz => {
             "\n- For meaningful multi-step work, use update_plan to keep a short current plan. Keep exactly one \
              step in_progress until the work is done, update the plan when the approach changes, and mark all \
-             steps completed before finishing. Skip plan overhead for simple tasks.\n"
+             steps completed before finishing. Send update_plan alongside your next tool call in the same \
+             response, never on its own. Skip plan overhead for simple tasks.\n"
         }
         SessionMode::Plan => "",
     };
@@ -5024,7 +5025,9 @@ the tool call in the same response, or deliver the final result.
 genuinely ambiguous.
 - Make independent tool calls in parallel in a single response; sequence a call only when it \
 depends on an earlier result. Batch related changes to the same file into one edit call with \
-multiple edit entries; do not edit the same file twice in one response.
+multiple edit entries; do not edit the same file twice in one response. When a mutation's \
+result will not change what you need next, include those independent reads in the same \
+response — an edit to one file can ride with the reads for the next.
 - Keep the user oriented during tool-heavy work. Before a non-trivial batch of tool calls or \
 when changing strategy, write one short visible sentence explaining the current goal and why \
 the next tools help. After significant tool results, briefly state what was learned and the \
@@ -5081,8 +5084,22 @@ the code force it to settle rather than set a flag no resumed loop will ever che
 claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
 could not verify, say so plainly.
 - If the same approach fails twice, stop and diagnose — re-read the file, question your \
-assumptions — rather than retrying blindly. Keep going until the task is resolved or you \
-are genuinely blocked on input only the user can provide.
+assumptions — rather than retrying blindly. Keep going until every checklist item is \
+verified, or you are genuinely blocked on input only the user can provide.
+
+# Completion
+
+- When you begin implementation work, fix the finish line first: the checklist of the user's \
+explicitly stated requirements. The task is resolved when each item is implemented and \
+verified; deliver the result and end your turn. Ending your turn is not abandonment — the \
+user continues the conversation from your report.
+- Do not re-verify what has already passed unless you changed something that could affect it \
+or new evidence casts doubt on it. Re-reading your own diff, re-running an already-green \
+suite, or re-inspecting completed work without such cause spends time without producing \
+information.
+- The checklist bounds speculation, not diligence: every stated requirement still gets its \
+verification pass; what stops is inventing unstated hardening and continuing to search for \
+improvements after the checklist is verified.
 
 # Tools
 
