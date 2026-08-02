@@ -1,6 +1,8 @@
 //! CIM evaluation-only synthetic semantic-search configuration.
 
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,6 +50,11 @@ pub(crate) fn load_config_from_env(
     if p2t_enabled || train_bifrost_enabled {
         bail!("{CIM_EVAL_ENV} cannot be combined with BRK_PATCHES_TO_TRACES or BRK_TRAIN_BIFROST");
     }
+    let path = config_path_from_env()?;
+    load_config(&path).map(Some)
+}
+
+fn config_path_from_env() -> Result<PathBuf> {
     let path = PathBuf::from(
         std::env::var(CIM_CONFIG_ENV)
             .with_context(|| format!("{CIM_CONFIG_ENV} must be set when {CIM_EVAL_ENV}=1"))?,
@@ -55,7 +62,25 @@ pub(crate) fn load_config_from_env(
     if !path.is_absolute() {
         bail!("{CIM_CONFIG_ENV} must be an absolute path");
     }
-    load_config(&path).map(Some)
+    Ok(path)
+}
+
+pub(crate) fn claim_synthetic_step() -> Result<bool> {
+    claim_synthetic_step_at(&config_path_from_env()?)
+}
+
+fn claim_synthetic_step_at(config_path: &Path) -> Result<bool> {
+    let claim_path = config_path.with_extension("step-0.claimed");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claim_path)
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to claim CIM step zero at {}", claim_path.display())),
+    }
 }
 
 fn load_config(path: &Path) -> Result<CimConfig> {
@@ -218,6 +243,16 @@ mod tests {
             queries: Vec::new(),
         });
         assert!(step.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn synthetic_step_claim_is_shared_across_fresh_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("cim-config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        assert!(claim_synthetic_step_at(&config).unwrap());
+        assert!(!claim_synthetic_step_at(&config).unwrap());
     }
 
     #[test]

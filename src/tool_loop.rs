@@ -1978,7 +1978,29 @@ pub(crate) async fn run(
         .snapshot(&session_id, registry.cwd())
         .await
         .is_some_and(|snapshot| snapshot.history.is_empty());
-    if let Some(config) = cim_config.as_ref().filter(|_| session_is_fresh) {
+    let cim_step_claimed = if cim_config.is_some() && session_is_fresh {
+        match crate::cim::claim_synthetic_step() {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                append_trace_record(serde_json::json!({
+                    "type": "cim_step_claim_error",
+                    "error": format!("{error:#}"),
+                }));
+                return LoopOutcome::setup_failure(format!(
+                    "BRK_CIM_EVAL could not claim synthetic step zero: {error:#}"
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    if cim_config.is_some() && session_is_fresh && !cim_step_claimed {
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_skipped",
+            "reason": "already_claimed",
+        }));
+    }
+    if let Some(config) = cim_config.as_ref().filter(|_| cim_step_claimed) {
         let step = crate::cim::synthetic_step(config);
         let calls = p2t::forced_step_to_tool_calls(&step);
         let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
