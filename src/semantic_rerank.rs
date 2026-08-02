@@ -287,6 +287,9 @@ async fn rerank_one_semantic_search(
             context_bytes: 0,
             selected_count: 0,
             final_count: 0,
+            signature_candidate_count: 0,
+            signature_locator_count: 0,
+            final_with_signature_count: 0,
             declaration_fallback_count: 0,
             fallback_reason: None,
             usage: TokenUsage::default(),
@@ -396,6 +399,18 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: 0,
                 final_count: ordered.len(),
+                signature_candidate_count: candidates
+                    .iter()
+                    .filter(|candidate| !candidate.declarations.is_empty())
+                    .count(),
+                signature_locator_count: candidates
+                    .iter()
+                    .map(|candidate| candidate.declarations.len())
+                    .sum(),
+                final_with_signature_count: ordered
+                    .iter()
+                    .filter(|selected| !selected.declarations.is_empty())
+                    .count(),
                 declaration_fallback_count: ordered
                     .iter()
                     .filter(|selected| selected.declaration_fallback)
@@ -463,6 +478,18 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: 0,
                 final_count: ordered.len(),
+                signature_candidate_count: candidates
+                    .iter()
+                    .filter(|candidate| !candidate.declarations.is_empty())
+                    .count(),
+                signature_locator_count: candidates
+                    .iter()
+                    .map(|candidate| candidate.declarations.len())
+                    .sum(),
+                final_with_signature_count: ordered
+                    .iter()
+                    .filter(|selected| !selected.declarations.is_empty())
+                    .count(),
                 declaration_fallback_count: ordered
                     .iter()
                     .filter(|selected| selected.declaration_fallback)
@@ -514,6 +541,18 @@ async fn rerank_one_semantic_search(
                 context_bytes,
                 selected_count: selected.len(),
                 final_count: ordered.len(),
+                signature_candidate_count: candidates
+                    .iter()
+                    .filter(|candidate| !candidate.declarations.is_empty())
+                    .count(),
+                signature_locator_count: candidates
+                    .iter()
+                    .map(|candidate| candidate.declarations.len())
+                    .sum(),
+                final_with_signature_count: ordered
+                    .iter()
+                    .filter(|selected| !selected.declarations.is_empty())
+                    .count(),
                 declaration_fallback_count: ordered
                     .iter()
                     .filter(|selected| selected.declaration_fallback)
@@ -550,6 +589,18 @@ async fn rerank_one_semantic_search(
         context_bytes,
         selected_count: selected.len(),
         final_count: ordered.len(),
+        signature_candidate_count: candidates
+            .iter()
+            .filter(|candidate| !candidate.declarations.is_empty())
+            .count(),
+        signature_locator_count: candidates
+            .iter()
+            .map(|candidate| candidate.declarations.len())
+            .sum(),
+        final_with_signature_count: ordered
+            .iter()
+            .filter(|selected| !selected.declarations.is_empty())
+            .count(),
         declaration_fallback_count: ordered
             .iter()
             .filter(|selected| selected.declaration_fallback)
@@ -787,22 +838,17 @@ async fn fetch_summary_context(
     if targets.is_empty() {
         return;
     }
-    match registry
-        .call_bifrost_tool_raw("get_summaries", json!({ "targets": targets }))
-        .await
-    {
-        Ok(value) => attach_summaries(candidates, &value),
-        Err(_) if targets.len() > 1 => {
-            for target in targets {
-                if let Ok(value) = registry
-                    .call_bifrost_tool_raw("get_summaries", json!({ "targets": [target] }))
-                    .await
-                {
-                    attach_summaries(candidates, &value);
-                }
-            }
-        }
-        Err(_) => {}
+    // Bifrost deliberately degrades an oversized aggregate summary to compact
+    // file outlines. That is useful for an interactive caller, but discards the
+    // structured declaration records this adapter needs for locator cards.
+    // Keep every request intrinsically small while retaining parallelism within
+    // the already bounded candidate batch.
+    let summaries = join_all(targets.iter().map(|target| {
+        registry.call_bifrost_tool_raw("get_summaries", json!({ "targets": [target] }))
+    }))
+    .await;
+    for value in summaries.into_iter().flatten() {
+        attach_summaries(candidates, &value);
     }
 }
 
@@ -1204,6 +1250,9 @@ struct RerankTrace<'a> {
     context_bytes: usize,
     selected_count: usize,
     final_count: usize,
+    signature_candidate_count: usize,
+    signature_locator_count: usize,
+    final_with_signature_count: usize,
     declaration_fallback_count: usize,
     fallback_reason: Option<&'a str>,
     usage: TokenUsage,
@@ -1263,6 +1312,9 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "context_bytes": trace.context_bytes,
         "reranker_selected_count": trace.selected_count,
         "selected_final_count": trace.final_count,
+        "structured_signature_candidate_count": trace.signature_candidate_count,
+        "structured_signature_locator_count": trace.signature_locator_count,
+        "selected_with_signature_count": trace.final_with_signature_count,
         "declaration_selection_fallback_count": trace.declaration_fallback_count,
         "fallback": trace.fallback_reason.is_some(),
         "fallback_reason": trace.fallback_reason,
