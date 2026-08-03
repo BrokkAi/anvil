@@ -34,6 +34,22 @@ const { actions = [] } = data.hero || {};
       )
     }
 
+    <aside class="install-panel anvil-panel anvil-panel--reverse" aria-labelledby="install-panel-title">
+      <header class="install-panel__header">
+        <a id="install-panel-title" href="install/">Install Anvil</a>
+        <span>Choose an installation method</span>
+      </header>
+      <div class="install-panel__tabs" role="tablist" aria-label="Installation method">
+        <button id="install-tab-curl" type="button" role="tab" aria-selected="true" aria-controls="install-panel-curl">Curl</button>
+      </div>
+      <div id="install-panel-curl" class="install-panel__command" role="tabpanel" aria-labelledby="install-tab-curl">
+        <code>curl -fsSL https://raw.githubusercontent.com/BrokkAi/anvil/refs/heads/master/install.sh | bash</code>
+        <button class="install-panel__copy" type="button" data-copy-install aria-label="Copy curl install command">
+          <span data-copy-label>Copy</span>
+        </button>
+      </div>
+    </aside>
+
     <ul class="hero-facts" aria-label="Anvil design principles">
       <li><span>Swappable</span><strong>Process, not library</strong></li>
       <li><span>Portable</span><strong>One executable</strong></li>
@@ -44,6 +60,24 @@ const { actions = [] } = data.hero || {};
   <AnvilForge />
 
 </section>
+
+<script>
+  const command = 'curl -fsSL https://raw.githubusercontent.com/BrokkAi/anvil/refs/heads/master/install.sh | bash';
+  const copyButton = document.querySelector<HTMLButtonElement>('[data-copy-install]');
+  const copyLabel = copyButton?.querySelector<HTMLElement>('[data-copy-label]');
+
+  copyButton?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      if (copyLabel) copyLabel.textContent = 'Copied';
+      window.setTimeout(() => {
+        if (copyLabel) copyLabel.textContent = 'Copy';
+      }, 1600);
+    } catch {
+      if (copyLabel) copyLabel.textContent = 'Select command';
+    }
+  });
+</script>
 
 <style>
   @layer starlight.user {
@@ -207,6 +241,117 @@ const { actions = [] } = data.hero || {};
       font-weight: var(--anvil-weight-semibold);
     }
 
+    .install-panel {
+      --install-command-surface: #1b242e;
+      --install-command-border: rgb(238 241 244 / 0.18);
+      --install-command-text: #eef1f4;
+      width: 100%;
+      max-width: 44rem;
+      margin: var(--anvil-space-10) 0 0;
+      color: var(--anvil-ink);
+      background: var(--anvil-line-strong);
+      font-family: var(--anvil-font-mono);
+    }
+
+    .install-panel::after {
+      background: color-mix(in srgb, var(--anvil-surface-raised) 96%, transparent);
+    }
+
+    .install-panel__header {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--anvil-space-4);
+      padding: var(--anvil-space-5) var(--anvil-space-6) var(--anvil-space-4);
+    }
+
+    .install-panel__header a {
+      color: var(--anvil-ink);
+      font-size: var(--anvil-text-lg);
+      font-weight: var(--anvil-weight-bold);
+      letter-spacing: var(--anvil-tracking-wider);
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .install-panel__header span {
+      color: var(--anvil-muted);
+      font-size: var(--anvil-text-xs);
+      letter-spacing: var(--anvil-tracking-wide);
+      text-transform: uppercase;
+    }
+
+    .install-panel__tabs {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      padding-inline: var(--anvil-space-6);
+      border-top: 1px solid var(--anvil-line);
+    }
+
+    .install-panel__tabs button {
+      padding: var(--anvil-space-3) var(--anvil-space-1) calc(var(--anvil-space-3) - 2px);
+      border: 0;
+      border-bottom: 2px solid var(--anvil-cobalt);
+      background: transparent;
+      color: var(--anvil-cobalt);
+      cursor: default;
+      font: inherit;
+      font-size: var(--anvil-text-xs);
+      font-weight: var(--anvil-weight-bold);
+      letter-spacing: var(--anvil-tracking-widest);
+      text-transform: uppercase;
+    }
+
+    .install-panel__command {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      border-top: 1px solid var(--install-command-border);
+      background: var(--install-command-surface);
+    }
+
+    .install-panel__command code {
+      display: block;
+      min-width: 0;
+      padding: var(--anvil-space-5) var(--anvil-space-6);
+      overflow: hidden;
+      color: var(--install-command-text);
+      font-size: var(--anvil-text-base);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .install-panel__copy {
+      min-width: 6.5rem;
+      padding: var(--anvil-space-4) var(--anvil-space-5);
+      border: 0;
+      border-inline-start: 1px solid var(--install-command-border);
+      background: var(--install-command-surface);
+      color: color-mix(in srgb, var(--anvil-cobalt) 72%, white);
+      cursor: pointer;
+      font: inherit;
+      font-size: var(--anvil-text-xs);
+      font-weight: var(--anvil-weight-bold);
+      letter-spacing: var(--anvil-tracking-widest);
+      text-transform: uppercase;
+    }
+
+    .install-panel__copy:hover,
+    .install-panel__copy:focus-visible {
+      background: color-mix(in srgb, var(--anvil-cobalt) 18%, transparent);
+    }
+
+    @media (width >= 62rem) {
+      .install-panel {
+        width: calc(196% + clamp(var(--anvil-space-8), 5vw, var(--anvil-space-24)));
+        max-width: none;
+      }
+    }
+
     @media (width < 62rem) {
       .anvil-hero { grid-template-columns: 1fr; min-height: auto; padding-top: 4rem; }
       .hero-copy { max-width: 47rem; }
@@ -217,6 +362,22 @@ const { actions = [] } = data.hero || {};
       .anvil-hero h1 { font-size: var(--anvil-text-display-hero-sm); }
       .hero-facts { grid-template-columns: 1fr; }
       .hero-facts li + li { padding-inline-start: 0; border-inline-start: 0; border-top: 1px solid var(--anvil-line); }
+      .install-panel__header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: var(--anvil-space-2);
+        padding: var(--anvil-space-4);
+      }
+      .install-panel__tabs { padding-inline: var(--anvil-space-4); }
+      .install-panel__command { grid-template-columns: 1fr; }
+      .install-panel__command code { padding: var(--anvil-space-4); }
+      .install-panel__copy {
+        width: 100%;
+        min-height: 2.75rem;
+        border-top: 1px solid var(--install-command-border);
+        border-inline-start: 0;
+        text-align: start;
+      }
     }
   }
 </style>
