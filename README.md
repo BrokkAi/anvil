@@ -43,7 +43,20 @@ custom TUI  --------------------------------------->  tools + sessions
 
 ## Install and Evaluate
 
-Download a checksum-verified binary from [GitHub Releases](https://github.com/BrokkAi/anvil/releases/latest), or install from crates.io:
+Install the released native binary through npm:
+
+```bash
+npm install -g @brokkai/anvil
+anvil --version
+```
+
+Run the same release once without a global installation:
+
+```bash
+npx -y @brokkai/anvil --version
+```
+
+You can also download a checksum-verified binary from [GitHub Releases](https://github.com/BrokkAi/anvil/releases/latest), or install from crates.io:
 
 ```bash
 rustup target add wasm32-wasip2

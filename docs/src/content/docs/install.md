@@ -5,6 +5,30 @@ description: Install a released Anvil binary, use Cargo, or build from source.
 
 Anvil runs as a subprocess launched by an ACP client. Prefer a released binary when evaluating it: this avoids a large Rust and Wasmtime compile.
 
+## Install With npm
+
+Install the released native `anvil` executable globally:
+
+```bash
+npm install -g @brokkai/anvil
+anvil --version
+```
+
+For one-shot use without a global installation:
+
+```bash
+npx -y @brokkai/anvil --version
+```
+
+Pin an exact Anvil release by adding its version after the package name. Use
+`npm update -g @brokkai/anvil` to upgrade and
+`npm uninstall -g @brokkai/anvil` to remove a global installation. npm and npx
+install the existing native release binary; they do not compile Anvil or
+download the Anvil executable on first run.
+
+The npm package supports Linux x86-64 and ARM64, Android ARM64, Windows x86-64,
+and universal macOS. The installed command is `anvil` on every platform.
+
 ## Prebuilt Release
 
 Download the archive and matching `.sha256` sidecar from the [latest GitHub release](https://github.com/BrokkAi/anvil/releases/latest).

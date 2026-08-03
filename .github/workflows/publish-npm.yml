@@ -1,0 +1,157 @@
+name: Build and publish npm packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Anvil GitHub release tag to package
+        required: true
+        type: string
+      publish:
+        description: Publish after building and smoke-testing
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  npm:
+    name: npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out npm packaging tooling
+        uses: actions/checkout@v6
+
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          path: release-source
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify release version
+        id: version
+        shell: bash
+        run: |
+          version="${{ inputs.tag }}"
+          version="${version#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' release-source/Cargo.toml | head -1)"
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "Tag version ($version) does not match Cargo.toml ($manifest_version)" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download release bundles and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir artifacts
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts \
+            --pattern 'brokk-anvil-*.zip' \
+            --pattern 'brokk-anvil-*.zip.sha256'
+
+      - name: Verify release checksums
+        shell: bash
+        working-directory: artifacts
+        run: |
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+
+      - name: Extract release bundles
+        id: bundles
+        shell: bash
+        run: |
+          mkdir -p bundles/{android-arm64,darwin-universal,linux-arm64,linux-x64,win32-x64}
+          unzip -q artifacts/*-aarch64-linux-android.zip -d bundles/android-arm64
+          unzip -q artifacts/*-universal-apple-darwin.zip -d bundles/darwin-universal
+          unzip -q artifacts/*-aarch64-unknown-linux-gnu.zip -d bundles/linux-arm64
+          unzip -q artifacts/*-x86_64-unknown-linux-gnu.zip -d bundles/linux-x64
+          unzip -q artifacts/*-x86_64-pc-windows-msvc.zip -d bundles/win32-x64
+
+          for platform in android-arm64 darwin-universal linux-arm64 linux-x64 win32-x64; do
+            bundle="$(find "bundles/$platform" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+            if [[ -z "$bundle" ]]; then
+              echo "No extracted release bundle found for $platform" >&2
+              exit 1
+            fi
+            echo "${platform//-/_}=$bundle" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Build npm tarballs
+        shell: bash
+        run: |
+          node npm/scripts/build-packages.mjs \
+            --version "${{ steps.version.outputs.value }}" \
+            --output-dir dist/npm \
+            --repository-root release-source \
+            --bundle "android-arm64=${{ steps.bundles.outputs.android_arm64 }}" \
+            --bundle "darwin-universal=${{ steps.bundles.outputs.darwin_universal }}" \
+            --bundle "linux-arm64=${{ steps.bundles.outputs.linux_arm64 }}" \
+            --bundle "linux-x64=${{ steps.bundles.outputs.linux_x64 }}" \
+            --bundle "win32-x64=${{ steps.bundles.outputs.win32_x64 }}"
+
+      - name: Smoke-test root and native package
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          install_root="$RUNNER_TEMP/anvil-npm-smoke"
+          root_package="$install_root/node_modules/@brokkai/anvil"
+          native_package="$install_root/node_modules/@brokkai/anvil-linux-x64"
+          mkdir -p "$root_package" "$native_package"
+          tar -xzf "dist/npm/brokkai-anvil-${version}.tgz" -C "$root_package" --strip-components=1
+          tar -xzf "dist/npm/brokkai-anvil-linux-x64-${version}.tgz" -C "$native_package" --strip-components=1
+          node "$root_package/bin/anvil.js" --version | grep -Fx "anvil $version"
+          test -x "$native_package/vendor/x86_64-unknown-linux-gnu/anvil"
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@v7
+        with:
+          name: brokkai-anvil-npm-${{ steps.version.outputs.value }}
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+      - name: Publish platform packages
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          publish_package() {
+            local name="$1"
+            local tarball="$2"
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "${name}@${version} is already published"
+              return
+            fi
+            npm publish "dist/npm/$tarball" --access public
+          }
+          publish_package @brokkai/anvil-android-arm64 "brokkai-anvil-android-arm64-${version}.tgz"
+          publish_package @brokkai/anvil-darwin-universal "brokkai-anvil-darwin-universal-${version}.tgz"
+          publish_package @brokkai/anvil-linux-arm64 "brokkai-anvil-linux-arm64-${version}.tgz"
+          publish_package @brokkai/anvil-linux-x64 "brokkai-anvil-linux-x64-${version}.tgz"
+          publish_package @brokkai/anvil-win32-x64 "brokkai-anvil-win32-x64-${version}.tgz"
+
+      - name: Publish root package last
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          if npm view "@brokkai/anvil@${version}" version >/dev/null 2>&1; then
+            echo "@brokkai/anvil@${version} is already published"
+          else
+            npm publish "dist/npm/brokkai-anvil-${version}.tgz" --access public
+          fi
+          npm view @brokkai/anvil dist-tags --json
