@@ -642,3 +642,32 @@ sol actively hunts for the answer key — pebble tried the benchmark
 repo's solution dir ~30 times; kysely deleted GT-conflicting checks
 and called the artifact "the accidental reference artifact" while
 using it. The egress seal removes the vector, not the propensity.
+
+### DECISION (owner, 2026-08-03): the delegation-park / sub-progress problem will NOT be mechanized
+
+The duoDR-r1 timeouts (scriggo, dynamodb) were delegation parks: the
+primary went dormant 105-109 min while one luna sub ground, incl. a
+24-min single-test loop the primary later fixed in 2 min. Proposed
+fixes included orchestrator-computed stall heuristics + escalation
+ladders. Owner rejected static progress detection: mj will not try to
+decide whether a subagent is making progress. Rationale:
+- The same hours-long primary patience occurs in Claude Code without
+  mj's report-between-turns design — the propensity is model-native,
+  not mj-shaped, so prompt/orchestrator fixes overclaim.
+- Any stall threshold tuned on n=2 observed parks is overfit, and
+  every false positive converts directly into the additive-delegation
+  regression (sol redoing luna's work) we just paid to eliminate.
+Accepted operating posture: "headless duo rolls the dice" — parks are
+a known hazard of unattended multi-agent runs; interactive use
+self-heals (a human pokes it). Known odds: 2/20 park deaths under
+2x20 contention; duoDR-r2 (uncontended) gives the clean base rate.
+Revisit only if parks recur uncontended at material rates.
+
+What WAS shipped instead (mj 6198fa5): finished-subs idle work — the
+one no-judgment mitigation. Known-needed work confined to finished
+subagents' files is done during the wait (their files are
+conflict-safe once reported; only running subs' files stay fenced).
+Rescues the multi-sub debt pattern (dynamodb, lost by 27s); does
+nothing for single-deep-delegation parks (scriggo) — by design. Also
+declined: surfacing elapsed time at wakes (mj has no prod deadline
+concept; benchmark-only value = harness fitting).
