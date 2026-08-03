@@ -5,6 +5,23 @@ description: Install a released Anvil binary, use Cargo, or build from source.
 
 Anvil runs as a subprocess launched by an ACP client. Prefer a released binary when evaluating it: this avoids a large Rust and Wasmtime compile.
 
+## Homebrew
+
+Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)
+on macOS (Apple Silicon and Intel) or Linux (x86-64 and ARM64 glibc):
+
+```bash
+brew tap brokkai/tap
+brew install anvil
+anvil --version
+```
+
+The formula downloads the release archive for your platform and verifies its
+published SHA-256 checksum. Upgrade with `brew upgrade anvil` and uninstall
+with `brew uninstall anvil`. The tap regenerates its formulae from tagged
+releases on a schedule, so upgrades follow new Anvil releases automatically.
+For Windows, musl-based Linux, or Android, use the methods below.
+
 ## Install Script
 
 Install the released binary with the install script:
