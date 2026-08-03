@@ -34,10 +34,15 @@ use crate::structured_output::StructuredOutputRequest;
 pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 120;
 
 /// Default value for `--llm-stall-timeout-secs`: the maximum gap between
-/// meaningful chunks after the first progress event has arrived. A stalled
-/// stream is dead weight — the request is retried from scratch either way, so
-/// this is a detection budget, not a patience budget.
-pub const DEFAULT_INTER_CHUNK_TIMEOUT_SECS: u64 = 30;
+/// meaningful chunks after the first progress event has arrived.
+///
+/// 30s was tried and reverted: a benchmark sweep showed ~11 stall-aborts per
+/// task, which looked like a provider defect worth detecting faster. The
+/// stalls turned out to be an artifact of that sweep's sealed container
+/// network (0.8/task unsealed vs 10.9/task sealed, same 60s budget). At 30s
+/// on a healthy network the abort rate tripled against 60s with nothing left
+/// to detect, and every abort costs a full request retry.
+pub const DEFAULT_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
 
 /// Lower bound for the LLM stream timeout CLI flags and the `/idle-timeout`
 /// slash command. 0 would mean "abort instantly", which is never useful.
