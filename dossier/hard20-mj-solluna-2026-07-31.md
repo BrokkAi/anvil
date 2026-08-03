@@ -877,3 +877,29 @@ CAVEAT for analysis: r3/r4 differ from r2 by THREE things at once
 (owner's review change, my review prompts, fixed networking). They
 support a clean DR-on-now vs DR-off(ab2) comparison, NOT an r3-vs-r2
 review-upgrade comparison.
+
+### RETRACTION: the "luna stall epidemic" was a sealed-network artifact
+
+Stall-aborts per archived task, `grep -c 'stalled mid-stream'`:
+
+| run | network | budget | aborts/task |
+|---|---|---|---|
+| duoDR-r1 | unsealed | 60s | **0.8** |
+| duoDR-r2 + requeues | **SEALED** | 60s | **10.9** |
+| duoDR-r3 | unsealed (blocked_hosts) | 30s | **2.4** |
+
+My finding "98 of 99 stalls were luna, ~37% of luna requests" came
+from the r2b/r2c requeue runs, which were ALL sealed. Unsealed, the
+same config stalls 13x less. Presumed mechanism: blocked outbound
+attempts hang until the inter-chunk deadline. Luna is not the
+problem; my seal was.
+
+Consequence: anvil 9d79a27 (60s -> 30s) was aimed at a phantom, and
+on a healthy network it TRIPLED the abort rate (2.4 vs 0.8) with
+nothing left to detect — every abort re-runs a whole request.
+Reverted in anvil 67a89c6, with the measurement recorded in the
+constant's doc comment so it is not re-tried.
+
+NOTE: the musl binary was deliberately NOT rebuilt while duoDR-r3/r4
+are in flight, so both seeds stay internally consistent at 30s. The
+revert lands in the next build.
