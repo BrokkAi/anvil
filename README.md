@@ -47,7 +47,8 @@ Install with Homebrew on macOS (Apple Silicon and Intel) or Linux (x86-64 and
 ARM64 glibc):
 
 ```bash
-brew install brokkai/tap/anvil
+brew tap brokkai/tap
+brew install anvil
 anvil --version
 ```
 
