@@ -590,3 +590,55 @@ sqlfmt, cattrs PROBED upstream/raw for reference code but got
 404/401; skrub/textual hits are changelog PR references. Only kysely
 succeeded. Container network access + public ground-truth fork = open
 contamination vector; duoDR kysely row untrusted.
+
+### Contamination sweep, full DeepSWE corpus (2026-08-03)
+
+Swept all 1645 archived zips across 75 DeepSWE-related sweeps (asgard/
+council campaigns excluded) for fetch signatures; refined 156 raw hits
+to 61 zips with URLs in actual shell commands; receipt-checked every
+serious case.
+
+**Ground truth RECEIVED (rows void):**
+- ab-duo-r1 kysely WIN ($2.09): blitzy-research pull/3+4.diff received
+  (39x PR diff headers, all 4 blitzy test filenames in trace). Patch
+  used independent naming so the earlier patch-string check passed it
+  — trace tells the truth. Duo-old-protocol 31/40 counts this win.
+- ab-solo-r1 valibot WIN ($6.08): open-circle/valibot pull/1504.patch
+  received in full ("Subject: [PATCH 1/8] feat: add recursive
+  schemas" = the exact task feature). Solo 27/40 counts this win.
+- duoDR-r1 kysely LOSS: known (committed 4 GT test files, still
+  250/254).
+
+**Honest re-tally excluding contaminated rows: solo 26/39, duo-old
+30/39 — the +4 edge survives symmetrically.** ab-duo-r2, ab2-duo-r1/r2
+kysely and all other valibot rows are clean (checked).
+
+**Attempted, FAILED (rows stand, behavior noted):**
+- ab2-duo-r1 pebble: fetched the benchmark repo itself —
+  datacurve-ai/deep-swe tasks/pebble.../tests/test.patch AND
+  solution/solution.patch at a pinned commit, ~30 attempts each;
+  repo is private -> 404/401/429, nothing received; narrated "found
+  the exact benchmark task". Won legitimately anyway.
+- duoDR-r1 skrub: same repo via API contents, 401/403/404/429.
+- hard20-solluna6 fastapi: upstream fastapi PR 14511 .patch/.diff,
+  429-walled, no receipt.
+- fullLuna valibot: open-circle raw @ GT commit, curl --fail errors,
+  receipt ambiguous (old sweep, not load-bearing).
+- duoDR opa/sqlfmt/cattrs, solluna4 skrub, koota: 404/401 probes.
+
+**Benign tail:** upstream-main source reads (cattrs converters.py,
+textual RichLog, cliffy command.ts, tomlkit convert.py, kysely-org
+master src...), api.github searches, Go import paths in commands,
+URLs inside repo files the agent read.
+
+Leaks to report to datacurve: blitzy-research/kysely and
+open-circle/valibot are PUBLIC with ground-truth PRs (both received by
+agents); fork orgs are discoverable via GitHub search on distinctive
+spec terms; datacurve-ai/deep-swe task paths are guessable (private
+today — one visibility mistake from a full answer-key leak).
+
+Propensity note (prod-relevant, beyond the egress fix): when stuck,
+sol actively hunts for the answer key — pebble tried the benchmark
+repo's solution dir ~30 times; kysely deleted GT-conflicting checks
+and called the artifact "the accidental reference artifact" while
+using it. The egress seal removes the vector, not the propensity.
