@@ -803,3 +803,46 @@ one-sided and was on the agent's screen.
 directly): obsidian r1 review was clean with no correction round;
 sqlfmt r1's correction fixed an unrelated Jinja bug while the
 spacing was already right. Treat DR's value as UNPROVEN.
+
+### duoDR-r2 FINAL (run-to-completion) + fixes landed 2026-08-03
+
+dynamodb requeue @10800s: LOSS on merit (21/37 f2p, p2p 1267/1267,
+170 min, $3.04, no timeout) — checked for seal damage, clean: zero
+registry/DNS failures in trace, verifier ran normally. So the raised
+cap converted dynamodb from timeout to honest loss.
+
+duoDR-r2 at the raised cap: 13 (capped) + scriggo W + cliffy W
++ opa-template L + dynamodb L = **15/20 raw**, but obsidian is VOID
+(seal killed the grader) and opa-template's loss is seal-tainted
+(never compiled). Honest read: **15/18 on tasks that were actually
+measurable**, vs DR-off's 14/20 complete (ab2-duo-r1, zero timeouts).
+Requeue scorecard: 2 of 4 timeouts were pure clock deaths, 2 were
+real losses hiding behind the cap.
+
+FIXES LANDED:
+- anvil 9d79a27: stall detection 60s -> 30s
+  (DEFAULT_INTER_CHUNK_TIMEOUT_SECS). Deadline resets per meaningful
+  chunk, so this only shortens DEAD-stream detection; 98/99 observed
+  stalls were luna. --llm-stall-timeout-secs still overrides.
+- brokkbench 675314114b0: seal -> blocked_hosts denylist. Normal
+  networking + --add-host <github family>:127.0.0.1 (github.com, www,
+  api, raw, codeload, gist, gist.githubusercontent,
+  objects.githubusercontent, raw.githack, rawcdn.githack).
+  BPR_NETWORK=open escapes; BPR_BLOCKED_HOSTS extends/(empty)
+  disables; 'sealed' aliases. netbridge/SNI bridge deleted;
+  host_loopback_ports (cimeval/sceval) unchanged. Live check on a
+  real task image: GitHub rc=7, npm 200, go fetch OK, DNS OK, all 6
+  Bedrock endpoints reachable.
+  CAUGHT IN REVIEW: codex deleted container_egress_allow_hosts but
+  left deepswe_agent_engine.py importing it — `import
+  deepswe_agent_engine` raised ImportError, i.e. EVERY duoDR run
+  would have died at startup. py_compile does not resolve imports
+  and codex never ran the deepswe tests. Fixed by hand.
+  (Pre-existing, unrelated: test_harness_cost_prices_usage_by_model
+  fails at HEAD too — a deepseek entry in the pricing table breaks a
+  rejects-unknowns assertion.)
+
+NEXT: health-check seed on the fixed stack (blocked_hosts + 30s
+stall) to confirm bifrost/lane MCP tooling returns to the review
+supervisor, before any denoising spend. Outstanding: DR-off dynamodb
+requeue still running on the OLD sealed config (provisional).
