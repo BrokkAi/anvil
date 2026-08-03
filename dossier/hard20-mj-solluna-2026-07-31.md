@@ -846,3 +846,34 @@ NEXT: health-check seed on the fixed stack (blocked_hosts + 30s
 stall) to confirm bifrost/lane MCP tooling returns to the review
 supervisor, before any denoising spend. Outstanding: DR-off dynamodb
 requeue still running on the OLD sealed config (provisional).
+
+### DR-off grid closed; two DR-on seeds launched on the fixed stack (2026-08-03)
+
+ab2-duo-r2 dynamodb requeue @10800s: **TIMED OUT AGAIN** (180 min, no
+result, cost recorded $0). Checked for seal damage: clean — zero
+registry/DNS failures in trace, no npm fetches at all. So dynamodb is
+a genuine loss for DR-off at 1.5x budget, while DR-ON finished the
+same task in 170 min (losing on merit, 21/37). Counting it as a loss:
+
+**DR-off run-to-completion: ab2-duo-r1 14/20 (zero timeouts) +
+ab2-duo-r2 13/20 = 27/40.**
+**DR-on run-to-completion: duoDR-r2 15/20 raw (15/18 measurable —
+obsidian void, opa-template seal-tainted); duoDR-r1 13/20 + 2
+un-requeued timeouts.**
+
+Seeds duoDR-r3 / duoDR-r4 launched (10800s, 20 threads, r4 auto-fires
+at r3 >= 17/20 resolved) on:
+- anvil musl 37c44b68 (30s stall detection)
+- mj musl 83a6160d @ merged HEAD 9d1609b = my a0b1820 (oracle review)
+  + 6198fa5 (park-eligible work) + OWNER'S 92e6e7d ("use analyze_diff
+  file changes in review", 394 lines in discrete_review.rs)
+- brokkbench 675314114b0 (blocked_hosts denylist)
+Verified live in an r3 container: all 10 GitHub hosts -> 127.0.0.1,
+registry.npmjs.org resolves to a real address, pasta flags plain (no
+-o 127.0.0.1). mj HEAD tests green except the documented
+roster::auto_misses flake (passes isolated).
+
+CAVEAT for analysis: r3/r4 differ from r2 by THREE things at once
+(owner's review change, my review prompts, fixed networking). They
+support a clean DR-on-now vs DR-off(ab2) comparison, NOT an r3-vs-r2
+review-upgrade comparison.
