@@ -671,3 +671,53 @@ Rescues the multi-sub debt pattern (dynamodb, lost by 27s); does
 nothing for single-deep-delegation parks (scriggo) — by design. Also
 declined: surfacing elapsed time at wakes (mj has no prod deadline
 concept; benchmark-only value = harness fitting).
+
+### duoDR-r2 + run-to-completion scoring (2026-08-03)
+
+duoDR-r2: oracle-mandate review (mj a0b1820: external-oracle literals,
+bounded coverage-gap suggestions, P2/P3 -> Advisory tier that cannot
+arm a correction round) + sealed egress, uncontended, 20 threads.
+Raw at the 7200s cap: 13/20, elapsed 14485s, FOUR timeouts (cliffy,
+dynamodb, scriggo, opa-template-on-retry) vs r1's two.
+
+**Owner's frame: accept slower solves for better results** — timeouts
+are a cap artifact, not a result, so they get requeued at 10800s
+(1.5x) and the requeue is the task's score. Requeue outcomes:
+- scriggo 48/48 WIN, 120 min, $16.12 (r1 autopsy said 8s short — held)
+- cliffy 37/37 WIN, 136 min, $4.99 — also resolved the getConfigValues
+  filtered-vs-raw ambiguity six prior runs missed
+- opa-template 4/5 LOSS on merit, 134 min — real assertion failure on
+  nested template strings, NOT the name-collision build break; extra
+  clock converted a timeout into an honest near-miss
+- dynamodb: in flight (hit the headless hang on attempt 1)
+
+Run-to-completion grid:
+
+| run | at 7200s | complete |
+|---|---|---|
+| DR-off r1 (ab2) | 14/20, zero timeouts | **14/20** |
+| DR-off r2 (ab2) | 13/20 + dynamodb TO | 13 or 14 (requeue in flight) |
+| DR-on r1 | 13/20 + 2 TO | 13-15, never requeued (old prompts) |
+| DR-on r2 | 13/20 + 4 TO | **15** or 16 |
+
+DR's best complete run 15-16/20 vs DR-off's 14/20 (+1 to +2 per 20).
+At the CAPPED budget the same arms read 26/40 vs 27/40 — parity — so
+the cap was systematically punishing the arm that takes the most
+timeouts. Opus seat cost ~$0.92/task (~22% of spend). Caveat: n=2 per
+arm, and DR-on r1 remains incomplete.
+
+The r2 review upgrade did not visibly move outcomes: psm's first-ever
+win came with a pass-0 clean verdict and zero findings (variance, not
+oracle); obsidian and sqlfmt, r1 review conversions, regressed to
+losses. Review value still reads ~+1/run with high per-task churn.
+
+**mj bug found (filed anvil#339, belongs in BrokkAi/mjolnir):**
+headless never exits when `subagent_cancel` claims the last
+outstanding report. `SubagentReportBus.pending` gates shutdown
+(headless.rs:533) and is decremented only in the orchestrator's
+injection batch (orchestrator.rs:486); a claimed report
+(subagent.rs:862) is never injected, so if it is the last one the
+counter never reaches 0 and the process hangs until the harness
+SIGKILLs it ~90 min later. Pre-existing (3-5 occurrences per ab2 run
+on 994bb619, DR off; 4/20 in duoDR-r2; 0/20 in duoDR-r1). Costs a
+wasted attempt + ~1.5h wall each; outcomes survive via retry.
