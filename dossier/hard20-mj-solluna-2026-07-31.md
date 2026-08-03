@@ -721,3 +721,85 @@ counter never reaches 0 and the process hangs until the harness
 SIGKILLs it ~90 min later. Pre-existing (3-5 occurrences per ab2 run
 on 994bb619, DR off; 4/20 in duoDR-r2; 0/20 in duoDR-r1). Costs a
 wasted attempt + ~1.5h wall each; outcomes survive via retry.
+
+### CORRECTION (2026-08-03): the egress seal damaged duoDR-r2; r2 is not a clean measurement
+
+My container-egress seal (brokkbench f2f3c9aa659) blocked package
+registries and DNS, not just GitHub. My "task images are hermetic"
+claim was WRONG — I sampled scriggo/dynamodb/skrub/tengo and
+generalized; obsidian needs npm mid-run and the VERIFIER needs the
+registry at grade time. Confirmed damage in duoDR-r2:
+
+- **obsidian: VOID, not a loss.** f2p 0/33 AND p2p 0/1133 — no logic
+  bug fails 100% of pre-existing tests. verifier-output.txt:
+  `npm error request to https://registry.npmjs.org/jest failed,
+  reason: getaddrinfo EAI_AGAIN`. Mid-run `npm ci` (which SUCCEEDED
+  in r1, "added 880 packages") failed and wiped node_modules; every
+  offline recovery failed (ENOTCACHED, ERR_PNPM_NO_OFFLINE_TARBALL).
+- **opa-template requeue 4/5: infra-tainted.** 171 trace hits for
+  `dial tcp: lookup proxy.golang.org ... i/o timeout`, no module
+  cache, no vendor: NOT ONE LINE of its 297-line AST rewriter or its
+  4 tests ever executed. Its nested-template test fixture was
+  hand-transcribed "based on compiler test shape" instead of real
+  compiler output. Retract my earlier "extra clock converted it into
+  an honest near-miss" — it lost because it could not test.
+- **cliffy: ~70 min wasted.** 19 `deno check/test` calls × 40s DNS
+  timeouts; subagents used hand-written shims; the primary found
+  DENO_DIR=/deno-cache at 12:14 and had the real suite green by
+  12:16. Won anyway at 10800s.
+- **review tooling degraded corpus-wide**: bifrost symbol-tool calls
+  48 across 18 tasks (r1) -> 12 across 9 (r2); tool Failed 10 -> 25;
+  4 `call_review_subagents` dispatches rejected. Supervisors said so
+  in plain text ("not in the current catalog"), yet the workflow
+  still recorded `outcome: clean, coverage: complete`.
+
+Diagnostic: container-internal loopback + resolv.conf are FINE under
+the seal (tested directly), so the review-MCP failure is bifrost
+needing network, not the HTTP transport.
+
+FIX (not deny-all): allowlist package registries (registry.npmjs.org,
+pypi.org, files.pythonhosted.org, proxy.golang.org, sum.golang.org,
+crates.io, static.crates.io) + working DNS, keep github.com /
+raw.githubusercontent.com / api.github.com blocked. Ground truth
+lives in GitHub PRs, not registries. Residual: proxy.golang.org can
+serve a GitHub-hosted module by path (narrow, Go-only).
+
+### Other findings from the r2 trace sweep (ranked, pre-seeding)
+
+P1 **luna 60s stream stalls dominate wall clock**: 99 stalls across
+the two requeue runs, 98 on luna, 37% of luna requests in cliffy.
+Luna median latency 51.9s vs sol 6.8s, p90 196s — the 60s client
+abort fires constantly. Three scriggo subagent reports were nothing
+but the stall error, forcing re-prompts. This drives subagent
+duration -> park length -> timeouts.
+
+P2 **costUsd counts the PRIMARY ONLY** (verified arithmetically):
+scriggo true $17.65 vs $16.12 recorded; cliffy $6.98 vs $4.99. All
+campaign costs understate by subagent + review spend.
+
+P2 **review verdict integrity**: supervisor text "that is a coverage
+gap, not a clean result" vs workflow `outcome: clean`. Also cliffy
+and dynamodb STARTED review with ~2 min of budget left and were
+killed mid-review — needs a remaining-budget gate.
+
+P3 **circular oracle still live** (upgrade did not fix it): sqlfmt
+lost on one hand-written line (`body_open.prefix = ""` ->
+`create table films(`); the reviewer ran the change's own suite and
+cited its pass as proof, AFTER the change rewrote the pre-existing
+fixture `CREATE TABLE films (` to match its own output — and the
+reviewer's own `git diff` displayed that mutation. Gates that would
+catch it: suite must actually execute for a non-advisory verdict;
+mutation of pre-existing tests/fixtures is a finding by default.
+
+P3 **opa-rego is winnable, not cursed**: it BUILT this run (22/25;
+the 0/25 build-failure mode was r1's). Loss is `ast.RulePath(rule)`
+== `Ref().String()` keeping the non-ground head suffix; 4/4 corpus
+runs using `Ref().GroundPrefix().String()` score 25/25, 12/12 using
+the other form lose the SAME three tests. instruction.md's "fully
+qualified rule path" is ambiguous but the repo convention is
+one-sided and was on the agent's screen.
+
+**Neither r1 win on the regression pair was review-driven** (checked
+directly): obsidian r1 review was clean with no correction round;
+sqlfmt r1's correction fixed an unrelated Jinja bug while the
+spacing was already right. Treat DR's value as UNPROVEN.
