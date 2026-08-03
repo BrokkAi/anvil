@@ -1813,9 +1813,9 @@ fn resolve_execution_policy(
 /// the session's `PermissionMode` and the tool's `ToolKind`, a call is auto-allowed,
 /// auto-rejected, or escalated to the client via `session/request_permission`.
 ///
-/// SAFETY: this function calls `SentRequest::block_task().await`, which is only
-/// safe inside `ConnectionTo::spawn`. The `SpawnedCx<'_>` parameter encodes
-/// that requirement -- callers must construct it inside a spawned task.
+/// Interactive permission decisions are delegated to `permission_broker`.
+/// ACP callers construct their broker inside `ConnectionTo::spawn`; other
+/// transports can provide their own implementation without an ACP connection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     llm: &Arc<dyn LlmBackend>,
@@ -1830,7 +1830,8 @@ pub(crate) async fn run(
     cancel: CancellationToken,
     on_text: TextSink,
     on_thought: TextSink,
-    spawned_cx: SpawnedCx<'_>,
+    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: String,
     sessions: SessionStore,
     original_user_request: String,
@@ -2077,7 +2078,8 @@ pub(crate) async fn run(
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                &spawned_cx,
+                spawned_cx,
+                permission_broker,
                 &session_id,
                 &sessions,
                 notifications,
@@ -2484,7 +2486,8 @@ pub(crate) async fn run(
                     max_turns,
                     idle_timeout,
                     cancel.clone(),
-                    &spawned_cx,
+                    spawned_cx,
+                    permission_broker,
                     &session_id,
                     &sessions,
                     notifications,
@@ -2854,6 +2857,7 @@ async fn execute_step_tool_calls(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -2895,6 +2899,7 @@ async fn execute_step_tool_calls(
                 idle_timeout,
                 cancel.clone(),
                 spawned_cx,
+                permission_broker,
                 session_id,
                 sessions,
                 notifications,
@@ -3141,7 +3146,7 @@ async fn execute_step_tool_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3275,6 +3280,7 @@ async fn execute_step_tool_calls(
                             idle_timeout,
                             cancel.clone(),
                             spawned_cx,
+                            permission_broker,
                             session_id,
                             sessions,
                             depth + 1,
@@ -3460,6 +3466,7 @@ async fn execute_parallel_safe_calls(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -3648,7 +3655,7 @@ async fn execute_parallel_safe_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3755,6 +3762,7 @@ async fn execute_parallel_safe_calls(
                         idle_timeout,
                         cancel,
                         spawned_cx,
+                        permission_broker,
                         session_id,
                         sessions,
                         depth + 1,
@@ -4066,7 +4074,7 @@ async fn deterministic_gate_rejection(
 /// execute, or `Reject` to feed the LLM a denial message instead.
 async fn consult_gate(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
 ) -> GateOutcome {
@@ -4113,7 +4121,7 @@ async fn consult_gate(
             GateOutcome::without_usage(
                 request_user_permission_or_reject(
                     sessions,
-                    spawned_cx,
+                    permission_broker,
                     cancel,
                     request,
                     evaluation,
@@ -4263,7 +4271,7 @@ async fn classify_gate_or_reject(
 
 async fn request_user_permission_or_reject(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4273,7 +4281,7 @@ async fn request_user_permission_or_reject(
     let rejected_permission_notice = permission_notice.clone();
     match request_user_permission_with_evaluation(
         sessions,
-        spawned_cx,
+        permission_broker,
         cancel,
         request,
         evaluation,
@@ -4331,7 +4339,7 @@ fn sanitize_permission_rationale(rationale: &str) -> String {
 
 async fn request_user_permission_with_evaluation(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4373,7 +4381,7 @@ async fn request_user_permission_with_evaluation(
         None => None,
     };
     let grant = request_user_permission(
-        spawned_cx,
+        permission_broker,
         cancel,
         PermissionRequest {
             session_id: request.session_id,
@@ -5336,6 +5344,7 @@ async fn execute_subagent(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     depth: usize,
@@ -5448,7 +5457,8 @@ async fn execute_subagent(
         cancel,
         noop_text,
         noop_thought,
-        SpawnedCx::new(spawned_cx.cx()),
+        spawned_cx,
+        permission_broker,
         session_id.to_string(),
         sessions.clone(),
         prompt.to_string(),
