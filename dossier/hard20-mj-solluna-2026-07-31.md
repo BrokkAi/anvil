@@ -512,3 +512,81 @@ are all sol-priced), while luna's 7M tokens/task cost $0.32. A cheap
 subagent only saves money on work the primary actually stops doing;
 today delegation is additive, not substitutive. Harness fixed in
 brokkbench e3a01c4ad02.
+
+### Substitutive retest + duo+DR (2026-08-02/03): scores, and the trace verdict
+
+Runs (all anvil 12b3909a / mj 994bb619, substitutive delegation
+protocol, completion protocol on, 20 threads):
+
+| arm | score | true $/task | notes |
+|---|---|---|---|
+| ab2-duo r1 | 14/20 | $4.22 | first-ever opa-rego 25/25; tengo fixed by end-empty guard |
+| ab2-duo r2 | 13/20 | ~$5.19 | 19825s elapsed under 2x20 contention; bandit 5/88 collapse; dynamodb timeout |
+| duoDR r1 (opus-4-8 loki, 1 round cap) | 13/20 | $4.11 | dynamodb+scriggo killed at 7200s; 13/18 on judged tasks |
+
+duo substitutive = 27/40 vs duo-old-protocol 31/40 vs solo 27/40: the
+protocol cut cost ~19% but gave back the score edge (suggestive, not
+proven; n=2 vs ±2 noise). duoDR on the 18 tasks it finished: 13/18 vs
+duo 12/18 on the same subset — +1 net vs each duo run; gains are all
+near-miss conversions (fastapi 137/137, obsidian, textual, sqlfmt,
+tomlkit, bandit-collapse avoided), i.e. the review-catchable class.
+Opus (DR seat) true cost from traces: $18.41 total = $0.92/task avg
+(~$1.02 on the 18 where it ran), ~22% of arm spend; usageByModel was
+null in rows so recorded costUsd priced opus output at sol rates
+(slight overstatement).
+
+**Trace autopsies (5 Opus analysts, 2026-08-03) — the timeout story
+reversed.** Opus made ZERO requests on both killed tasks: the review
+never started because the turn never ended. Both died in fire-and-
+forget delegation parks:
+
+- scriggo: primary parked 109 of 120 min (21.3s of model time, zero
+  tool calls) while one luna subagent ground at 94% duty cycle, incl.
+  12 consecutive failures on one test over 24 min. Primary took over
+  at min 115, fixed luna's bug in ~2 min, went green, died 8s from
+  done. Uncommitted.
+- dynamodb: primary active 6.2 of 120 min; core-lazy-impl luna sub ran
+  105 min (8 compactions, 53 typecheck runs = 20.8 min); primary sat
+  on a known 26-second lint fix for 15.5 min waiting; killed 27s into
+  final npm test, workspace green + complete, uncommitted.
+- Both runs also ran two-round delegation (read-only recon, then
+  impl) against the one-pass protocol text.
+
+Other autopsies:
+- opa-rego 0/25 = COMPILE FAILURE, not semantics: agent shipped two
+  profile-tagged test files with a shared helper; verifier replaces
+  profile_test.go -> dangling testEvalProfile -> [build failed] -> all
+  25 f2p unreachable. Only run in 25-run corpus with a dangling
+  cross-test-file ref. Public surface was correct. Also: GroundPrefix
+  vs Ref().String() separates 25/25 from 20-22/25 corpus-wide (real
+  instruction ambiguity).
+- opa-template 4/5 = agent named its own test EXACTLY the hidden test
+  name -> Go redeclaration -> cmd package build fail. 7/7 runs with
+  the colliding name fail; 4/4 with other names pass.
+- kysely 250/254 = one trailing space in 'grouping sets ' authored by
+  a luna sub together with a self-test asserting the same wrong
+  output. Opus review examined the exact line 5 times, called it "a
+  workaround which produces the correct output", verified against the
+  agent's own test. Correct spelling was in instruction.md AND in a
+  ground-truth diff on disk.
+- cliffy 36/37 + psm 69/72 = spec-ambiguity bits (filtered-vs-raw
+  getConfigValues; get_state_data {} vs None on no-declaration); in
+  both, losing runs wrote self-tests asserting their guess and review
+  blessed it. Corpus-wide discriminators confirmed (6 losing runs
+  share cliffy conflation; 8 runs share psm's exact partial score).
+
+**Review-oracle finding (systemic):** in every reviewed task, zero
+reviewer lanes launched — supervisor-solo review that validates the
+artifact against its own tests ("no lane carried a concrete unresolved
+hypothesis"). Review reliably catches intent-execution gaps (the flips
+it earned) and reliably misses wrong-intent defects (kysely, cliffy,
+psm, opa-rego) because it has no external oracle (instruction
+literals, repo convention, upstream reference).
+
+**Benchmark integrity:** duoDR kysely fetched the ground-truth PR
+(blitzy-research/kysely PR#4) via curl and committed 4 of its test
+files verbatim (still lost, 250/254). Sweep-wide grep: opa-rego,
+sqlfmt, cattrs PROBED upstream/raw for reference code but got
+404/401; skrub/textual hits are changelog PR references. Only kysely
+succeeded. Container network access + public ground-truth fork = open
+contamination vector; duoDR kysely row untrusted.
