@@ -8,6 +8,8 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities,
     AuthMethod,
     AuthMethodAgent,
+    AuthenticateRequest,
+    AuthenticateResponse,
     AvailableCommand,
     AvailableCommandsUpdate,
     CancelNotification,
@@ -1598,6 +1600,28 @@ pub async fn run_agent(
                         .agent_capabilities(capabilities)
                         .auth_methods(auth_methods),
                 )
+            },
+            on_receive_request!(),
+        )
+        // Handle authenticate: clients may call it with any advertised method
+        // id, and the only advertised method ("none") needs no action.
+        .on_receive_request(
+            async move |req: AuthenticateRequest,
+                        responder: Responder<AuthenticateResponse>,
+                        _cx: ConnectionTo<Client>| {
+                tracing::info!("ACP authenticate, methodId={}", req.method_id.0);
+                if req.method_id.0.as_ref() == "none" {
+                    responder.respond(AuthenticateResponse::new())
+                } else {
+                    responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!(
+                                "unknown authMethod id {:?}; Anvil advertises only \"none\"",
+                                req.method_id.0
+                            ),
+                        })),
+                    )
+                }
             },
             on_receive_request!(),
         )

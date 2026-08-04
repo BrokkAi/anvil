@@ -594,6 +594,19 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         case.name
     );
 
+    // Clients may authenticate with any advertised method id, so "none" must
+    // succeed as a no-op while unknown ids are rejected.
+    let authenticate = client.request("authenticate", json!({ "methodId": "none" }));
+    assert_response_ok(&case, "authenticate", &authenticate, &client);
+    let bad_authenticate = client.request("authenticate", json!({ "methodId": "oauth" }));
+    assert_response_invalid_params_contains(
+        &case,
+        "authenticate",
+        &bad_authenticate,
+        "unknown authMethod id",
+        &client,
+    );
+
     let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
     assert_response_ok(&case, "session/new", &new_session, &client);
     let session_id = new_session["result"]["sessionId"]
