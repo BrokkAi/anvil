@@ -323,3 +323,70 @@ fn serve_generated_token_gates_v1_endpoints() {
         .expect("valid token");
     assert_eq!(status, 200, "expected 200, got {body}");
 }
+
+#[test]
+fn serve_rejects_non_loopback_host_header() {
+    let home = tempfile::tempdir().expect("temp home");
+    let daemon = spawn_serve(home.path());
+    let base = &daemon.base_url;
+    let host_port = base.strip_prefix("http://").expect("base url");
+
+    // DNS-rebinding guard: same TCP destination, hostile Host header.
+    let (status, body) = request_with_host("GET", host_port, "/v1/models", "evil.example")
+        .expect("request with hostile host");
+    assert_eq!(status, 403, "expected 403, got {body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    // The genuine loopback name keeps working.
+    let (status, _) = request_with_host("GET", host_port, "/v1/models", "localhost")
+        .expect("request with localhost host");
+    assert_eq!(status, 200);
+}
+
+/// Raw request with an explicit Host header value (the shared helpers use
+/// the connection address, which is exactly what the rebinding guard
+/// accepts).
+fn request_with_host(
+    method: &str,
+    connect_to: &str,
+    path: &str,
+    host_header: &str,
+) -> Result<(u16, Value), String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(connect_to).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    let request =
+        format!("{method} {path} HTTP/1.1\r\nhost: {host_header}\r\nconnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("malformed response: {response}"))?;
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("malformed status line: {head}"))?;
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body.lines()
+            .skip(1)
+            .take_while(|line| *line != "0")
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        body.to_string()
+    };
+    let value =
+        serde_json::from_str(body.trim()).map_err(|e| format!("non-JSON body ({e}): {body:?}"))?;
+    Ok((status, value))
+}

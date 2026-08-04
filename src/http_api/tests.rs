@@ -42,6 +42,12 @@ async fn start_server_with(sessions: SessionStore, config: TestConfig) -> Socket
         auth: config
             .auth_token
             .map(|token| Arc::new(super::AuthToken::new(&token))),
+        allowed_hosts: Some(Arc::new(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+            "::1".to_string(),
+        ])),
         workspace_roots: Arc::new(config.workspace_roots),
         allow_bypass_permissions: config.allow_bypass_permissions,
         max_turns: usize::MAX,
@@ -1082,11 +1088,10 @@ async fn cancelling_a_run_expires_pending_permissions() {
         .expect("cancel run");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    let run = poll_run_until_terminal(addr, &run_id).await;
-    assert_eq!(run["status"], "cancelled", "run: {run}");
-
-    // The pending request expired with the run; late responses are refused
-    // and nothing is left pending.
+    // Response-after-cancel race: cancellation expires pending permissions
+    // synchronously before the cancel endpoint returns, so an approval
+    // arriving immediately afterwards deterministically finds nothing to
+    // approve — it must never reach the tool loop.
     let response = client
         .post(format!(
             "http://{addr}/v1/permissions/{permission_id}/respond"
@@ -1094,8 +1099,11 @@ async fn cancelling_a_run_expires_pending_permissions() {
         .json(&serde_json::json!({ "option_id": "allow" }))
         .send()
         .await
-        .expect("late response");
+        .expect("response racing cancel");
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let run = poll_run_until_terminal(addr, &run_id).await;
+    assert_eq!(run["status"], "cancelled", "run: {run}");
     let (_, body) = get_json(addr, &format!("/v1/runs/{run_id}/permissions")).await;
     assert_eq!(
         body["permissions"].as_array().expect("permissions").len(),
@@ -1104,5 +1112,63 @@ async fn cancelling_a_run_expires_pending_permissions() {
     assert!(
         !workspace.path().join("hello.txt").exists(),
         "cancelled permission must not execute the tool"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_roots_resolve_symlinks_and_require_existing_dirs() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let outside = tempfile::tempdir().expect("outside dir");
+    let addr = start_server_with(
+        seeded_store().await,
+        TestConfig {
+            workspace_roots: vec![root.path().canonicalize().expect("canonical root")],
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // A symlink inside the root pointing outside must be rejected: the
+    // policy canonicalizes and stores the canonical path, so the link's
+    // target is what gets checked (symlink-swap regression).
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": link.display().to_string() }))
+        .send()
+        .await
+        .expect("create through symlink");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Not-yet-existing paths under the root are refused outright, closing
+    // the validate-then-create-symlink TOCTOU window.
+    let missing = root.path().join("does-not-exist-yet");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": missing.display().to_string() }))
+        .send()
+        .await
+        .expect("create with missing cwd");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A real directory inside the root is stored under its canonical path.
+    let real = root.path().join("project");
+    std::fs::create_dir(&real).expect("create project dir");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": real.display().to_string() }))
+        .send()
+        .await
+        .expect("create real dir session");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created = response.json::<Value>().await.expect("JSON body");
+    let stored_cwd = created["cwd"].as_str().expect("cwd");
+    assert_eq!(
+        std::path::PathBuf::from(stored_cwd),
+        real.canonicalize().expect("canonical project dir"),
+        "session must store the canonical path, not the caller's spelling"
     );
 }

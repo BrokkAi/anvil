@@ -106,6 +106,13 @@ pub(crate) struct ServeArgs {
     /// should be able to request unless the operator opted in.
     #[arg(long, default_value_t = false)]
     pub(crate) allow_bypass_permissions: bool,
+
+    /// Additional `Host` header values accepted on loopback listeners,
+    /// beyond the built-in `localhost` / `127.0.0.1` / `[::1]` set.
+    /// Loopback binds validate the Host header to block DNS-rebinding
+    /// attacks; non-loopback (authenticated) binds do not restrict Host.
+    #[arg(long = "allowed-host")]
+    pub(crate) allowed_hosts: Vec<String>,
 }
 
 /// Run the HTTP daemon until interrupted. Performs the same eager model
@@ -159,6 +166,21 @@ pub(crate) async fn serve(
         Err(e) => tracing::warn!("serve startup discovery failed: {e:#}"),
     }
 
+    let allowed_hosts = ip.is_loopback().then(|| {
+        let mut hosts = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+            "::1".to_string(),
+        ];
+        hosts.extend(
+            args.allowed_hosts
+                .iter()
+                .map(|host| host.to_ascii_lowercase()),
+        );
+        Arc::new(hosts)
+    });
+
     let state = ApiState {
         sessions,
         llm,
@@ -166,6 +188,7 @@ pub(crate) async fn serve(
         runs: Arc::new(runs::RunManager::default()),
         permissions: Arc::new(permissions::PermissionRegistry::default()),
         auth: auth.map(Arc::new),
+        allowed_hosts,
         workspace_roots: Arc::new(workspace_roots),
         allow_bypass_permissions: args.allow_bypass_permissions,
         max_turns,
@@ -274,6 +297,51 @@ fn resolve_auth(args: &ServeArgs) -> Result<(Option<AuthToken>, Option<String>)>
     Ok((None, None))
 }
 
+/// DNS-rebinding guard for loopback listeners: reject requests whose
+/// `Host` header is not a recognized loopback name (or explicit
+/// `--allowed-host`). Applies to every route, `/health` included — local
+/// probes address the daemon by a loopback name anyway.
+async fn host_guard_middleware(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(allowed) = &state.allowed_hosts else {
+        return next.run(request).await;
+    };
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(strip_port)
+        .map(|host| host.to_ascii_lowercase());
+    match host {
+        Some(host) if allowed.iter().any(|candidate| candidate == &host) => next.run(request).await,
+        host => {
+            tracing::warn!(
+                target: "audit",
+                host = host.as_deref().unwrap_or("<missing>"),
+                path = %request.uri().path(),
+                "rejected request with non-loopback Host header (DNS-rebinding guard)"
+            );
+            ApiError::forbidden(
+                "Host header is not an allowed name for this loopback listener; pass \
+                 --allowed-host to extend the allowlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Strip an optional `:port` suffix from a Host header value, keeping
+/// IPv6 bracket forms intact (`[::1]:8080` -> `[::1]`).
+fn strip_port(host: &str) -> &str {
+    if let Some(end) = host.find(']') {
+        return &host[..=end.min(host.len() - 1)];
+    }
+    host.split(':').next().unwrap_or(host)
+}
+
 /// Bearer-token gate for every route except `/health` (liveness stays
 /// unauthenticated). No-op when no token is configured — the documented
 /// local policy for the loopback-only default.
@@ -324,6 +392,13 @@ struct ApiState {
     /// SHA-256 digest of the required bearer token; `None` disables auth
     /// (loopback-only default policy).
     auth: Option<Arc<AuthToken>>,
+    /// `Host` header allowlist, active on loopback listeners. Loopback
+    /// alone is not an authentication boundary: a hostile web page can
+    /// DNS-rebind its own hostname to 127.0.0.1 and issue same-origin
+    /// requests, so requests whose Host is not a recognized loopback name
+    /// (or an explicit `--allowed-host`) are refused. `None` (non-loopback
+    /// binds, which require bearer auth) disables the check.
+    allowed_hosts: Option<Arc<Vec<String>>>,
     /// Canonicalized roots session workspaces must live under; empty means
     /// unrestricted.
     workspace_roots: Arc<Vec<PathBuf>>,
@@ -377,6 +452,10 @@ fn router(state: ApiState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            host_guard_middleware,
         ))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -772,63 +851,59 @@ fn fallback_cwd(explicit: Option<&str>) -> PathBuf {
     }
 }
 
-/// Canonicalize a path for workspace-root policy checks, walking up to the
-/// first existing ancestor when the tail does not exist yet (a session cwd
-/// may be created later). Callers must reject `..` components first.
-fn canonicalize_for_policy(path: &std::path::Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        match current.canonicalize() {
-            Ok(canonical) => {
-                let mut resolved = canonical;
-                for component in missing_tail.iter().rev() {
-                    resolved.push(component);
-                }
-                return resolved;
-            }
-            Err(_) => match (current.parent(), current.file_name()) {
-                (Some(parent), Some(name)) => {
-                    missing_tail.push(name.to_os_string());
-                    current = parent.to_path_buf();
-                }
-                _ => return path.to_path_buf(),
-            },
-        }
-    }
-}
-
 /// Enforce the server's `--workspace-root` policy on a requested session
-/// path. No-op when no roots are configured. Rejections are audited: a
-/// caller probing outside the sandbox is exactly what the audit trail is
-/// for.
+/// path and return the path to actually use. Without configured roots the
+/// path passes through unchanged. With roots, the path must already exist
+/// and is canonicalized, and the **canonical** path is what the session
+/// stores and every tool resolution uses — validating a symlink and then
+/// following the caller-supplied spelling would let the link be retargeted
+/// outside the boundary after the check (TOCTOU). `..` components are
+/// refused outright. Rejections are audited: a caller probing outside the
+/// sandbox is exactly what the audit trail is for.
 fn enforce_workspace_roots(
     state: &ApiState,
     field: &'static str,
-    path: &std::path::Path,
-) -> Result<(), ApiError> {
+    path: PathBuf,
+) -> Result<PathBuf, ApiError> {
     if state.workspace_roots.is_empty() {
-        return Ok(());
+        return Ok(path);
     }
-    let escapes_via_parent = path
+    if path
         .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir));
-    let canonical = canonicalize_for_policy(path);
-    let allowed = !escapes_via_parent
-        && state
-            .workspace_roots
-            .iter()
-            .any(|root| canonical.starts_with(root));
-    if allowed {
-        return Ok(());
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(workspace_root_rejection(state, field, &path));
     }
+    let Ok(canonical) = path.canonicalize() else {
+        return Err(ApiError::invalid_argument(format!(
+            "{field} '{}' must be an existing directory when the server restricts workspace \
+             roots",
+            path.display()
+        ))
+        .details(json!({ "field": field })));
+    };
+    if state
+        .workspace_roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        return Ok(canonical);
+    }
+    Err(workspace_root_rejection(state, field, &path))
+}
+
+fn workspace_root_rejection(
+    state: &ApiState,
+    field: &'static str,
+    path: &std::path::Path,
+) -> ApiError {
     tracing::warn!(
         target: "audit",
         field,
         path = %path.display(),
         "rejected session path outside configured workspace roots"
     );
-    Err(ApiError::forbidden(format!(
+    ApiError::forbidden(format!(
         "{field} '{}' is outside the server's configured workspace roots",
         path.display()
     ))
@@ -839,7 +914,7 @@ fn enforce_workspace_roots(
             .iter()
             .map(|root| root.display().to_string())
             .collect::<Vec<_>>(),
-    })))
+    }))
 }
 
 /// Reject `bypassPermissions` from HTTP callers unless the operator opted
@@ -978,7 +1053,7 @@ async fn list_sessions(
     }
     if let Some(cwd) = &query.cwd {
         let cwd = require_absolute_cwd(cwd)?;
-        enforce_workspace_roots(&state, "cwd", &cwd)?;
+        let cwd = enforce_workspace_roots(&state, "cwd", cwd)?;
         for manifest in state.sessions.list_sessions_from_disk(&cwd).await {
             if seen.contains(&manifest.id) {
                 continue;
@@ -1003,11 +1078,11 @@ async fn create_session(
     ApiJson(request): ApiJson<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResource>), ApiError> {
     let cwd = require_absolute_cwd(&request.cwd)?;
-    let additional_directories = validated_additional_directories(request.additional_directories)?;
-    enforce_workspace_roots(&state, "cwd", &cwd)?;
-    for directory in &additional_directories {
-        enforce_workspace_roots(&state, "additional_directories", directory)?;
-    }
+    let cwd = enforce_workspace_roots(&state, "cwd", cwd)?;
+    let additional_directories = validated_additional_directories(request.additional_directories)?
+        .into_iter()
+        .map(|directory| enforce_workspace_roots(&state, "additional_directories", directory))
+        .collect::<Result<Vec<_>, _>>()?;
     enforce_permission_mode_policy(&state, &request.config)?;
 
     let session = state
@@ -1054,9 +1129,11 @@ async fn get_session(
     Query(query): Query<GetSessionQuery>,
 ) -> Result<Json<SessionResource>, ApiError> {
     let cwd = fallback_cwd(query.cwd.as_deref());
-    if query.cwd.is_some() {
-        enforce_workspace_roots(&state, "cwd", &cwd)?;
-    }
+    let cwd = if query.cwd.is_some() {
+        enforce_workspace_roots(&state, "cwd", cwd)?
+    } else {
+        cwd
+    };
     let session = state
         .sessions
         .get_session(&session_id, &cwd)
@@ -1155,11 +1232,11 @@ async fn reopen_session(
     include_history: bool,
 ) -> Result<Json<SessionResource>, ApiError> {
     let cwd = require_absolute_cwd(&request.cwd)?;
-    let additional_directories = validated_additional_directories(request.additional_directories)?;
-    enforce_workspace_roots(&state, "cwd", &cwd)?;
-    for directory in &additional_directories {
-        enforce_workspace_roots(&state, "additional_directories", directory)?;
-    }
+    let cwd = enforce_workspace_roots(&state, "cwd", cwd)?;
+    let additional_directories = validated_additional_directories(request.additional_directories)?
+        .into_iter()
+        .map(|directory| enforce_workspace_roots(&state, "additional_directories", directory))
+        .collect::<Result<Vec<_>, _>>()?;
 
     match state
         .sessions

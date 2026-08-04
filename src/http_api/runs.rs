@@ -76,7 +76,7 @@ impl RunStatus {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         self != Self::Running
     }
 }
@@ -129,6 +129,11 @@ impl RunHandle {
 
     pub(super) fn status(&self) -> RunStatus {
         *self.status.read().expect("run status lock")
+    }
+
+    /// Whether cancellation has been requested for this run's turn.
+    pub(super) fn cancel_requested(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     fn last_seq(&self) -> u64 {
@@ -653,6 +658,11 @@ pub(super) async fn cancel_run(
             "http run cancellation requested"
         );
         run.cancel.cancel();
+        // Expire pending permissions synchronously, under the same
+        // registry transition respond_permission uses, so a response
+        // arriving after this endpoint returns can never approve a tool
+        // call on the cancelled run.
+        state.permissions.expire_for_run(&run.id);
         state.sessions.cancel_prompt(&run.session_id).await;
     }
     Ok(Json(run.resource()))

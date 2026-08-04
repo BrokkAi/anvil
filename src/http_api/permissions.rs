@@ -120,6 +120,26 @@ impl PermissionRegistry {
             .cloned()
     }
 
+    /// Synchronously expire every pending request for a run: each entry is
+    /// resolved as cancelled through the same exactly-once transition
+    /// `respond_permission` uses, and removed from the registry, before this
+    /// returns. Called by run cancellation so a response arriving after the
+    /// cancel endpoint returned deterministically finds nothing to approve.
+    pub(super) fn expire_for_run(&self, run_id: &str) {
+        let expired: Vec<Arc<PendingPermission>> = {
+            let mut pending = self.pending.lock().expect("pending permissions lock");
+            let ids: Vec<String> = pending
+                .values()
+                .filter(|permission| permission.run.id == run_id)
+                .map(|permission| permission.id.clone())
+                .collect();
+            ids.iter().filter_map(|id| pending.remove(id)).collect()
+        };
+        for permission in expired {
+            permission.resolve(PermissionDecision::Cancelled);
+        }
+    }
+
     pub(super) fn pending_for_run(&self, run_id: &str) -> Vec<Arc<PendingPermission>> {
         let mut pending: Vec<Arc<PendingPermission>> = self
             .pending
@@ -177,14 +197,19 @@ impl PermissionBroker for HttpPermissionBroker {
         );
 
         Box::pin(async move {
+            // `biased` so cancellation deterministically wins when a
+            // response races it: a decision that lands after the cancel
+            // token is set is discarded rather than approving a tool call
+            // on a cancelled run.
             let decision = tokio::select! {
-                decision = receiver => decision.unwrap_or(PermissionDecision::Cancelled),
+                biased;
                 _ = self.cancel.cancelled() => {
                     // Run cancellation expires the pending request; a later
                     // response is rejected as already-resolved.
                     permission.resolve(PermissionDecision::Cancelled);
                     PermissionDecision::Cancelled
                 }
+                decision = receiver => decision.unwrap_or(PermissionDecision::Cancelled),
             };
             self.registry.remove(&permission.id);
             let decision_str = match &decision {
@@ -270,6 +295,13 @@ pub(super) async fn respond_permission(
             "unknown or already-resolved permission request '{permission_id}'"
         ))
     })?;
+
+    if permission.run.cancel_requested() || permission.run.status().is_terminal() {
+        return Err(ApiError::conflict(
+            "permission request already resolved (duplicate response, or the run was \
+             cancelled or completed first)",
+        ));
+    }
 
     let decision = match (&response.option_id, response.cancel) {
         (Some(_), true) => {
