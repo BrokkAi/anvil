@@ -5001,17 +5001,12 @@ not revert changes that are not yours.
 - Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
 narrate what code does or address the user in comments.
 
-# Project instructions (AGENTS.md)
+# AGENTS.md
 
-- An AGENTS.md governs the entire directory tree rooted at the folder containing it; a \
-CLAUDE.md is equivalent where no AGENTS.md sits beside it. Obey every such file whose scope \
-covers a file you touch.
-- When two of them cover the same file, the more deeply nested one wins. Direct system and \
-user instructions outrank both.
-- Any AGENTS.md between the project root and the working directory has already been supplied \
-to you; do not re-read those. Ones nested below the working directory have not been: before \
-editing under a subdirectory, check that subdirectory and the directories between it and the \
-working directory for their own AGENTS.md, and read any you find.
+- An AGENTS.md (or CLAUDE.md) governs the whole tree under its directory. Obey every one \
+covering a file you touch; on conflict the most deeply nested wins.
+- Those from the project root down to the working directory are already supplied. Ones below \
+it are not: check for them before editing under a subdirectory.
 
 # Verification
 
@@ -10766,15 +10761,15 @@ mod tests {
         for mode in [SessionMode::Lutz, SessionMode::Plan] {
             let prompt = build_system_prompt(&mode, cwd, &[]);
             assert!(
-                prompt.contains("entire directory tree rooted at the folder containing it"),
+                prompt.contains("governs the whole tree under its directory"),
                 "system prompt for {mode:?} must state the AGENTS.md scoping rule, got: {prompt}"
             );
             assert!(
-                prompt.contains("the more deeply nested one wins"),
+                prompt.contains("the most deeply nested wins"),
                 "system prompt for {mode:?} must state nested-wins precedence, got: {prompt}"
             );
             assert!(
-                prompt.contains("do not re-read those"),
+                prompt.contains("are already supplied"),
                 "system prompt for {mode:?} must stop the model re-reading the supplied \
                  root-to-cwd chain, got: {prompt}"
             );
