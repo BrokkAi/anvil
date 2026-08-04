@@ -4037,15 +4037,21 @@ mod tests {
             "delivered diff against original base must include worker change:\n{delivered}"
         );
 
+        // `ANVIL_TRACE_JSONL` is process-wide, so a concurrently running Asgard
+        // test's baseline record can be the one found first here. `env.txt` is
+        // dirtied only by this test, so it identifies our run's record; match
+        // across every candidate rather than on whichever comes first.
         let trace_records = fs::read_to_string(&trace_path).expect("trace");
-        let baseline = trace_records
+        let baselines = trace_records
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|record| record["type"] == "asgard_baseline_commit")
-            .expect("baseline trace record");
-        assert_eq!(
-            baseline["files"],
-            serde_json::json!(["README.md", "env.txt"])
+            .filter(|record| record["type"] == "asgard_baseline_commit")
+            .collect::<Vec<_>>();
+        assert!(
+            baselines
+                .iter()
+                .any(|baseline| baseline["files"] == serde_json::json!(["README.md", "env.txt"])),
+            "the absorbed baseline must list both dirty files: {baselines:?}"
         );
     }
 
@@ -5689,10 +5695,24 @@ mod tests {
         assert!(supervisor_text.contains("prefinalize spawned w2 from root"));
 
         let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
-        let coverage_records = trace
+        let all_coverage_records = trace
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
             .filter(|record| record["type"] == "asgard_prefinalize_coverage")
+            .collect::<Vec<_>>();
+        // `ANVIL_TRACE_JSONL` is process-wide, so a concurrently running Asgard
+        // test appends its own coverage records to this same file. Every run
+        // stamps its own `trace_run_id`, and this scripted supervisor is the
+        // only one anywhere that declares an attack - so the run id carrying
+        // `attacks_total: 1` is ours, and its records are exactly ours.
+        let our_run_id = all_coverage_records
+            .iter()
+            .find(|record| record["attacks_total"] == serde_json::json!(1))
+            .expect("coverage record for the covered resubmission")["trace_run_id"]
+            .clone();
+        let coverage_records = all_coverage_records
+            .iter()
+            .filter(|record| record["trace_run_id"] == our_run_id)
             .collect::<Vec<_>>();
         // One record per ACCEPTED prefinalize; the bounced call records nothing.
         assert_eq!(coverage_records.len(), 2, "records: {coverage_records:?}");
@@ -5782,7 +5802,14 @@ mod tests {
         let coverage = trace
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
-            .find(|record| record["type"] == "asgard_prefinalize_coverage")
+            // `ANVIL_TRACE_JSONL` is process-wide, so a concurrently running
+            // Asgard test's coverage records land in this same file and can
+            // otherwise be the one found first. Only this test skips the full
+            // suite, so the skip reason identifies our record.
+            .find(|record| {
+                record["type"] == "asgard_prefinalize_coverage"
+                    && record["skipped_reason_present"] == serde_json::json!(true)
+            })
             .expect("coverage trace record");
         assert_eq!(coverage["bounced"], serde_json::json!(false));
         assert_eq!(coverage["full_suite_worker_count"], serde_json::json!(0));
