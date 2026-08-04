@@ -107,7 +107,7 @@ jobs:
       run: cargo test
 
     - name: Run minimizer crate tests
-      run: cargo test -p anvil-minimizer --locked
+      run: cargo test -p brokk-anvil-minimizer --locked
 
   build-android:
     name: Build aarch64-linux-android
