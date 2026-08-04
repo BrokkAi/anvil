@@ -1,8 +1,9 @@
 name: Publish npm Packages
 
-# Manual workflow that packages an existing GitHub release as the six
-# @brokkai npm packages. It defaults to build-and-validate only; writing to
-# the npm registry requires explicitly checking the `publish` input.
+# Packages an existing GitHub release as the six @brokkai npm packages. Version
+# tags dispatch this workflow only after CI, docs, crates.io, and release-asset
+# checks pass. Manual runs default to build-and-validate; registry writes require
+# the `publish` input and the npm-publish environment.
 #
 # Publishing uses npm trusted publishing (OIDC) — no long-lived npm token is
 # stored in the repository. The workflow is safe to re-run after a partial
@@ -29,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  build-and-validate:
     name: Build and validate
     runs-on: ubuntu-latest
     steps:
@@ -88,7 +89,7 @@ jobs:
   publish:
     name: Publish to npm
     if: ${{ inputs.publish }}
-    needs: build-and-publish
+    needs: build-and-validate
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:

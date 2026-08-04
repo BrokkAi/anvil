@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
 
 # Harden cargo's network layer against transient crates.io index fetches that
@@ -345,11 +344,11 @@ jobs:
           set -euo pipefail
           tag_sha=$(git rev-list -n1 "$TAG")
           wait_for_workflow() {
-            local workflow="$1" attempts=40
+            local workflow="$1" event="$2" attempts=40
             for ((attempt = 1; attempt <= attempts; attempt++)); do
               local runs latest status conclusion
               runs=$(gh api \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=push&head_sha=$tag_sha&per_page=100" \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=$event&head_sha=$tag_sha&per_page=100" \
                 --jq '.workflow_runs' \
                 | jq -c --arg tag "$TAG" '[.[] | select(.head_branch == $tag)]')
               latest=$(jq -c 'sort_by(.created_at) | last // empty' <<<"$runs")
@@ -374,12 +373,9 @@ jobs:
             return 1
           }
 
-          wait_for_workflow ci.yml
-          wait_for_workflow docs.yml
-          wait_for_workflow publish-crate.yml
+          wait_for_workflow ci.yml push
+          wait_for_workflow docs.yml push
+          wait_for_workflow publish-crate.yml push
 
-      - name: Dispatch npm publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: gh workflow run publish-npm.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG" -f publish=true
+          gh workflow run publish-npm.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG" -f publish=true
+          wait_for_workflow publish-npm.yml workflow_dispatch
