@@ -208,6 +208,41 @@ fn serve_daemon_lifecycle_over_localhost() {
     assert_eq!(missing["error"]["code"], "not_found");
     assert!(missing["request_id"].is_string());
 
+    // Asynchronous run lifecycle (#318): the smoke environment has no LLM
+    // providers, so the run is accepted, executes, and reports a failed
+    // terminal state with the result retained for polling.
+    let (status, run) = request(
+        "POST",
+        &format!("{base}/v1/sessions/{session_id}/runs"),
+        Some(&serde_json::json!({ "prompt": "hello over http" }).to_string()),
+    )
+    .expect("create run");
+    assert_eq!(status, 202, "run not accepted: {run}");
+    let run_id = run["id"].as_str().expect("run id").to_string();
+    assert_eq!(run["status"], "running");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let terminal = loop {
+        let (status, run) = http_get(&format!("{base}/v1/runs/{run_id}"));
+        assert_eq!(status, 200);
+        if run["status"] != "running" {
+            break run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run did not reach a terminal state in time: {run}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(terminal["status"], "failed", "expected failure: {terminal}");
+    assert_eq!(terminal["stop_reason"], "error");
+    assert!(terminal["last_seq"].as_u64().expect("last_seq") >= 2);
+
+    // Cancel stays idempotent once the run is terminal.
+    let (status, _) = request("POST", &format!("{base}/v1/runs/{run_id}/cancel"), None)
+        .expect("cancel terminal run");
+    assert_eq!(status, 200, "cancel must be idempotent on terminal runs");
+
     let (status, deleted) = request("DELETE", &format!("{base}/v1/sessions/{session_id}"), None)
         .expect("delete session");
     assert_eq!(status, 200);

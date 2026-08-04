@@ -103,18 +103,16 @@ use crate::session::{
 use crate::slash::{is_slash_command, parse_slash_command, slash_command_args};
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
-    parse_structured_output_request, validate_response,
+    parse_structured_output_request,
 };
 use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::usage_report::{
     attach_bedrock_credits_meta, attach_deepseek_balance_meta, attach_openrouter_balance_meta,
-    estimate_usage_by_model_cost, fetch_codex_credits_for_usage,
-    fetch_openrouter_credits_for_usage, insert_turn_failure_meta, render_usage_report,
-    usage_by_model_meta,
+    fetch_codex_credits_for_usage, fetch_openrouter_credits_for_usage, insert_turn_failure_meta,
+    render_usage_report, usage_by_model_meta,
 };
-use crate::workspace_delta::{WorkspaceDeltaTracker, workspace_delta_for_turn};
 
 /// Stable ids for ACP `SessionConfigOption` selectors. These are live
 /// session inputs from the client, not Anvil setup preferences.
@@ -3306,7 +3304,7 @@ pub async fn run_agent(
         .await
 }
 
-fn resolve_idle_timeouts(
+pub(crate) fn resolve_idle_timeouts(
     session_override_secs: Option<u64>,
     default_first_progress_secs: u64,
     default_inter_chunk_secs: u64,
@@ -4192,18 +4190,18 @@ fn build_prompt_messages_with_parts(
     build_prompt_messages_with_mode_and_parts(snap, snap.mode, new_prompt_text, new_prompt_parts)
 }
 
-struct PreparedPrompt {
-    messages: Vec<ChatMessage>,
-    compaction_usage: crate::llm_client::TokenUsage,
-    prefix_len: usize,
-    current_plan: Option<crate::plan::UpdatePlanArgs>,
+pub(crate) struct PreparedPrompt {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) compaction_usage: crate::llm_client::TokenUsage,
+    pub(crate) prefix_len: usize,
+    pub(crate) current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
 /// Build a prompt and, when necessary, replace all completed model history
 /// with one cumulative checkpoint. The canonical prefix and incoming user
 /// prompt are never summarized.
 #[allow(clippy::too_many_arguments)]
-async fn build_prompt_messages_with_compression(
+pub(crate) async fn build_prompt_messages_with_compression(
     snap: &mut SessionSnapshot,
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
@@ -4489,47 +4487,10 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
     }
 }
 
-/// Below this many characters of visible answer, a turn with no tool calls
-/// is treated as trivial chat and skips the extra recap-summary LLM call --
-/// the short answer already speaks for itself right above the recap.
-const RECAP_SUMMARY_MIN_CHARS: usize = 280;
-
-/// Best-effort, user-facing summary of the work done this turn, for the
-/// recap. Returns `None` when there is nothing worth summarizing or the
-/// summarizer call fails or is cancelled; the recap then renders only its
-/// deterministic stat lines. Failures are intentionally swallowed -- a recap
-/// is a convenience, never a reason to fail the turn.
-async fn recap_work_summary(
-    llm: &dyn crate::llm_client::LlmBackend,
-    model: &str,
-    turn: &ConversationTurn,
-    context_length: Option<u32>,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Option<String> {
-    let visible = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
-    if turn.tool_exchanges.is_empty() && visible.trim().chars().count() < RECAP_SUMMARY_MIN_CHARS {
-        return None;
-    }
-    match crate::context_manager::summarize_turn_for_recap(
-        llm,
-        model,
-        turn,
-        context_length,
-        idle_timeout,
-        cancel,
-    )
-    .await
-    {
-        Ok(summary) if !summary.trim().is_empty() => Some(summary),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::debug!(model, "turn recap summary failed: {e:#}");
-            None
-        }
-    }
-}
-
+/// ACP wrapper around the shared transport-neutral turn pipeline
+/// ([`crate::turn_runner::run_prompt_turn`]): adapts the connection into
+/// text/thought sinks and the `SpawnedCx` event-sink/permission-broker pair,
+/// then reports the post-turn `session/usage_update`.
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -4542,7 +4503,7 @@ async fn run_model_turn_in_spawn(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
-    mut messages: Vec<ChatMessage>,
+    messages: Vec<ChatMessage>,
     initial_usage: crate::llm_client::TokenUsage,
     context_length: Option<u32>,
     context_prefix_len: usize,
@@ -4553,13 +4514,6 @@ async fn run_model_turn_in_spawn(
     turn_recap_enabled: bool,
     prompt_text_for_turn: String,
 ) -> Result<ModelTurnResult, LoopIterationError> {
-    use futures::FutureExt;
-    use std::panic::AssertUnwindSafe;
-
-    if let Some(instructions) = registry.mcp_instructions().await {
-        append_mcp_instructions_to_system_prompt(&mut messages, &instructions);
-    }
-
     let cx_text = cx.clone();
     let sid_text = session_id.to_string();
     let cx_thought = cx.clone();
@@ -4574,198 +4528,54 @@ async fn run_model_turn_in_spawn(
             send_thought(&cx_thought, &sid_thought, token);
         }));
 
-    let cancel_status = cancel.clone();
-    let workspace_delta_tracker = if turn_recap_enabled {
-        Some(WorkspaceDeltaTracker::snapshot(fallback_cwd).await)
-    } else {
-        None
-    };
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
-    let loop_future = async {
-        let outcome = crate::tool_loop::run(
-            llm,
-            registry,
-            model,
-            reasoning_effort,
-            service_tier,
-            structured_output_request,
-            messages,
-            max_turns,
-            idle_timeout,
-            cancel,
-            text_sink,
-            thought_sink,
-            &spawned_cx,
-            &spawned_cx,
-            session_id.to_string(),
-            sessions.clone(),
-            prompt_text_for_turn.clone(),
-            crate::tool_loop::NotificationMode::Live,
-            0,
-            None,
-            None,
-            false,
-            None,
-            None,
-            context_length,
-            context_prefix_len,
-            initial_plan,
-        )
-        .await;
-        let usage_by_model: Option<BTreeMap<String, crate::llm_client::TokenUsage>> = None;
-        (outcome, usage_by_model)
-    };
-    let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
-    let (mut outcome, mut usage_by_model) = match loop_result {
-        Ok(result) => result,
-        Err(panic) => {
-            tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
-            // A panic is treated as fatal (non-retryable): retrying a
-            // deterministic crash would just spin, so an autonomous driver
-            // should stop and surface it rather than back off and retry.
-            (
-                crate::tool_loop::LoopOutcome {
-                    response: "Error: agent loop panicked. See server logs.".to_string(),
-                    tool_exchanges: Vec::new(),
-                    replay_events: Vec::new(),
-                    usage: crate::llm_client::TokenUsage::default(),
-                    stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
-                        retryable: false,
-                        message: "agent loop panicked".to_string(),
-                    }),
-                    current_plan: None,
-                    compaction_checkpoint: None,
-                },
-                None,
-            )
-        }
-    };
-    outcome.usage.add(initial_usage);
-    if let Some(usage_by_model) = usage_by_model.as_mut() {
-        usage_by_model
-            .entry(model.to_string())
-            .or_default()
-            .add(initial_usage);
-    }
-    let crate::tool_loop::LoopOutcome {
-        response: response_text,
-        tool_exchanges,
-        replay_events,
-        usage: turn_usage,
-        stop,
-        current_plan,
-        compaction_checkpoint,
-    } = outcome;
-
-    let model_metadata = sessions.available_model_metadata().await;
-    let model_meta = model_metadata.iter().find(|meta| meta.id == model);
-    let cost_delta_usd = match usage_by_model.as_ref() {
-        Some(usage_by_model) => estimate_usage_by_model_cost(&model_metadata, usage_by_model),
-        None => model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage)),
-    };
-    let context_length = model_meta.and_then(|meta| meta.context_length);
-    let cumulative_usage = sessions
-        .record_usage(session_id, turn_usage, cost_delta_usd)
-        .await
-        .unwrap_or(turn_usage);
-    let structured_output_result =
-        structured_output_request.map(|request| validate_response(request, &response_text));
-
-    // Build the turn up front so the recap summarizer can read it without
-    // cloning the tool exchanges. `agent_response` holds the raw model text for
-    // now (the summarizer strips host notices itself) and is replaced with the
-    // recap-augmented text below before the turn is persisted.
-    let mut turn = ConversationTurn {
-        user_prompt: prompt_text_for_turn,
-        agent_response: response_text.clone(),
-        replay_events: sanitize_replay_events(&replay_events),
-        tool_exchanges,
-        structured_output: structured_output_result.clone(),
-        summary: None,
-        current_plan,
-        compaction_checkpoint,
-        fragment_id: None,
-    };
-
-    let workspace_delta = if let Some(tracker) = workspace_delta_tracker {
-        workspace_delta_for_turn(fallback_cwd, tracker).await
-    } else {
-        crate::host_notice::WorkspaceDelta::default()
-    };
-    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges)
-        .with_workspace_delta(&workspace_delta);
-    let visible_response =
-        if turn_recap_enabled && !cancel_status.is_cancelled() && tool_stats.has_changed_files() {
-            let summary = recap_work_summary(
-                llm.as_ref(),
-                model,
-                &turn,
-                context_length,
-                idle_timeout,
-                cancel_status.clone(),
-            )
-            .await;
-            let recap = crate::host_notice::render_turn_recap(
-                summary.as_deref(),
-                &turn.tool_exchanges,
-                Some(&workspace_delta),
-                &stop,
-            );
-            send_message(cx, session_id, &recap);
-            format!("{response_text}{recap}")
-        } else {
-            response_text.clone()
-        };
-    turn.agent_response = visible_response;
-
-    let persisted_fragment_id = match sessions.add_turn(session_id, turn).await {
-        Ok(fragment_id) => fragment_id,
-        Err(e) => {
-            send_message(
-                cx,
-                session_id,
-                &format!(
-                    "\n**Warning:** failed to save this conversation turn to disk; \
-                     it will not survive a session reload: {e}\n"
-                ),
-            );
-            None
-        }
-    };
+    let outcome = crate::turn_runner::run_prompt_turn(crate::turn_runner::PromptTurnRequest {
+        sessions,
+        session_id,
+        fallback_cwd,
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        service_tier,
+        structured_output_request,
+        messages,
+        initial_usage,
+        context_length,
+        context_prefix_len,
+        initial_plan,
+        max_turns,
+        idle_timeout,
+        cancel,
+        turn_recap_enabled,
+        prompt_text_for_turn,
+        text_sink,
+        thought_sink,
+        event_sink: &spawned_cx,
+        permission_broker: &spawned_cx,
+    })
+    .await;
 
     send_session_usage_update_with_breakdown(
         cx,
         sessions,
         session_id,
         fallback_cwd,
-        usage_by_model.as_ref(),
-        match &stop {
-            crate::tool_loop::LoopStop::Failed(failure) => Some(failure),
-            _ => None,
-        },
+        None,
+        outcome.turn_failure(),
     )
     .await;
-    Ok(ModelTurnResult {
-        structured_output: structured_output_result,
-        cumulative_usage,
-        response: response_text,
-        stop,
-        tool_stats,
-        persisted_fragment_id,
-    })
-}
 
-fn append_mcp_instructions_to_system_prompt(messages: &mut [ChatMessage], instructions: &str) {
-    let Some(system) = messages.iter_mut().find(|message| message.role == "system") else {
-        return;
-    };
-    let Some(crate::llm_client::ChatContentPart::Text { text }) = system.content.first_mut() else {
-        return;
-    };
-    text.push_str("\n\n");
-    text.push_str(instructions);
+    Ok(ModelTurnResult {
+        structured_output: outcome.structured_output,
+        cumulative_usage: outcome.cumulative_usage,
+        response: outcome.response,
+        stop: outcome.stop,
+        tool_stats: outcome.tool_stats,
+        persisted_fragment_id: outcome.persisted_fragment_id,
+    })
 }
 
 /// Shared "run one model turn" pipeline behind both `/loop` and `/goal`:
@@ -9746,7 +9556,7 @@ mod tests {
             ChatMessage::user(original_user),
         ];
 
-        append_mcp_instructions_to_system_prompt(
+        crate::turn_runner::append_mcp_instructions_to_system_prompt(
             &mut messages,
             "<mcp_instructions>\n  <server name=\"council\">\nCoordinate persistently.\n  </server>\n</mcp_instructions>",
         );

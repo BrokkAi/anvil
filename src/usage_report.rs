@@ -167,21 +167,6 @@ pub(crate) fn is_deepseek_model(model_wire_id: &str) -> bool {
     )
 }
 
-pub(crate) fn estimate_usage_by_model_cost(
-    metadata: &[crate::llm_client::ModelMetadata],
-    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
-) -> Option<f64> {
-    usage_by_model
-        .iter()
-        .try_fold(0.0, |total, (model, usage)| {
-            if usage.is_zero() {
-                return Some(total);
-            }
-            let model = metadata.iter().find(|metadata| metadata.id == *model)?;
-            Some(total + model.estimate_cost_usd(*usage)?)
-        })
-}
-
 /// `render_usage_report` can render a distinct line for "no credential
 /// found" vs. "credential found but the upstream call failed" without
 /// the call site re-shaping a nested type.
@@ -769,24 +754,6 @@ mod tests {
             ("deepseek::deepseek-v4-flash".to_string(), flash_usage),
             ("deepseek::deepseek-v4-pro".to_string(), pro_usage),
         ]);
-        let priced = |id: &str, input, output| {
-            let mut metadata = crate::llm_client::ModelMetadata::id_only(id);
-            metadata.pricing = Some(crate::llm_client::ModelPricing {
-                input_cost_per_token_usd: input,
-                output_cost_per_token_usd: output,
-            });
-            metadata
-        };
-        let metadata = vec![
-            priced("deepseek::deepseek-v4-flash", 1.0e-7, 2.0e-7),
-            priced("deepseek::deepseek-v4-pro", 4.0e-7, 8.0e-7),
-        ];
-
-        let cost = estimate_usage_by_model_cost(&metadata, &usage_by_model)
-            .expect("both models have pricing");
-        let expected = (120.0 * 1.0e-7 + 12.0 * 2.0e-7) + (240.0 * 4.0e-7 + 34.0 * 8.0e-7);
-        assert_eq!(cost, expected);
-
         let meta = usage_by_model_meta(&usage_by_model);
         assert_eq!(
             meta["anvil"]["usageByModel"]["deepseek::deepseek-v4-pro"]["totalTokens"],
