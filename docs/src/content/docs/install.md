@@ -21,6 +21,47 @@ with `brew uninstall anvil`. The tap regenerates its formulae from tagged
 releases on a schedule, so upgrades follow new Anvil releases automatically.
 For Windows, musl-based Linux, or Android, use the methods below.
 
+## npm and npx
+
+With Node.js 18+ installed, npm covers every released platform, including
+Windows:
+
+```bash
+npm install -g @brokkai/anvil
+anvil --version
+```
+
+Or run Anvil one-shot without a persistent install:
+
+```bash
+npx -y @brokkai/anvil --version
+npx -y @brokkai/anvil@0.24.3 --version   # pin an exact release
+```
+
+The `@brokkai/anvil` package installs the released native `anvil` binary
+through one exact-pinned optional dependency per platform
+(`@brokkai/anvil-darwin-universal`, `@brokkai/anvil-linux-x64`,
+`@brokkai/anvil-linux-arm64`, `@brokkai/anvil-android-arm64`,
+`@brokkai/anvil-win32-x64`). Each platform package contains the complete
+checksum-verified GitHub release bundle; no Rust toolchain and no first-run
+download are involved. The installed command is `anvil`, and its version
+matches the npm package version exactly.
+
+Pin, upgrade, and uninstall with the usual npm commands:
+
+```bash
+npm install -g @brokkai/anvil@0.24.3   # exact release
+npm install -g @brokkai/anvil@latest   # upgrade
+npm uninstall -g @brokkai/anvil        # uninstall
+```
+
+Supported platforms match the released binaries: macOS (Apple Silicon and
+Intel), Linux x86-64 and ARM64 (glibc), Windows x86-64, and Android ARM64
+under Termux. Unsupported platforms — for example musl-based Linux such as
+Alpine — fail with a clear error at run time; use Cargo there. Do not install
+with `--no-optional` / `--omit=optional`, which would skip the platform
+package that carries the binary.
+
 ## Install Script
 
 Install the released binary with the install script:
@@ -58,7 +99,8 @@ WSL needs to launch Anvil.
 
 ### Windows
 
-The install script does not cover Windows. Use [Cargo](#install-with-cargo), or
+The install script does not cover Windows. Use [npm](#npm-and-npx),
+[Cargo](#install-with-cargo), or
 download the `.zip` archive and matching `.sha256` sidecar from the
 [release page](https://github.com/BrokkAi/anvil/releases) and place `anvil.exe`
 on your `PATH`. Running the script from Git Bash, MSYS2, or Cygwin does not
@@ -80,7 +122,7 @@ The script accepts these environment variables:
 | --- | --- |
 | `INSTALL_DIR` | Install directory. Defaults to `~/.local/bin`. |
 | `ANVIL_INSTALL_DIR` | Same as `INSTALL_DIR`, with higher precedence. |
-| `ANVIL_VERSION` | Release tag to install, for example `v0.24.2`. Defaults to the latest release. |
+| `ANVIL_VERSION` | Release tag to install, for example `v0.24.3`. Defaults to the latest release. |
 | `ANVIL_GITHUB_OWNER` | GitHub owner to download from. Defaults to `BrokkAi`. |
 | `GITHUB_TOKEN` | Token used for GitHub API rate limits. |
 | `PROFILE` | Shell profile to update when the install directory is not on `PATH`. |
@@ -88,7 +130,7 @@ The script accepts these environment variables:
 Pin a version and choose the directory like this:
 
 ```bash
-ANVIL_VERSION=v0.24.2 INSTALL_DIR=/usr/local/bin \
+ANVIL_VERSION=v0.24.3 INSTALL_DIR=/usr/local/bin \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrokkAi/anvil/refs/heads/master/install.sh)"
 ```
 

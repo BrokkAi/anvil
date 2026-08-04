@@ -42,3 +42,6 @@ docs/.astro/
 __pycache__/
 *.py[cod]
 *.log
+
+# npm packaging build output (npm/build-npm-packages.mjs)
+/npm/dist/
