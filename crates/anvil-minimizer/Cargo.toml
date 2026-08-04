@@ -1,6 +1,8 @@
 [package]
 name = "brokk-anvil-minimizer"
-version = "0.1.0"
+# Versioned in lockstep with the root brokk-anvil crate (CI enforces the
+# match), so the published minimizer always corresponds to the release tag.
+version = "0.24.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/BrokkAi/anvil"
