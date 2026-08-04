@@ -344,13 +344,14 @@ jobs:
           set -euo pipefail
           tag_sha=$(git rev-list -n1 "$TAG")
           wait_for_workflow() {
-            local workflow="$1" event="$2" attempts=40
+            local workflow="$1" event="$2" attempts="${3:-40}" excluded_run_ids="${4:-[]}"
             for ((attempt = 1; attempt <= attempts; attempt++)); do
               local runs latest status conclusion
               runs=$(gh api \
                 "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=$event&head_sha=$tag_sha&per_page=100" \
                 --jq '.workflow_runs' \
-                | jq -c --arg tag "$TAG" '[.[] | select(.head_branch == $tag)]')
+                | jq -c --arg tag "$TAG" --argjson excluded "$excluded_run_ids" \
+                  '[.[] | select(.head_branch == $tag and (.id as $id | $excluded | index($id) | not))]')
               latest=$(jq -c 'sort_by(.created_at) | last // empty' <<<"$runs")
               if [[ -z "$latest" ]]; then
                 echo "Waiting for $workflow to start for $TAG ($attempt/$attempts)"
@@ -377,5 +378,9 @@ jobs:
           wait_for_workflow docs.yml push
           wait_for_workflow publish-crate.yml push
 
+          existing_npm_run_ids=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/publish-npm.yml/runs?event=workflow_dispatch&head_sha=$tag_sha&per_page=100" \
+            --jq '.workflow_runs' \
+            | jq -c --arg tag "$TAG" '[.[] | select(.head_branch == $tag) | .id]')
           gh workflow run publish-npm.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG" -f publish=true
-          wait_for_workflow publish-npm.yml workflow_dispatch
+          wait_for_workflow publish-npm.yml workflow_dispatch 120 "$existing_npm_run_ids"
