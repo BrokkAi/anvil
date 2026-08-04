@@ -8,7 +8,6 @@ use clap::{Parser, Subcommand};
 mod acp;
 mod agents;
 mod agents_md;
-mod asgard;
 mod bedrock_auth;
 mod bedrock_client;
 mod bedrock_credits;
@@ -96,23 +95,6 @@ struct Args {
     /// message (e.g. "continue") resumes the task from where it stopped.
     #[arg(long, default_value_t = 0)]
     max_turns: usize,
-
-    /// Candidate model for Asgard trajectory search. Repeat to configure an
-    /// ordered pool of up to five lanes; the supervisor chooses how many of
-    /// the pool's leading lanes to launch each window. All candidates require
-    /// provider-qualified model wire ids (for example
-    /// `deepseek::deepseek-v4-flash`).
-    #[arg(long = "asgard-model")]
-    asgard_models: Vec<String>,
-
-    /// Supervisor model for Asgard (for example
-    /// `deepseek::deepseek-v4-pro`). Defaults to the selected session model.
-    #[arg(long, requires = "asgard_models")]
-    asgard_supervisor: Option<String>,
-
-    /// Deprecated. Asgard supervisor now chooses each shared window length.
-    #[arg(long, default_value_t = 8)]
-    asgard_window_steps: usize,
 
     /// Maximum number of sessions to keep resident in memory before the
     /// least-recently-used session is evicted (the on-disk zip is unaffected
@@ -222,9 +204,6 @@ impl std::fmt::Debug for Args {
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
-            .field("asgard_models", &self.asgard_models)
-            .field("asgard_supervisor", &self.asgard_supervisor)
-            .field("asgard_window_steps", &self.asgard_window_steps)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
             .field("bifrost_binary", &self.bifrost_binary)
@@ -797,21 +776,6 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
-    // `--asgard-supervisor` accepts a `model+effort` selector the same way
-    // `--models` does in the harness; without the split the suffix reached
-    // the provider as part of the model id and 404'd.
-    let (supervisor_model, supervisor_reasoning_effort) = match args.asgard_supervisor {
-        Some(selector) => {
-            let (model, effort) = asgard::split_model_effort(&selector);
-            (Some(model), effort)
-        }
-        None => (None, None),
-    };
-    asgard::configure((!args.asgard_models.is_empty()).then_some(asgard::Config {
-        candidate_models: args.asgard_models,
-        supervisor_model,
-        supervisor_reasoning_effort,
-    }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
     acp::run_agent(

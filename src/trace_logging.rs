@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::sync::Mutex;
 const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
-const TRACE_RUN_ID_ENV: &str = "ANVIL_TRACE_RUN_ID";
 static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
@@ -12,30 +11,6 @@ struct TraceContext {
 
 tokio::task_local! {
     static TRACE_CONTEXT: TraceContext;
-}
-
-pub async fn with_trace_context_from_env<F, T>(run_id: Option<String>, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    let Ok(path) = std::env::var(TRACE_JSONL_ENV) else {
-        return future.await;
-    };
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return future.await;
-    }
-    let run_id = run_id.or_else(trace_run_id_from_env);
-    TRACE_CONTEXT
-        .scope(TraceContext { path, run_id }, future)
-        .await
-}
-
-pub fn trace_run_id_from_env() -> Option<String> {
-    std::env::var(TRACE_RUN_ID_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 pub fn append_trace_record(record: serde_json::Value) {

@@ -69,10 +69,9 @@ const DAILY_QUOTA_MARKER: &str = "-tpd:";
 /// A per-day token quota does not reset on any timescale a retry loop can
 /// wait out, so treating its 429 as "rate limited, back off and try again"
 /// burns the whole retry budget and then hands the caller a failure that is
-/// indistinguishable from a transient one. That is how a 2x113-task sweep
-/// laundered 186 dead supervisor turns into ordinary-looking `TESTS_FAILED`
-/// completions: the Asgard fallback finalized an arbitrary checkpoint
-/// because nothing in the error said "this is fatal". This marker says it.
+/// indistinguishable from a transient one -- a fallback path then finalizes
+/// an arbitrary result because nothing in the error said "this is fatal".
+/// This marker says it.
 #[derive(Debug)]
 pub(crate) struct FatalLlmQuotaError {
     quota: String,

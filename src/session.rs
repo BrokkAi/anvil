@@ -3390,55 +3390,6 @@ impl SessionStore {
         Some(registry)
     }
 
-    /// Build an uncached registry for an isolated trajectory workspace while
-    /// inheriting the parent session's tools, skills, subagents, MCP servers,
-    /// and additional roots. The parent session cwd and cached registry are
-    /// left untouched.
-    pub async fn create_trajectory_registry(
-        &self,
-        session_id: &str,
-        cwd: PathBuf,
-    ) -> Option<Arc<ToolRegistry>> {
-        self.create_trajectory_registry_with_roots(session_id, cwd, &[])
-            .await
-    }
-
-    /// As [`Self::create_trajectory_registry`], with extra read roots used by
-    /// an internal trajectory supervisor to inspect candidate repositories.
-    pub async fn create_trajectory_registry_with_roots(
-        &self,
-        session_id: &str,
-        cwd: PathBuf,
-        extra_roots: &[PathBuf],
-    ) -> Option<Arc<ToolRegistry>> {
-        let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents, mcp_servers, additional_directories) = {
-            let sessions = self.sessions.read().await;
-            let session = sessions.get(session_id)?;
-            (
-                session.skills.clone(),
-                session.agents.clone(),
-                effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
-                session.additional_directories.clone(),
-            )
-        };
-        let plugin_hooks =
-            crate::plugins::discover(Some(&normalized_cwd), dirs::home_dir().as_deref()).hooks();
-        let mut roots = additional_directories;
-        roots.extend_from_slice(extra_roots);
-        Some(Arc::new(
-            ToolRegistry::new(
-                normalized_cwd,
-                normalize_additional_directories(&roots),
-                mcp_servers,
-                skills,
-                agents,
-                plugin_hooks,
-                self.shell_minimizer_enabled,
-            )
-            .await,
-        ))
-    }
 
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
