@@ -3390,7 +3390,6 @@ impl SessionStore {
         Some(registry)
     }
 
-
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
     }
@@ -6081,6 +6080,11 @@ mod tests {
     /// changes are not persisted, so they reset on reload.
     #[tokio::test]
     async fn get_session_loads_from_disk_when_cold() {
+        // Reloading mints a fresh `permission_mode` via `initial_permission_mode`,
+        // which reads `BROKK_ACP_PERMISSION_MODE` - a process-wide env var that
+        // the `initial_permission_mode_*` tests set. Without the guard this test
+        // reads whatever they have installed and sees `bypassPermissions`.
+        let _env_guard = ENV_GUARD.lock().await;
         let store = SessionStore::new("m".to_string());
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-rust-cold-{}", uuid::Uuid::new_v4()));
