@@ -3390,7 +3390,6 @@ impl SessionStore {
         Some(registry)
     }
 
-
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
     }
