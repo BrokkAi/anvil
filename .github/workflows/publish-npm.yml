@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   build-and-publish:
-    name: Build, validate${{ inputs.publish && ', and publish' || '' }}
+    name: Build and validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,6 +85,30 @@ jobs:
       - name: Show publication plan (dry run)
         run: node npm/publish-npm-packages.mjs --dist npm/dist
 
-      - name: Publish to npm
-        if: ${{ inputs.publish }}
+  publish:
+    name: Publish to npm
+    if: ${{ inputs.publish }}
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm (trusted publishing needs npm >= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Download validated npm packages
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-packages-${{ inputs.tag }}
+          path: npm/dist
+
+      - name: Publish and verify npm packages
         run: node npm/publish-npm-packages.mjs --dist npm/dist --yes-publish

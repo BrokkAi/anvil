@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 # Harden cargo's network layer against transient crates.io index fetches that
@@ -321,3 +322,64 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: bash scripts/announce-discord-release.sh
+
+  publish-npm:
+    name: Gate and dispatch npm publish
+    if: github.event_name == 'push'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require the tagged release workflows to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_sha=$(git rev-list -n1 "$TAG")
+          wait_for_workflow() {
+            local workflow="$1" attempts=40
+            for ((attempt = 1; attempt <= attempts; attempt++)); do
+              local runs latest status conclusion
+              runs=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=push&head_sha=$tag_sha&per_page=100" \
+                --jq '.workflow_runs' \
+                | jq -c --arg tag "$TAG" '[.[] | select(.head_branch == $tag)]')
+              latest=$(jq -c 'sort_by(.created_at) | last // empty' <<<"$runs")
+              if [[ -z "$latest" ]]; then
+                echo "Waiting for $workflow to start for $TAG ($attempt/$attempts)"
+              else
+                status=$(jq -r '.status' <<<"$latest")
+                conclusion=$(jq -r '.conclusion // empty' <<<"$latest")
+                if [[ "$status" == completed && "$conclusion" == success ]]; then
+                  echo "$workflow passed for $TAG"
+                  return 0
+                fi
+                if [[ "$status" == completed ]]; then
+                  echo "::error::$workflow concluded $conclusion for $TAG"
+                  return 1
+                fi
+                echo "Waiting for $workflow ($status, $attempt/$attempts)"
+              fi
+              sleep 30
+            done
+            echo "::error::Timed out waiting for $workflow to pass for $TAG"
+            return 1
+          }
+
+          wait_for_workflow ci.yml
+          wait_for_workflow docs.yml
+          wait_for_workflow publish-crate.yml
+
+      - name: Dispatch npm publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh workflow run publish-npm.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG" -f publish=true
