@@ -768,6 +768,7 @@ fn is_builtin_tool(name: &str) -> bool {
 /// Rows for MCP-loaded tools describe Anvil's default Bifrost toolset; a
 /// session's live registry may expose fewer (server disabled) or more
 /// (extra MCP servers) at prompt time.
+#[cfg(feature = "http-api")]
 pub(crate) struct ToolCatalogEntry {
     pub(crate) name: &'static str,
     pub(crate) kind: ToolKind,
@@ -776,6 +777,7 @@ pub(crate) struct ToolCatalogEntry {
     pub(crate) builtin: bool,
 }
 
+#[cfg(feature = "http-api")]
 pub(crate) fn tool_catalog() -> Vec<ToolCatalogEntry> {
     TOOLS
         .iter()

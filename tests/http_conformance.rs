@@ -1,3 +1,5 @@
+#![cfg(feature = "http-api")]
+
 //! Black-box conformance suite for the Anvil HTTP API (#320).
 //!
 //! Starts the packaged `anvil serve` daemon against a scripted

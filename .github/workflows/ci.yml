@@ -101,6 +101,12 @@ jobs:
     - name: Run Clippy lints
       run: cargo clippy --all-targets -- -D warnings
 
+    # ACP-only configuration (#346): the http-api feature is default-on,
+    # but the opt-out build must keep compiling and linting or the gated
+    # code rots.
+    - name: Run Clippy lints (ACP-only, no http-api)
+      run: cargo clippy --all-targets --no-default-features --features wasm-sandbox -- -D warnings
+
     - name: Build Anvil
       run: cargo build --release
 

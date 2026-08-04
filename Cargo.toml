@@ -16,8 +16,12 @@ homepage = "https://github.com/BrokkAi/anvil"
 readme = "README.md"
 
 [features]
-default = ["wasm-sandbox"]
+default = ["wasm-sandbox", "http-api"]
 wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# `anvil serve` HTTP daemon (#317/#346). Default-on; all official release
+# binaries ship it. `--no-default-features --features wasm-sandbox` builds
+# an ACP-only binary without the axum dependency tree.
+http-api = ["dep:axum"]
 
 [[bin]]
 name = "anvil"
@@ -26,8 +30,8 @@ path = "src/main.rs"
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable"] }
 # HTTP daemon for `anvil serve` (#317). Server-side only; LLM/MCP client
-# traffic stays on `reqwest`.
-axum = "0.8"
+# traffic stays on `reqwest`. Optional: gated behind the `http-api` feature.
+axum = { version = "0.8", optional = true }
 # Dependency-renamed so imports stay `anvil_minimizer::` while the published
 # crate is namespaced. The minimizer is versioned in lockstep with this crate:
 # bump this requirement, the minimizer's version, and the root version

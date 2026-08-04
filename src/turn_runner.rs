@@ -63,7 +63,10 @@ pub(crate) struct PromptTurnOutcome {
     pub structured_output: Option<StructuredOutputResult>,
     /// Session-cumulative usage after recording this turn.
     pub cumulative_usage: TokenUsage,
-    /// This turn's usage alone (compaction included).
+    /// This turn's usage alone (compaction included). Consumed by the
+    /// HTTP runs API for run resources and terminal events; the ACP
+    /// adapter reports usage through its own session-cumulative update.
+    #[cfg(feature = "http-api")]
     pub turn_usage: TokenUsage,
     pub response: String,
     pub stop: LoopStop,
@@ -265,6 +268,7 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
     PromptTurnOutcome {
         structured_output: structured_output_result,
         cumulative_usage,
+        #[cfg(feature = "http-api")]
         turn_usage,
         response: response_text,
         stop,
