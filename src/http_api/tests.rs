@@ -18,6 +18,10 @@ async fn start_server(sessions: SessionStore) -> SocketAddr {
         sessions,
         llm: Arc::new(MultiBackend::new(Vec::new())),
         refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        runs: Arc::new(super::runs::RunManager::default()),
+        max_turns: usize::MAX,
+        default_idle_timeout_secs: 30,
+        default_stall_timeout_secs: 30,
     };
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -402,4 +406,312 @@ async fn malformed_json_body_uses_error_envelope() {
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     let body = response.json::<Value>().await.expect("JSON body");
     assert_eq!(body["error"]["code"], "invalid_argument");
+}
+
+// ---------------------------------------------------------------------------
+// Prompt runs (#318)
+// ---------------------------------------------------------------------------
+
+use futures::FutureExt;
+use futures::future::BoxFuture;
+
+use crate::llm_client::{LlmBackend, LlmResponse, StreamChatRequest, TokenUsage};
+use crate::multi_backend::BackendRegistration;
+
+/// Scripted backend for the `test::` source: streams a fixed reply, or
+/// hangs until cancellation to exercise in-flight semantics.
+enum MockBehavior {
+    Echo,
+    HangUntilCancelled,
+}
+
+struct MockBackend {
+    behavior: MockBehavior,
+}
+
+impl LlmBackend for MockBackend {
+    fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+        async { Ok(vec!["alpha".to_string()]) }.boxed()
+    }
+
+    fn stream_chat(
+        &self,
+        request: StreamChatRequest,
+    ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+        match self.behavior {
+            MockBehavior::Echo => {
+                let mut on_token = request.on_token;
+                async move {
+                    on_token("Hello from mock");
+                    Ok(LlmResponse::Text {
+                        text: "Hello from mock".to_string(),
+                        reasoning_content: None,
+                        usage: TokenUsage {
+                            input_tokens: 3,
+                            output_tokens: 2,
+                            thought_tokens: 0,
+                            cached_read_tokens: 0,
+                            cached_write_tokens: 0,
+                        },
+                    })
+                }
+                .boxed()
+            }
+            MockBehavior::HangUntilCancelled => async move {
+                request.cancel.cancelled().await;
+                anyhow::bail!("stream cancelled")
+            }
+            .boxed(),
+        }
+    }
+}
+
+async fn start_run_server(behavior: MockBehavior) -> (SocketAddr, SessionStore) {
+    let sessions = seeded_store().await;
+    let llm = Arc::new(MultiBackend::new(vec![BackendRegistration::new(
+        "test",
+        "Test",
+        Some(Arc::new(MockBackend { behavior })),
+    )]));
+    let state = ApiState {
+        sessions: sessions.clone(),
+        llm,
+        refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        runs: Arc::new(super::runs::RunManager::default()),
+        max_turns: usize::MAX,
+        default_idle_timeout_secs: 30,
+        default_stall_timeout_secs: 30,
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind ephemeral test port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.expect("serve");
+    });
+    (addr, sessions)
+}
+
+async fn create_test_session(addr: SocketAddr, cwd: &str) -> String {
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": cwd }))
+        .send()
+        .await
+        .expect("create session")
+        .json::<Value>()
+        .await
+        .expect("JSON body");
+    created["id"].as_str().expect("session id").to_string()
+}
+
+async fn poll_run_until_terminal(addr: SocketAddr, run_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (status, run) = get_json(addr, &format!("/v1/runs/{run_id}")).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        if run["status"] != "running" {
+            return run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run did not reach a terminal state in time: {run}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn run_lifecycle_streams_events_and_persists_turn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::Echo).await;
+    let client = reqwest::Client::new();
+    let session_id = create_test_session(addr, &cwd).await;
+
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "say hello" }))
+        .send()
+        .await
+        .expect("create run");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let created = response.json::<Value>().await.expect("JSON body");
+    let run_id = created["id"].as_str().expect("run id").to_string();
+    assert_eq!(created["session_id"], session_id.as_str());
+
+    let run = poll_run_until_terminal(addr, &run_id).await;
+    assert_eq!(run["status"], "completed", "run failed: {run}");
+    assert_eq!(run["stop_reason"], "end_turn");
+    assert_eq!(run["result_text"], "Hello from mock");
+    assert_eq!(run["usage"]["input_tokens"], 3);
+    assert_eq!(run["error"], Value::Null);
+
+    // The event stream terminates after the terminal event, so the full
+    // body is readable in one shot.
+    let events_body = client
+        .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+        .send()
+        .await
+        .expect("events request")
+        .text()
+        .await
+        .expect("events body");
+    assert!(events_body.contains("event: run.created"));
+    assert!(events_body.contains("event: message.delta"));
+    assert!(events_body.contains("Hello from mock"));
+    assert!(events_body.contains("event: run.completed"));
+
+    // Reconnecting from the last seen sequence id replays nothing new.
+    let last_seq = run["last_seq"].as_u64().expect("last seq");
+    let replay = client
+        .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+        .header("last-event-id", last_seq.to_string())
+        .send()
+        .await
+        .expect("replay request")
+        .text()
+        .await
+        .expect("replay body");
+    assert!(
+        !replay.contains("event: run.completed"),
+        "full replay after Last-Event-ID should skip already-seen events: {replay}"
+    );
+
+    // Resuming mid-stream replays only events after the cursor.
+    let partial = client
+        .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+        .header("last-event-id", (last_seq - 1).to_string())
+        .send()
+        .await
+        .expect("partial replay request")
+        .text()
+        .await
+        .expect("partial replay body");
+    assert!(partial.contains("event: run.completed"));
+    assert!(!partial.contains("event: run.created"));
+
+    // The turn persisted through the same SessionStore path ACP uses.
+    let (status, session) = get_json(
+        addr,
+        &format!("/v1/sessions/{session_id}?include_history=true"),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(session["history_turns"], 1);
+    assert_eq!(session["history"][0]["user_prompt"], "say hello");
+    assert_eq!(session["history"][0]["agent_response"], "Hello from mock");
+    assert_eq!(session["usage"]["input_tokens"], 3);
+
+    // The prompt slot was released: a second run is accepted.
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "again" }))
+        .send()
+        .await
+        .expect("second run");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let second = response.json::<Value>().await.expect("JSON body");
+    let second_run = poll_run_until_terminal(addr, second["id"].as_str().unwrap()).await;
+    assert_eq!(second_run["status"], "completed");
+
+    // Both runs are listed for the session, newest first.
+    let (status, listing) = get_json(addr, &format!("/v1/sessions/{session_id}/runs")).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(listing["runs"].as_array().expect("runs array").len(), 2);
+}
+
+#[tokio::test]
+async fn duplicate_run_is_rejected_and_cancel_is_idempotent() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::HangUntilCancelled).await;
+    let client = reqwest::Client::new();
+    let session_id = create_test_session(addr, &cwd).await;
+
+    let created = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "hang" }))
+        .send()
+        .await
+        .expect("create run")
+        .json::<Value>()
+        .await
+        .expect("JSON body");
+    let run_id = created["id"].as_str().expect("run id").to_string();
+
+    // One-in-flight-prompt-per-session is preserved across transports.
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "duplicate" }))
+        .send()
+        .await
+        .expect("duplicate run");
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let body = response.json::<Value>().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "conflict");
+
+    // Cancel, and cancel again once terminal: both succeed.
+    let response = client
+        .post(format!("http://{addr}/v1/runs/{run_id}/cancel"))
+        .send()
+        .await
+        .expect("cancel run");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let run = poll_run_until_terminal(addr, &run_id).await;
+    assert_eq!(run["status"], "cancelled", "expected cancelled: {run}");
+    assert_eq!(run["stop_reason"], "cancelled");
+    let response = client
+        .post(format!("http://{addr}/v1/runs/{run_id}/cancel"))
+        .send()
+        .await
+        .expect("second cancel");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("JSON body")["status"],
+        "cancelled"
+    );
+
+    // The session accepts a fresh run afterwards (slot released).
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "after cancel" }))
+        .send()
+        .await
+        .expect("run after cancel");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn run_validation_and_unknown_resources() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::Echo).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/no-such-session/runs"))
+        .json(&serde_json::json!({ "prompt": "hello" }))
+        .send()
+        .await
+        .expect("run on unknown session");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let session_id = create_test_session(addr, &cwd).await;
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "   " }))
+        .send()
+        .await
+        .expect("empty prompt");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let (status, _) = get_json(addr, "/v1/runs/run_nope").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    let response = client
+        .post(format!("http://{addr}/v1/runs/run_nope/cancel"))
+        .send()
+        .await
+        .expect("cancel unknown run");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
