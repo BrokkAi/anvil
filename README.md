@@ -51,6 +51,16 @@ brew install brokkai/tap/anvil
 anvil --version
 ```
 
+Or install through npm on any supported platform (macOS, Linux glibc, Windows, Android/Termux) — the package installs the released native binary, no Rust toolchain needed:
+
+```bash
+npm install -g @brokkai/anvil
+anvil --version
+
+# or run one-shot without installing
+npx -y @brokkai/anvil --version
+```
+
 Or install the latest checksum-verified release on macOS, Linux, WSL, or Android/Termux:
 
 ```bash

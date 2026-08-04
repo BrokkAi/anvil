@@ -1,0 +1,90 @@
+name: Publish npm Packages
+
+# Manual workflow that packages an existing GitHub release as the six
+# @brokkai npm packages. It defaults to build-and-validate only; writing to
+# the npm registry requires explicitly checking the `publish` input.
+#
+# Publishing uses npm trusted publishing (OIDC) — no long-lived npm token is
+# stored in the repository. The workflow is safe to re-run after a partial
+# publication: already-published versions are skipped, and the root package
+# is only ever published after every platform package is publicly visible.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing GitHub release tag to package (for example v0.24.2)'
+        required: true
+      publish:
+        description: 'Publish to npmjs.org. Leave unchecked to build and validate only.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build, validate${{ inputs.publish && ', and publish' || '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm (trusted publishing needs npm >= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Verify the release tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft --jq '.'
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'brokk-anvil-*.zip' --pattern 'brokk-anvil-*.zip.sha256' \
+            --dir release-assets
+          ls -l release-assets
+
+      - name: Build and validate npm packages
+        env:
+          TAG: ${{ inputs.tag }}
+        run: node npm/build-npm-packages.mjs --tag "$TAG" --assets-dir release-assets --out npm/dist
+
+      - name: Smoke-test the built tarballs (linux-x64)
+        run: node npm/test-npm-packages.mjs --dist npm/dist
+
+      - name: Upload tarballs as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-packages-${{ inputs.tag }}
+          path: |
+            npm/dist/*.tgz
+            npm/dist/manifest.json
+          if-no-files-found: error
+
+      - name: Show publication plan (dry run)
+        run: node npm/publish-npm-packages.mjs --dist npm/dist
+
+      - name: Publish to npm
+        if: ${{ inputs.publish }}
+        run: node npm/publish-npm-packages.mjs --dist npm/dist --yes-publish
