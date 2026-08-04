@@ -4962,6 +4962,11 @@ fn build_system_prompt(
 /// short imperative rules better than long constitutions, and this string
 /// rides on every request.
 ///
+/// The AGENTS.md section is the prompt half of `crate::agents_md`, which only
+/// loads the project-root-to-cwd chain. Nothing eagerly reads the files nested
+/// below cwd, so the model is told their scoping rule and asked to fetch those
+/// itself when it works under the directories that own them.
+///
 /// Tool-preference language is conditioned on what is ADVERTISED because the
 /// active toolset varies by session (bifrost may be absent; P2T gates tools):
 /// an unconditional "use read_file, not cat" invites calls to tools that are
@@ -4995,6 +5000,13 @@ handling, no unrequested features. Prefer editing existing files over creating n
 not revert changes that are not yours.
 - Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
 narrate what code does or address the user in comments.
+
+# AGENTS.md
+
+- An AGENTS.md (or CLAUDE.md) governs the whole tree under its directory. Obey every one \
+covering a file you touch; on conflict the most deeply nested wins.
+- Those from the project root down to the working directory are already supplied. Ones below \
+it are not: check for them before editing under a subdirectory.
 
 # Verification
 
@@ -10736,6 +10748,35 @@ mod tests {
                 !prompt.contains("create a task list"),
                 "system prompt for {mode:?} must not revive the task-list invitation (anvil has \
                  no todo tool; it induces prose plans instead of tool calls), got: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_system_prompt_explains_nested_agents_md_scope() {
+        // `agents_md::discover` only walks the git-root-to-cwd chain, so
+        // an AGENTS.md nested below cwd reaches the model only if the
+        // prompt tells it to go read one.
+        let cwd = std::path::Path::new("/tmp/some-cwd");
+        for mode in [SessionMode::Lutz, SessionMode::Plan] {
+            let prompt = build_system_prompt(&mode, cwd, &[]);
+            assert!(
+                prompt.contains("governs the whole tree under its directory"),
+                "system prompt for {mode:?} must state the AGENTS.md scoping rule, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("the most deeply nested wins"),
+                "system prompt for {mode:?} must state nested-wins precedence, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("are already supplied"),
+                "system prompt for {mode:?} must stop the model re-reading the supplied \
+                 root-to-cwd chain, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("before editing under a subdirectory"),
+                "system prompt for {mode:?} must ask the model to fetch AGENTS.md nested \
+                 below cwd, got: {prompt}"
             );
         }
     }
