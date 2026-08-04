@@ -4962,6 +4962,11 @@ fn build_system_prompt(
 /// short imperative rules better than long constitutions, and this string
 /// rides on every request.
 ///
+/// The AGENTS.md section is the prompt half of `crate::agents_md`, which only
+/// loads the project-root-to-cwd chain. Nothing eagerly reads the files nested
+/// below cwd, so the model is told their scoping rule and asked to fetch those
+/// itself when it works under the directories that own them.
+///
 /// Tool-preference language is conditioned on what is ADVERTISED because the
 /// active toolset varies by session (bifrost may be absent; P2T gates tools):
 /// an unconditional "use read_file, not cat" invites calls to tools that are
@@ -4995,6 +5000,18 @@ handling, no unrequested features. Prefer editing existing files over creating n
 not revert changes that are not yours.
 - Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
 narrate what code does or address the user in comments.
+
+# Project instructions (AGENTS.md)
+
+- An AGENTS.md governs the entire directory tree rooted at the folder containing it; a \
+CLAUDE.md is equivalent where no AGENTS.md sits beside it. Obey every such file whose scope \
+covers a file you touch.
+- When two of them cover the same file, the more deeply nested one wins. Direct system and \
+user instructions outrank both.
+- Any AGENTS.md between the project root and the working directory has already been supplied \
+to you; do not re-read those. Ones nested below the working directory have not been: before \
+editing under a subdirectory, check that subdirectory and the directories between it and the \
+working directory for their own AGENTS.md, and read any you find.
 
 # Verification
 
@@ -10736,6 +10753,35 @@ mod tests {
                 !prompt.contains("create a task list"),
                 "system prompt for {mode:?} must not revive the task-list invitation (anvil has \
                  no todo tool; it induces prose plans instead of tool calls), got: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_system_prompt_explains_nested_agents_md_scope() {
+        // `agents_md::discover` only walks the git-root-to-cwd chain, so
+        // an AGENTS.md nested below cwd reaches the model only if the
+        // prompt tells it to go read one.
+        let cwd = std::path::Path::new("/tmp/some-cwd");
+        for mode in [SessionMode::Lutz, SessionMode::Plan] {
+            let prompt = build_system_prompt(&mode, cwd, &[]);
+            assert!(
+                prompt.contains("entire directory tree rooted at the folder containing it"),
+                "system prompt for {mode:?} must state the AGENTS.md scoping rule, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("the more deeply nested one wins"),
+                "system prompt for {mode:?} must state nested-wins precedence, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("do not re-read those"),
+                "system prompt for {mode:?} must stop the model re-reading the supplied \
+                 root-to-cwd chain, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("before editing under a subdirectory"),
+                "system prompt for {mode:?} must ask the model to fetch AGENTS.md nested \
+                 below cwd, got: {prompt}"
             );
         }
     }
