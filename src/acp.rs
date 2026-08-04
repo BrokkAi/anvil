@@ -6,6 +6,8 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities,
+    AuthMethod,
+    AuthMethodAgent,
     AvailableCommand,
     AvailableCommandsUpdate,
     CancelNotification,
@@ -1579,9 +1581,22 @@ pub async fn run_agent(
                             ),
                     );
 
+                // Anvil requires no login of its own, but the ACP registry
+                // (AUTHENTICATION.md) rejects agents whose initialize response
+                // advertises no auth methods, so declare an explicit no-auth
+                // method rather than an empty list.
+                let auth_methods = vec![AuthMethod::Agent(
+                    AuthMethodAgent::new("none", "No authentication required").description(
+                        "Anvil needs no login; model providers are configured per \
+                         session (/setup) or through environment variables.",
+                    ),
+                )];
+
                 let protocol_version = negotiate_protocol_version(req.protocol_version);
                 responder.respond(
-                    InitializeResponse::new(protocol_version).agent_capabilities(capabilities),
+                    InitializeResponse::new(protocol_version)
+                        .agent_capabilities(capabilities)
+                        .auth_methods(auth_methods),
                 )
             },
             on_receive_request!(),
