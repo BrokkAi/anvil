@@ -51,6 +51,7 @@ mod tool_loop;
 mod tools;
 mod trace_logging;
 mod train_bifrost;
+mod turn_runner;
 mod usage_report;
 mod workspace_delta;
 
@@ -772,13 +773,6 @@ async fn main() -> Result<()> {
         .set_default_reasoning_effort(args.reasoning_effort)
         .await;
 
-    // HTTP daemon mode shares the backend registrations and SessionStore
-    // built above with the ACP path, so both transports use one runtime
-    // and persistence implementation (#317).
-    if let Some(Command::Serve(serve_args)) = args.command {
-        return http_api::serve(serve_args, llm, sessions).await;
-    }
-
     // `0` means "no turn cap" (matching `--max-sessions`/`--max-history-turns`):
     // map it to the max so the `for turn in 0..turn_limit` loop is bounded only
     // by the model's own completion signal, the stream timeouts, and the nudges.
@@ -787,6 +781,21 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
+
+    // HTTP daemon mode shares the backend registrations, SessionStore, and
+    // turn limits built above with the ACP path, so both transports use one
+    // runtime and persistence implementation (#317, #318).
+    if let Some(Command::Serve(serve_args)) = args.command {
+        return http_api::serve(
+            serve_args,
+            llm,
+            sessions,
+            max_turns,
+            args.llm_idle_timeout_secs,
+            args.llm_stall_timeout_secs,
+        )
+        .await;
+    }
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
     acp::run_agent(

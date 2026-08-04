@@ -19,6 +19,11 @@
 //! | DELETE | `/v1/sessions/{id}`           | Delete (idempotent)                  |
 //! | POST   | `/v1/sessions/{id}/load`      | Reopen with history in the response  |
 //! | POST   | `/v1/sessions/{id}/resume`    | Reopen without history               |
+//! | POST   | `/v1/sessions/{id}/runs`      | Start an asynchronous prompt run     |
+//! | GET    | `/v1/sessions/{id}/runs`      | List this session's runs             |
+//! | GET    | `/v1/runs/{id}`               | Poll run state and result            |
+//! | GET    | `/v1/runs/{id}/events`        | SSE event stream (`Last-Event-ID`)   |
+//! | POST   | `/v1/runs/{id}/cancel`        | Cancel the active turn (idempotent)  |
 //!
 //! Error responses share one envelope: `{"error": {"code", "message",
 //! "details"?}, "request_id"}` with the same id echoed in `x-request-id`.
@@ -74,6 +79,9 @@ pub(crate) async fn serve(
     args: ServeArgs,
     llm: Arc<MultiBackend>,
     sessions: SessionStore,
+    max_turns: usize,
+    default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
 ) -> Result<()> {
     match llm.list_model_metadata_with_progress(None).await {
         Ok(models) => {
@@ -104,6 +112,10 @@ pub(crate) async fn serve(
         sessions,
         llm,
         refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        runs: Arc::new(runs::RunManager::default()),
+        max_turns,
+        default_idle_timeout_secs,
+        default_stall_timeout_secs,
     };
     let listener = tokio::net::TcpListener::bind((ip, args.port))
         .await
@@ -161,6 +173,13 @@ struct ApiState {
     /// Serializes `?refresh=true` model re-discovery so concurrent requests
     /// don't stack redundant provider probes (mirrors the ACP refresh lock).
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Registry of prompt runs started over HTTP (#318).
+    runs: Arc<runs::RunManager>,
+    /// Per-prompt tool-turn cap; `usize::MAX` means unbounded (`--max-turns 0`).
+    max_turns: usize,
+    /// Binary-wide LLM stream timeouts, overridable per session.
+    default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
 }
 
 fn router(state: ApiState) -> Router {
@@ -177,6 +196,13 @@ fn router(state: ApiState) -> Router {
         )
         .route("/v1/sessions/{session_id}/load", post(load_session))
         .route("/v1/sessions/{session_id}/resume", post(resume_session))
+        .route(
+            "/v1/sessions/{session_id}/runs",
+            get(runs::list_runs).post(runs::create_run),
+        )
+        .route("/v1/runs/{run_id}", get(runs::get_run))
+        .route("/v1/runs/{run_id}/events", get(runs::run_events))
+        .route("/v1/runs/{run_id}/cancel", post(runs::cancel_run))
         .fallback(fallback_not_found)
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -888,6 +914,8 @@ async fn reopen_session(
         session_resource(&state.sessions, &session, include_history).await,
     ))
 }
+
+mod runs;
 
 #[cfg(test)]
 mod tests;
