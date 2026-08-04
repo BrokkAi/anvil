@@ -1,0 +1,968 @@
+openapi: 3.1.0
+info:
+  title: Anvil Agent API
+  description: >
+    Versioned REST surface of the Anvil agent runtime (`anvil serve`).
+    This document, together with the companion SSE event schema
+    (`anvil.v1.events.schema.json`), is the authoritative wire contract:
+    official SDK wire layers are generated from these artifacts, and the
+    black-box conformance suite (`tests/http_conformance.rs`) validates a
+    running daemon against them. See COMPATIBILITY.md for the evolution
+    rules that govern what may change within `/v1`.
+  version: 1.0.0
+  license:
+    name: LGPL-3.0-only
+    identifier: LGPL-3.0-only
+servers:
+  - url: http://127.0.0.1:26845
+    description: Default loopback listener. The bound address is reported on
+      the daemon's stdout `serve.ready` line.
+security:
+  - bearerAuth: []
+  - {}
+tags:
+  - name: server
+  - name: models
+  - name: tools
+  - name: sessions
+  - name: runs
+  - name: permissions
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness, version, and model-discovery state.
+      description: Always unauthenticated, including when a bearer token is
+        configured, so orchestrators can probe liveness without credentials.
+      tags: [server]
+      security: [{}]
+      responses:
+        "200":
+          description: Daemon is serving.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: Model catalog and default model.
+      tags: [models]
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Re-probe providers before answering. Discovery
+            failures are never fatal; the cached catalog is served.
+      responses:
+        "200":
+          description: Discovered models.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/tools:
+    get:
+      operationId: listTools
+      summary: Static harness tool catalog.
+      description: The catalog of built-in and default MCP-loaded tools the
+        harness supports. A session's live registry may expose fewer
+        (server disabled) or more (extra MCP servers) at prompt time.
+      tags: [tools]
+      responses:
+        "200":
+          description: Tool catalog.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/sessions:
+    get:
+      operationId: listSessions
+      summary: List sessions.
+      description: Resident (in-memory) sessions, plus persisted sessions on
+        disk under `cwd` when the query parameter is supplied. Sessions
+        without a title (never prompted) are omitted, matching ACP
+        `session/list`.
+      tags: [sessions]
+      parameters:
+        - name: cwd
+          in: query
+          required: false
+          schema: { type: string }
+          description: Absolute workspace path whose on-disk session archives
+            should be included.
+      responses:
+        "200":
+          description: Session listing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionListResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      operationId: createSession
+      summary: Create and configure a session.
+      description: Creates the session, then applies the optional
+        configuration selectors through the same validation path ACP uses.
+        If any selector is invalid the session is rolled back and an error
+        is returned, so a failed create leaves no state behind.
+      tags: [sessions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSessionRequest" }
+            examples:
+              minimal:
+                value: { cwd: /work/repo }
+              configured:
+                value:
+                  cwd: /work/repo
+                  permission_mode: readOnly
+                  model: "codex::gpt-5-codex"
+                  reasoning_effort: medium
+      responses:
+        "201":
+          description: Session created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/sessions/{session_id}:
+    parameters:
+      - { $ref: "#/components/parameters/SessionId" }
+    get:
+      operationId: getSession
+      summary: Inspect a session.
+      tags: [sessions]
+      parameters:
+        - name: cwd
+          in: query
+          required: false
+          schema: { type: string }
+          description: Workspace to cold-load the session archive from when
+            it is not resident. Defaults to the daemon's process cwd.
+        - name: include_history
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Session resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: configureSession
+      summary: Reconfigure session selectors.
+      description: Applies selectors sequentially through the shared ACP
+        validation path. On a validation failure, selectors already applied
+        stay applied. Model changes that drop an unsupported reasoning
+        effort or service tier pick surface a warning.
+      tags: [sessions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionConfigPatch" }
+      responses:
+        "200":
+          description: Updated session plus warnings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigureSessionResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteSession
+      summary: Delete a session (idempotent).
+      description: >-
+        Cancels any in-flight prompt, removes the persisted archive, and
+        reports whether anything was deleted. Unknown ids report
+        `deleted: false` rather than an error.
+      tags: [sessions]
+      responses:
+        "200":
+          description: Deletion outcome.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteSessionResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/sessions/{session_id}/load:
+    post:
+      operationId: loadSession
+      summary: Reopen a persisted session with history.
+      description: The HTTP analogue of ACP `session/load`; the response
+        embeds the conversation history. The request cwd must match the cwd
+        the session was created under.
+      tags: [sessions]
+      parameters:
+        - { $ref: "#/components/parameters/SessionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LifecycleRequest" }
+      responses:
+        "200":
+          description: Reopened session with `history` present.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/sessions/{session_id}/resume:
+    post:
+      operationId: resumeSession
+      summary: Reopen a persisted session without history.
+      tags: [sessions]
+      parameters:
+        - { $ref: "#/components/parameters/SessionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LifecycleRequest" }
+      responses:
+        "200":
+          description: Reopened session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/sessions/{session_id}/runs:
+    parameters:
+      - { $ref: "#/components/parameters/SessionId" }
+    get:
+      operationId: listRuns
+      summary: List a session's runs, newest first.
+      tags: [runs]
+      responses:
+        "200":
+          description: Runs for the session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunListResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createRun
+      summary: Start an asynchronous prompt run.
+      description: >
+        Returns the run resource promptly; the turn executes in the
+        background. One prompt may be in flight per session: a duplicate
+        run is rejected with 409 until the active run reaches a terminal
+        state or is cancelled. Progress is observable via the run's SSE
+        event stream and by polling the run resource.
+      tags: [runs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRunRequest" }
+            examples:
+              simple:
+                value: { prompt: "Summarize the repository layout." }
+              structured:
+                value:
+                  prompt: "List the three largest files."
+                  structured_output:
+                    schema_name: largest_files
+                    schema:
+                      type: object
+                      properties:
+                        files: { type: array, items: { type: string } }
+                      required: [files]
+      responses:
+        "202":
+          description: Run accepted and executing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      summary: Poll run state and result.
+      tags: [runs]
+      parameters:
+        - { $ref: "#/components/parameters/RunId" }
+      responses:
+        "200":
+          description: Run resource; terminal fields are populated once the
+            run completes, fails, or is cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/runs/{run_id}/events:
+    get:
+      operationId: streamRunEvents
+      summary: Stream run events as Server-Sent Events.
+      description: >
+        Ordered `text/event-stream`. Each SSE message carries the event's
+        sequence number as its `id`, the event type as its `event` name,
+        and a JSON payload described by the companion event schema
+        (`anvil.v1.events.schema.json`) as its `data`. Reconnect with the
+        standard `Last-Event-ID` header (or the `after_seq` query
+        parameter) to replay from a bounded per-run buffer; falling behind
+        the buffer yields an `events.gap` notice. The stream ends after the
+        terminal `run.*` event. Dropping the stream never cancels the run.
+      tags: [runs]
+      parameters:
+        - { $ref: "#/components/parameters/RunId" }
+        - name: after_seq
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0 }
+          description: Replay events with sequence numbers greater than
+            this. The `Last-Event-ID` header wins when both are present.
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: SSE stream of run events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: See anvil.v1.events.schema.json for the payload
+                  contract of each event.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      summary: Cancel the active turn (idempotent).
+      description: Cancels through the same token the runtime uses for ACP
+        cancellation. A cancel racing natural completion loses gracefully;
+        cancelling a terminal run returns its current resource.
+      tags: [runs]
+      parameters:
+        - { $ref: "#/components/parameters/RunId" }
+      responses:
+        "200":
+          description: Current run resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/runs/{run_id}/permissions:
+    get:
+      operationId: listRunPermissions
+      summary: Pending interactive permission requests for a run.
+      tags: [permissions]
+      parameters:
+        - { $ref: "#/components/parameters/RunId" }
+      responses:
+        "200":
+          description: Pending permission requests, oldest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PermissionListResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/permissions/{permission_id}:
+    get:
+      operationId: getPermission
+      summary: Inspect one pending permission request.
+      tags: [permissions]
+      parameters:
+        - { $ref: "#/components/parameters/PermissionId" }
+      responses:
+        "200":
+          description: Pending permission request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Permission" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/permissions/{permission_id}/respond:
+    post:
+      operationId: respondPermission
+      summary: Approve, reject, or cancel a permission request.
+      description: >
+        Resolves a pending request exactly once. `option_id` must be one of
+        the ids offered on the request (for example `allow`,
+        `allow_always`, `allow_outside_sandbox`, `reject`); alternatively
+        pass `cancel: true` to cancel the request. Requests that were
+        already resolved — including by run cancellation or completion —
+        answer 404 (no longer pending) or 409 (racing resolution).
+      tags: [permissions]
+      parameters:
+        - { $ref: "#/components/parameters/PermissionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PermissionResponseRequest" }
+            examples:
+              approve: { value: { option_id: allow } }
+              reject: { value: { option_id: reject } }
+              cancel: { value: { cancel: true } }
+      responses:
+        "200":
+          description: The request was resolved by this response.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PermissionRespondResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Required on every `/v1` endpoint when the daemon is
+        started with a token (`--auth-token`, `--auth-token-file`,
+        `ANVIL_HTTP_TOKEN`, or `--generate-auth-token`). Always required
+        for non-loopback listeners. `/health` is always unauthenticated.
+
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string }
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string }
+    PermissionId:
+      name: permission_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Invalid request (`error.code = "invalid_argument"`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Missing or invalid bearer token
+        (`error.code = "unauthorized"`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: Refused by server policy — workspace roots or
+        `bypassPermissions` gating (`error.code = "forbidden"`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Unknown resource (`error.code = "not_found"`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: State conflict — cwd mismatch, prompt already in flight,
+        no model configured, or permission already resolved
+        (`error.code = "conflict"`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      description: Stable envelope for every non-2xx JSON response. The
+        `request_id` is also echoed on every response in the
+        `x-request-id` header.
+      required: [error, request_id]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_argument, unauthorized, forbidden, not_found, conflict, internal]
+            message: { type: string }
+            details:
+              description: Machine-readable context (offending field,
+                supported values, workspace roots, ...).
+        request_id:
+          type: [string, "null"]
+      additionalProperties: false
+
+    Health:
+      type: object
+      required: [status, name, version, models_discovered]
+      properties:
+        status: { type: string, const: ok }
+        name: { type: string, const: anvil }
+        version: { type: string }
+        models_discovered: { type: integer, minimum: 0 }
+      additionalProperties: false
+
+    ModelsResponse:
+      type: object
+      required: [models, default_model]
+      properties:
+        models:
+          type: array
+          items: { $ref: "#/components/schemas/Model" }
+        default_model:
+          type: [string, "null"]
+      additionalProperties: false
+
+    Model:
+      type: object
+      description: One discovered model. Ids are wire-tagged
+        `<source>::<id>` (for example `codex::gpt-5-codex`,
+        `ollama::llama3:latest`).
+      required:
+        - id
+        - default_reasoning_level
+        - supported_reasoning_levels
+        - service_tiers
+        - supports_images
+        - context_length
+        - pricing
+      properties:
+        id: { type: string }
+        default_reasoning_level: { type: [string, "null"] }
+        supported_reasoning_levels:
+          type: array
+          items:
+            type: object
+            required: [effort, description]
+            properties:
+              effort: { type: string }
+              description: { type: string }
+            additionalProperties: false
+        service_tiers:
+          type: array
+          items:
+            type: object
+            required: [id, name, description]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              description: { type: string }
+            additionalProperties: false
+        supports_images: { type: [boolean, "null"] }
+        context_length: { type: [integer, "null"], minimum: 0 }
+        pricing:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [input_cost_per_token_usd, output_cost_per_token_usd]
+              properties:
+                input_cost_per_token_usd: { type: number }
+                output_cost_per_token_usd: { type: number }
+              additionalProperties: false
+      additionalProperties: false
+
+    ToolsResponse:
+      type: object
+      required: [tools]
+      properties:
+        tools:
+          type: array
+          items: { $ref: "#/components/schemas/Tool" }
+      additionalProperties: false
+
+    Tool:
+      type: object
+      required: [name, kind, display_name, concurrency_safe, source]
+      properties:
+        name: { type: string }
+        kind:
+          type: string
+          description: Permission-gate classification (ACP tool kind).
+        display_name: { type: string }
+        concurrency_safe: { type: boolean }
+        source:
+          type: string
+          enum: [builtin, mcp]
+      additionalProperties: false
+
+    Usage:
+      type: object
+      required:
+        - input_tokens
+        - output_tokens
+        - thought_tokens
+        - cached_read_tokens
+        - cached_write_tokens
+      properties:
+        input_tokens: { type: integer, minimum: 0 }
+        output_tokens: { type: integer, minimum: 0 }
+        thought_tokens: { type: integer, minimum: 0 }
+        cached_read_tokens: { type: integer, minimum: 0 }
+        cached_write_tokens: { type: integer, minimum: 0 }
+      additionalProperties: false
+
+    Session:
+      type: object
+      required:
+        - id
+        - cwd
+        - additional_directories
+        - model
+        - behavior_mode
+        - permission_mode
+        - reasoning_effort
+        - service_tier
+        - title
+        - created_at_ms
+        - modified_at_ms
+        - updated_at
+        - history_turns
+        - usage
+        - usage_cost_usd
+      properties:
+        id: { type: string }
+        cwd: { type: string }
+        additional_directories:
+          type: array
+          items: { type: string }
+        model: { type: string }
+        behavior_mode: { type: string, enum: [LUTZ, PLAN] }
+        permission_mode:
+          type: string
+          enum: [default, auto, acceptEdits, readOnly, bypassPermissions]
+        reasoning_effort: { type: [string, "null"] }
+        service_tier: { type: [string, "null"] }
+        title: { type: [string, "null"] }
+        created_at_ms: { type: integer, minimum: 0 }
+        modified_at_ms: { type: integer, minimum: 0 }
+        updated_at:
+          type: [string, "null"]
+          description: RFC 3339 rendering of `modified_at_ms`.
+        history_turns: { type: integer, minimum: 0 }
+        usage: { $ref: "#/components/schemas/Usage" }
+        usage_cost_usd: { type: [number, "null"] }
+        history:
+          description: Present only on `load` responses and
+            `?include_history=true` inspections.
+          type: array
+          items: { $ref: "#/components/schemas/HistoryTurn" }
+      additionalProperties: false
+
+    HistoryTurn:
+      type: object
+      required: [user_prompt, agent_response, summary, tool_exchanges]
+      properties:
+        user_prompt: { type: string }
+        agent_response: { type: string }
+        summary: { type: [string, "null"] }
+        tool_exchanges:
+          type: array
+          items:
+            type: object
+            required: [call_id, tool_name, arguments, result, status, permission_notice]
+            properties:
+              call_id: { type: string }
+              tool_name: { type: string }
+              arguments: { type: string }
+              result: { type: string }
+              status: { type: string, enum: [completed, failed] }
+              permission_notice: { type: [string, "null"] }
+            additionalProperties: false
+      additionalProperties: false
+
+    SessionListResponse:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            type: object
+            required: [id, title, created_at_ms, modified_at_ms, updated_at, cwd, resident]
+            properties:
+              id: { type: string }
+              title: { type: [string, "null"] }
+              created_at_ms: { type: integer, minimum: 0 }
+              modified_at_ms: { type: integer, minimum: 0 }
+              updated_at: { type: [string, "null"] }
+              cwd: { type: [string, "null"] }
+              resident: { type: boolean }
+            additionalProperties: false
+      additionalProperties: false
+
+    McpServerConfig:
+      type: object
+      description: Anvil's internal MCP server configuration shape.
+        Per-session servers are additive to the daemon's canonical setup.
+      required: [name]
+      properties:
+        name: { type: string }
+        transport: { type: string, enum: [stdio, http, sse], default: stdio }
+        command: { type: string, default: "" }
+        url: { type: [string, "null"] }
+        headers:
+          type: array
+          items: { $ref: "#/components/schemas/McpEnvVar" }
+        args:
+          type: array
+          items: { type: string }
+        env:
+          type: array
+          items: { $ref: "#/components/schemas/McpEnvVar" }
+        framing: { type: string, enum: [content-length, line], default: content-length }
+        enabled: { type: boolean, default: true }
+      additionalProperties: false
+
+    McpEnvVar:
+      type: object
+      required: [name, value]
+      properties:
+        name: { type: string }
+        value: { type: string }
+      additionalProperties: false
+
+    SessionConfigPatch:
+      type: object
+      description: Client-owned per-session selectors, mirroring the ACP
+        `SessionConfigOption` ids. At least one property is required.
+      properties:
+        model: { type: string }
+        reasoning_effort:
+          type: string
+          description: A model-supported effort, `off` to omit reasoning
+            controls, or empty string to clear back to the model default.
+        service_tier:
+          type: string
+          description: A provider tier id, or empty string to clear.
+        behavior_mode: { type: string, enum: [LUTZ, PLAN] }
+        permission_mode:
+          type: string
+          enum: [default, auto, acceptEdits, readOnly, bypassPermissions]
+      additionalProperties: false
+      minProperties: 1
+
+    CreateSessionRequest:
+      type: object
+      required: [cwd]
+      properties:
+        cwd:
+          type: string
+          description: Absolute working directory for the session.
+        additional_directories:
+          type: array
+          items: { type: string }
+        mcp_servers:
+          type: array
+          items: { $ref: "#/components/schemas/McpServerConfig" }
+        model: { type: string }
+        reasoning_effort: { type: string }
+        service_tier: { type: string }
+        behavior_mode: { type: string, enum: [LUTZ, PLAN] }
+        permission_mode:
+          type: string
+          enum: [default, auto, acceptEdits, readOnly, bypassPermissions]
+      additionalProperties: false
+
+    LifecycleRequest:
+      type: object
+      required: [cwd]
+      properties:
+        cwd:
+          type: string
+          description: Must match the cwd the session was created under.
+        additional_directories:
+          type: array
+          items: { type: string }
+        mcp_servers:
+          type: array
+          items: { $ref: "#/components/schemas/McpServerConfig" }
+      additionalProperties: false
+
+    ConfigureSessionResponse:
+      type: object
+      required: [session, warnings]
+      properties:
+        session: { $ref: "#/components/schemas/Session" }
+        warnings:
+          type: array
+          items: { type: string }
+      additionalProperties: false
+
+    DeleteSessionResponse:
+      type: object
+      required: [deleted]
+      properties:
+        deleted: { type: boolean }
+      additionalProperties: false
+
+    StructuredOutputSpec:
+      type: object
+      required: [schema]
+      properties:
+        schema:
+          description: JSON Schema the final response must satisfy.
+        schema_name: { type: string, default: structured_output }
+        allow_coercion: { type: boolean, default: false }
+        prefer_json_object:
+          type: boolean
+          default: false
+          description: Request basic JSON mode instead of strict
+            `json_schema` on providers that support only the former.
+      additionalProperties: false
+
+    CreateRunRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt: { type: string, minLength: 1 }
+        structured_output:
+          oneOf:
+            - type: "null"
+            - { $ref: "#/components/schemas/StructuredOutputSpec" }
+      additionalProperties: false
+
+    Run:
+      type: object
+      required:
+        - id
+        - session_id
+        - status
+        - stop_reason
+        - error
+        - result_text
+        - structured_output
+        - usage
+        - created_at_ms
+        - finished_at_ms
+        - last_seq
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        status:
+          type: string
+          enum: [running, completed, cancelled, failed]
+        stop_reason:
+          type: [string, "null"]
+          enum: [end_turn, max_turns, time_limit, cancelled, error, null]
+        error: { type: [string, "null"] }
+        result_text: { type: [string, "null"] }
+        structured_output:
+          description: Structured-output validation result
+            (`status` = `success` / `coerced_success` / `validation_error`)
+            when the run requested one.
+        usage:
+          oneOf:
+            - type: "null"
+            - { $ref: "#/components/schemas/Usage" }
+        created_at_ms: { type: integer, minimum: 0 }
+        finished_at_ms: { type: [integer, "null"], minimum: 0 }
+        last_seq: { type: integer, minimum: 0 }
+      additionalProperties: false
+
+    RunListResponse:
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items: { $ref: "#/components/schemas/Run" }
+      additionalProperties: false
+
+    PermissionOption:
+      type: object
+      required: [id, label, kind]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        kind: { type: string, enum: [allow_once, allow_always, reject_once] }
+      additionalProperties: false
+
+    Permission:
+      type: object
+      required:
+        - id
+        - run_id
+        - session_id
+        - tool_name
+        - tool_call_id
+        - input
+        - permission_notice
+        - options
+        - created_at_ms
+        - status
+      properties:
+        id: { type: string }
+        run_id: { type: string }
+        session_id: { type: string }
+        tool_name: { type: string }
+        tool_call_id: { type: string }
+        input:
+          description: Raw tool-call arguments awaiting approval.
+        permission_notice: { type: [string, "null"] }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionOption" }
+        created_at_ms: { type: integer, minimum: 0 }
+        status: { type: string, const: pending }
+      additionalProperties: false
+
+    PermissionListResponse:
+      type: object
+      required: [permissions]
+      properties:
+        permissions:
+          type: array
+          items: { $ref: "#/components/schemas/Permission" }
+      additionalProperties: false
+
+    PermissionResponseRequest:
+      type: object
+      description: Pass exactly one of `option_id` or `cancel = true`.
+      properties:
+        option_id: { type: [string, "null"] }
+        cancel: { type: boolean, default: false }
+      additionalProperties: false
+
+    PermissionRespondResult:
+      type: object
+      required: [resolved, id]
+      properties:
+        resolved: { type: boolean, const: true }
+        id: { type: string }
+      additionalProperties: false
