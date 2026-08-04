@@ -25,21 +25,30 @@ impl Drop for ServeDaemon {
     }
 }
 
-fn spawn_serve(home: &std::path::Path) -> ServeDaemon {
-    let bin = std::env::var_os("CARGO_BIN_EXE_anvil")
+fn anvil_bin() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_anvil")
         .map(PathBuf::from)
         .or_else(|| option_env!("CARGO_BIN_EXE_anvil").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("target/debug/anvil"));
-    let mut child = Command::new(bin)
-        .args([
-            "--no-wasm-sandbox",
-            "--transient-setup",
-            "--default-model",
-            "smoke::model",
-            "serve",
-            "--port",
-            "0",
-        ])
+        .unwrap_or_else(|| PathBuf::from("target/debug/anvil"))
+}
+
+fn spawn_serve(home: &std::path::Path) -> ServeDaemon {
+    spawn_serve_with(home, &[]).0
+}
+
+fn spawn_serve_with(home: &std::path::Path, extra_args: &[&str]) -> (ServeDaemon, Value) {
+    let mut args = vec![
+        "--no-wasm-sandbox",
+        "--transient-setup",
+        "--default-model",
+        "smoke::model",
+        "serve",
+        "--port",
+        "0",
+    ];
+    args.extend_from_slice(extra_args);
+    let mut child = Command::new(anvil_bin())
+        .args(&args)
         .env("HOME", home)
         .env("CODEX_HOME", home.join(".codex"))
         .env("BROKK_CONFIG_HOME", home.join("config"))
@@ -75,7 +84,7 @@ fn spawn_serve(home: &std::path::Path) -> ServeDaemon {
         "daemon must bind loopback, got {base_url}"
     );
 
-    ServeDaemon { child, base_url }
+    (ServeDaemon { child, base_url }, ready)
 }
 
 fn http_get(url: &str) -> (u16, Value) {
@@ -100,6 +109,15 @@ fn ureq_get(url: &str) -> Result<(u16, Value), String> {
 }
 
 fn request(method: &str, url: &str, body: Option<&str>) -> Result<(u16, Value), String> {
+    request_with_auth(method, url, body, None)
+}
+
+fn request_with_auth(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    bearer: Option<&str>,
+) -> Result<(u16, Value), String> {
     use std::io::{Read, Write};
 
     let rest = url
@@ -112,8 +130,11 @@ fn request(method: &str, url: &str, body: Option<&str>) -> Result<(u16, Value), 
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| e.to_string())?;
     let payload = body.unwrap_or("");
+    let auth_header = bearer
+        .map(|token| format!("authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+        "{method} {path} HTTP/1.1\r\nhost: {host}\r\n{auth_header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
         payload.len(),
     );
     stream
@@ -247,4 +268,58 @@ fn serve_daemon_lifecycle_over_localhost() {
         .expect("delete session");
     assert_eq!(status, 200);
     assert_eq!(deleted["deleted"], true);
+}
+
+#[test]
+fn serve_refuses_non_loopback_binding_without_auth() {
+    let home = tempfile::tempdir().expect("temp home");
+    let status = Command::new(anvil_bin())
+        .args([
+            "--no-wasm-sandbox",
+            "--transient-setup",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "0",
+        ])
+        .env("HOME", home.path())
+        .env("BROKK_CONFIG_HOME", home.path().join("config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run anvil serve");
+    assert!(
+        !status.success(),
+        "non-loopback binding without a token must fail startup"
+    );
+}
+
+#[test]
+fn serve_generated_token_gates_v1_endpoints() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (daemon, ready) = spawn_serve_with(home.path(), &["--generate-auth-token"]);
+    let base = &daemon.base_url;
+    assert_eq!(ready["auth_required"], true);
+    let token = ready["auth_token"].as_str().expect("generated token");
+
+    // Liveness stays open; /v1 requires the bearer token.
+    let (status, _) = http_get(&format!("{base}/health"));
+    assert_eq!(status, 200);
+    let (status, body) =
+        request_with_auth("GET", &format!("{base}/v1/models"), None, None).expect("no token");
+    assert_eq!(status, 401, "expected 401, got {body}");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    let (status, _) = request_with_auth(
+        "GET",
+        &format!("{base}/v1/models"),
+        None,
+        Some("wrong-token"),
+    )
+    .expect("wrong token");
+    assert_eq!(status, 401);
+    let (status, body) = request_with_auth("GET", &format!("{base}/v1/models"), None, Some(token))
+        .expect("valid token");
+    assert_eq!(status, 200, "expected 200, got {body}");
 }

@@ -24,14 +24,21 @@
 //! | GET    | `/v1/runs/{id}`               | Poll run state and result            |
 //! | GET    | `/v1/runs/{id}/events`        | SSE event stream (`Last-Event-ID`)   |
 //! | POST   | `/v1/runs/{id}/cancel`        | Cancel the active turn (idempotent)  |
+//! | GET    | `/v1/runs/{id}/permissions`   | Pending interactive permissions      |
+//! | GET    | `/v1/permissions/{id}`        | Inspect one permission request       |
+//! | POST   | `/v1/permissions/{id}/respond`| Approve / reject / cancel it         |
 //!
 //! Error responses share one envelope: `{"error": {"code", "message",
 //! "details"?}, "request_id"}` with the same id echoed in `x-request-id`.
 //!
-//! Security posture: the listener is a remote-execution boundary (sessions
-//! drive filesystem and shell tooling), so binding is restricted to loopback
-//! addresses until bearer-token authentication lands (#319). Logs go to
-//! stderr; stdout carries exactly one machine-readable `serve.ready` line.
+//! Security posture (#319): the listener is a remote-execution boundary
+//! (sessions drive filesystem and shell tooling). Binding defaults to
+//! loopback with optional bearer-token auth; non-loopback binding requires
+//! a configured token. `--workspace-root` restricts session paths,
+//! `bypassPermissions` is refused unless `--allow-bypass-permissions` is
+//! set, and auth failures plus permission decisions are written to the
+//! `audit` log target. Logs go to stderr; stdout carries exactly one
+//! machine-readable `serve.ready` line.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -70,6 +77,35 @@ pub(crate) struct ServeArgs {
     /// The default, 26845, spells ANVIL on a phone keypad.
     #[arg(long, default_value_t = 26845)]
     pub(crate) port: u16,
+
+    /// Bearer token required on every `/v1` endpoint (`Authorization:
+    /// Bearer <token>`). `/health` stays open for liveness checks.
+    /// Required to bind a non-loopback address.
+    #[arg(long, env = "ANVIL_HTTP_TOKEN", hide_env_values = true)]
+    pub(crate) auth_token: Option<String>,
+
+    /// Read the bearer token from a file (surrounding whitespace trimmed).
+    /// Preferred over --auth-token, which is visible in process listings.
+    #[arg(long, conflicts_with = "auth_token")]
+    pub(crate) auth_token_file: Option<PathBuf>,
+
+    /// Generate a random bearer token at startup and report it on the
+    /// stdout `serve.ready` line as `auth_token`.
+    #[arg(long, conflicts_with_all = ["auth_token", "auth_token_file"])]
+    pub(crate) generate_auth_token: bool,
+
+    /// Restrict session working directories (and additional directories)
+    /// to descendants of these roots. Repeatable. Without it, sessions may
+    /// use any absolute path the daemon's user can access.
+    #[arg(long = "workspace-root")]
+    pub(crate) workspace_roots: Vec<PathBuf>,
+
+    /// Allow HTTP clients to select `permission_mode:
+    /// "bypassPermissions"`. Off by default: the bypass mode disables the
+    /// permission gate entirely, which is not something a remote caller
+    /// should be able to request unless the operator opted in.
+    #[arg(long, default_value_t = false)]
+    pub(crate) allow_bypass_permissions: bool,
 }
 
 /// Run the HTTP daemon until interrupted. Performs the same eager model
@@ -83,6 +119,37 @@ pub(crate) async fn serve(
     default_idle_timeout_secs: u64,
     default_stall_timeout_secs: u64,
 ) -> Result<()> {
+    // Validate the security configuration before the (potentially slow)
+    // provider discovery so a misconfigured daemon fails fast.
+    let ip: IpAddr = if args.host == "localhost" {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        args.host
+            .parse()
+            .with_context(|| format!("invalid --host address '{}'", args.host))?
+    };
+
+    let (auth, generated_token) = resolve_auth(&args)?;
+    if !ip.is_loopback() && auth.is_none() {
+        bail!(
+            "refusing to bind non-loopback address {ip} without authentication: the HTTP API \
+             exposes model-driven filesystem and shell tooling. Pass --auth-token, \
+             --auth-token-file, or --generate-auth-token (or set ANVIL_HTTP_TOKEN) to enable \
+             authenticated network access."
+        );
+    }
+
+    let mut workspace_roots = Vec::with_capacity(args.workspace_roots.len());
+    for root in &args.workspace_roots {
+        let canonical = root.canonicalize().with_context(|| {
+            format!(
+                "--workspace-root '{}' must be an existing directory",
+                root.display()
+            )
+        })?;
+        workspace_roots.push(canonical);
+    }
+
     match llm.list_model_metadata_with_progress(None).await {
         Ok(models) => {
             tracing::info!("serve startup discovery: {} model(s) found", models.len());
@@ -92,27 +159,15 @@ pub(crate) async fn serve(
         Err(e) => tracing::warn!("serve startup discovery failed: {e:#}"),
     }
 
-    let ip: IpAddr = if args.host == "localhost" {
-        IpAddr::from([127, 0, 0, 1])
-    } else {
-        args.host
-            .parse()
-            .with_context(|| format!("invalid --host address '{}'", args.host))?
-    };
-    if !ip.is_loopback() {
-        bail!(
-            "refusing to bind non-loopback address {ip}: the HTTP API exposes model-driven \
-             filesystem and shell tooling and does not support authentication yet. Bind a \
-             loopback address (default 127.0.0.1) and front it with your own authenticated \
-             proxy if remote access is required."
-        );
-    }
-
     let state = ApiState {
         sessions,
         llm,
         refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         runs: Arc::new(runs::RunManager::default()),
+        permissions: Arc::new(permissions::PermissionRegistry::default()),
+        auth: auth.map(Arc::new),
+        workspace_roots: Arc::new(workspace_roots),
+        allow_bypass_permissions: args.allow_bypass_permissions,
         max_turns,
         default_idle_timeout_secs,
         default_stall_timeout_secs,
@@ -125,14 +180,16 @@ pub(crate) async fn serve(
 
     // The single intentional stdout line: machine-readable readiness with
     // the resolved address (required when --port 0 picks an ephemeral port).
-    println!(
-        "{}",
-        json!({
-            "type": "serve.ready",
-            "url": format!("http://{addr}"),
-            "version": env!("CARGO_PKG_VERSION"),
-        })
-    );
+    let mut ready = json!({
+        "type": "serve.ready",
+        "url": format!("http://{addr}"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "auth_required": state.auth.is_some(),
+    });
+    if let Some(token) = generated_token {
+        ready["auth_token"] = json!(token);
+    }
+    println!("{ready}");
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
@@ -166,6 +223,93 @@ async fn shutdown_signal() {
     }
 }
 
+/// SHA-256 digest of the configured bearer token. Requests are checked by
+/// comparing digests rather than raw bytes: an early-exit comparison over a
+/// digest leaks nothing an attacker can extend into the token, because the
+/// digest is not secret-prefix-continuable and cannot be inverted.
+struct AuthToken {
+    digest: [u8; 32],
+}
+
+impl AuthToken {
+    fn new(token: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            digest: Sha256::digest(token.as_bytes()).into(),
+        }
+    }
+
+    fn matches(&self, presented: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let presented: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        presented == self.digest
+    }
+}
+
+/// Resolve the effective bearer token from the CLI/env inputs. Returns the
+/// digest checker plus the plaintext token when it was generated here (so
+/// `serve.ready` can report it exactly once).
+fn resolve_auth(args: &ServeArgs) -> Result<(Option<AuthToken>, Option<String>)> {
+    if args.generate_auth_token {
+        let raw: [u8; 32] = rand::random();
+        use base64::Engine as _;
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        return Ok((Some(AuthToken::new(&token)), Some(token)));
+    }
+    if let Some(path) = &args.auth_token_file {
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --auth-token-file {}", path.display()))?;
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("--auth-token-file {} is empty", path.display());
+        }
+        return Ok((Some(AuthToken::new(token)), None));
+    }
+    if let Some(token) = &args.auth_token {
+        if token.is_empty() {
+            bail!("--auth-token must not be empty");
+        }
+        return Ok((Some(AuthToken::new(token)), None));
+    }
+    Ok((None, None))
+}
+
+/// Bearer-token gate for every route except `/health` (liveness stays
+/// unauthenticated). No-op when no token is configured — the documented
+/// local policy for the loopback-only default.
+async fn auth_middleware(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    let Some(expected) = &state.auth else {
+        return next.run(request).await;
+    };
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if expected.matches(token) => next.run(request).await,
+        presented => {
+            tracing::warn!(
+                target: "audit",
+                path = %request.uri().path(),
+                method = %request.method(),
+                header_present = presented.is_some(),
+                "rejected unauthenticated http request"
+            );
+            ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "unauthorized",
+                message: "missing or invalid bearer token".to_string(),
+                details: None,
+            }
+            .into_response()
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ApiState {
     sessions: SessionStore,
@@ -175,6 +319,16 @@ struct ApiState {
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     /// Registry of prompt runs started over HTTP (#318).
     runs: Arc<runs::RunManager>,
+    /// Pending interactive permission requests (#319).
+    permissions: Arc<permissions::PermissionRegistry>,
+    /// SHA-256 digest of the required bearer token; `None` disables auth
+    /// (loopback-only default policy).
+    auth: Option<Arc<AuthToken>>,
+    /// Canonicalized roots session workspaces must live under; empty means
+    /// unrestricted.
+    workspace_roots: Arc<Vec<PathBuf>>,
+    /// Whether HTTP clients may select `bypassPermissions`.
+    allow_bypass_permissions: bool,
     /// Per-prompt tool-turn cap; `usize::MAX` means unbounded (`--max-turns 0`).
     max_turns: usize,
     /// Binary-wide LLM stream timeouts, overridable per session.
@@ -203,7 +357,27 @@ fn router(state: ApiState) -> Router {
         .route("/v1/runs/{run_id}", get(runs::get_run))
         .route("/v1/runs/{run_id}/events", get(runs::run_events))
         .route("/v1/runs/{run_id}/cancel", post(runs::cancel_run))
+        .route(
+            "/v1/runs/{run_id}/permissions",
+            get(permissions::list_run_permissions),
+        )
+        .route(
+            "/v1/permissions/{permission_id}",
+            get(permissions::get_permission),
+        )
+        .route(
+            "/v1/permissions/{permission_id}/respond",
+            post(permissions::respond_permission),
+        )
         .fallback(fallback_not_found)
+        // Explicit request-size cap (axum's default, stated as policy):
+        // large payloads are structured-output schemas and prompts, both
+        // comfortably under this.
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
@@ -263,6 +437,15 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: "conflict",
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
             message: message.into(),
             details: None,
         }
@@ -589,6 +772,97 @@ fn fallback_cwd(explicit: Option<&str>) -> PathBuf {
     }
 }
 
+/// Canonicalize a path for workspace-root policy checks, walking up to the
+/// first existing ancestor when the tail does not exist yet (a session cwd
+/// may be created later). Callers must reject `..` components first.
+fn canonicalize_for_policy(path: &std::path::Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(canonical) => {
+                let mut resolved = canonical;
+                for component in missing_tail.iter().rev() {
+                    resolved.push(component);
+                }
+                return resolved;
+            }
+            Err(_) => match (current.parent(), current.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing_tail.push(name.to_os_string());
+                    current = parent.to_path_buf();
+                }
+                _ => return path.to_path_buf(),
+            },
+        }
+    }
+}
+
+/// Enforce the server's `--workspace-root` policy on a requested session
+/// path. No-op when no roots are configured. Rejections are audited: a
+/// caller probing outside the sandbox is exactly what the audit trail is
+/// for.
+fn enforce_workspace_roots(
+    state: &ApiState,
+    field: &'static str,
+    path: &std::path::Path,
+) -> Result<(), ApiError> {
+    if state.workspace_roots.is_empty() {
+        return Ok(());
+    }
+    let escapes_via_parent = path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    let canonical = canonicalize_for_policy(path);
+    let allowed = !escapes_via_parent
+        && state
+            .workspace_roots
+            .iter()
+            .any(|root| canonical.starts_with(root));
+    if allowed {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "audit",
+        field,
+        path = %path.display(),
+        "rejected session path outside configured workspace roots"
+    );
+    Err(ApiError::forbidden(format!(
+        "{field} '{}' is outside the server's configured workspace roots",
+        path.display()
+    ))
+    .details(json!({
+        "field": field,
+        "workspace_roots": state
+            .workspace_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// Reject `bypassPermissions` from HTTP callers unless the operator opted
+/// in with `--allow-bypass-permissions` (#319).
+fn enforce_permission_mode_policy(
+    state: &ApiState,
+    patch: &SessionConfigPatch,
+) -> Result<(), ApiError> {
+    if state.allow_bypass_permissions {
+        return Ok(());
+    }
+    if patch.permission_mode.as_deref() == Some("bypassPermissions") {
+        tracing::warn!(
+            target: "audit",
+            "rejected bypassPermissions request from http client (server policy)"
+        );
+        return Err(ApiError::forbidden(
+            "permission_mode 'bypassPermissions' is disabled for HTTP clients; start the              daemon with --allow-bypass-permissions to permit it",
+        ));
+    }
+    Ok(())
+}
+
 fn require_absolute_cwd(cwd: &str) -> Result<PathBuf, ApiError> {
     let path = PathBuf::from(cwd);
     if !path.is_absolute() {
@@ -704,6 +978,7 @@ async fn list_sessions(
     }
     if let Some(cwd) = &query.cwd {
         let cwd = require_absolute_cwd(cwd)?;
+        enforce_workspace_roots(&state, "cwd", &cwd)?;
         for manifest in state.sessions.list_sessions_from_disk(&cwd).await {
             if seen.contains(&manifest.id) {
                 continue;
@@ -729,6 +1004,11 @@ async fn create_session(
 ) -> Result<(StatusCode, Json<SessionResource>), ApiError> {
     let cwd = require_absolute_cwd(&request.cwd)?;
     let additional_directories = validated_additional_directories(request.additional_directories)?;
+    enforce_workspace_roots(&state, "cwd", &cwd)?;
+    for directory in &additional_directories {
+        enforce_workspace_roots(&state, "additional_directories", directory)?;
+    }
+    enforce_permission_mode_policy(&state, &request.config)?;
 
     let session = state
         .sessions
@@ -774,6 +1054,9 @@ async fn get_session(
     Query(query): Query<GetSessionQuery>,
 ) -> Result<Json<SessionResource>, ApiError> {
     let cwd = fallback_cwd(query.cwd.as_deref());
+    if query.cwd.is_some() {
+        enforce_workspace_roots(&state, "cwd", &cwd)?;
+    }
     let session = state
         .sessions
         .get_session(&session_id, &cwd)
@@ -803,6 +1086,7 @@ async fn configure_session(
              permission_mode is required",
         ));
     }
+    enforce_permission_mode_policy(&state, &patch)?;
     let mut warnings = Vec::new();
     // Applied sequentially through the shared ACP path; on a validation
     // failure, selectors already applied stay applied (same as issuing the
@@ -872,6 +1156,10 @@ async fn reopen_session(
 ) -> Result<Json<SessionResource>, ApiError> {
     let cwd = require_absolute_cwd(&request.cwd)?;
     let additional_directories = validated_additional_directories(request.additional_directories)?;
+    enforce_workspace_roots(&state, "cwd", &cwd)?;
+    for directory in &additional_directories {
+        enforce_workspace_roots(&state, "additional_directories", directory)?;
+    }
 
     match state
         .sessions
@@ -915,6 +1203,7 @@ async fn reopen_session(
     ))
 }
 
+mod permissions;
 mod runs;
 
 #[cfg(test)]
