@@ -13,12 +13,43 @@ use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 use crate::multi_backend::MultiBackend;
 use crate::session::SessionStore;
 
-async fn start_server(sessions: SessionStore) -> SocketAddr {
+#[derive(Default)]
+struct TestConfig {
+    behavior: Option<MockBehavior>,
+    auth_token: Option<String>,
+    workspace_roots: Vec<std::path::PathBuf>,
+    allow_bypass_permissions: bool,
+}
+
+async fn start_server_with(sessions: SessionStore, config: TestConfig) -> SocketAddr {
+    let llm = match config.behavior {
+        Some(behavior) => Arc::new(MultiBackend::new(vec![BackendRegistration::new(
+            "test",
+            "Test",
+            Some(Arc::new(MockBackend {
+                behavior,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })),
+        )])),
+        None => Arc::new(MultiBackend::new(Vec::new())),
+    };
     let state = ApiState {
         sessions,
-        llm: Arc::new(MultiBackend::new(Vec::new())),
+        llm,
         refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         runs: Arc::new(super::runs::RunManager::default()),
+        permissions: Arc::new(super::permissions::PermissionRegistry::default()),
+        auth: config
+            .auth_token
+            .map(|token| Arc::new(super::AuthToken::new(&token))),
+        allowed_hosts: Some(Arc::new(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+            "::1".to_string(),
+        ])),
+        workspace_roots: Arc::new(config.workspace_roots),
+        allow_bypass_permissions: config.allow_bypass_permissions,
         max_turns: usize::MAX,
         default_idle_timeout_secs: 30,
         default_stall_timeout_secs: 30,
@@ -31,6 +62,10 @@ async fn start_server(sessions: SessionStore) -> SocketAddr {
         axum::serve(listener, router(state)).await.expect("serve");
     });
     addr
+}
+
+async fn start_server(sessions: SessionStore) -> SocketAddr {
+    start_server_with(sessions, TestConfig::default()).await
 }
 
 fn test_model_catalog() -> Vec<ModelMetadata> {
@@ -418,15 +453,18 @@ use futures::future::BoxFuture;
 use crate::llm_client::{LlmBackend, LlmResponse, StreamChatRequest, TokenUsage};
 use crate::multi_backend::BackendRegistration;
 
-/// Scripted backend for the `test::` source: streams a fixed reply, or
-/// hangs until cancellation to exercise in-flight semantics.
+/// Scripted backend for the `test::` source: streams a fixed reply, hangs
+/// until cancellation, or requests one `write_file` tool call before
+/// finishing (to exercise the permission gate).
 enum MockBehavior {
     Echo,
     HangUntilCancelled,
+    WriteFileThenDone,
 }
 
 struct MockBackend {
     behavior: MockBehavior,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl LlmBackend for MockBackend {
@@ -462,33 +500,54 @@ impl LlmBackend for MockBackend {
                 anyhow::bail!("stream cancelled")
             }
             .boxed(),
+            MockBehavior::WriteFileThenDone => {
+                let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call_index == 0 {
+                    async move {
+                        Ok(LlmResponse::ToolCalls {
+                            text: String::new(),
+                            reasoning_content: None,
+                            calls: vec![crate::llm_client::ToolCall {
+                                id: "call-1".to_string(),
+                                r#type: "function".to_string(),
+                                function: crate::llm_client::FunctionCall {
+                                    name: "write_file".to_string(),
+                                    arguments: serde_json::json!({
+                                        "file_path": "hello.txt",
+                                        "content": "hi from run",
+                                    })
+                                    .to_string(),
+                                },
+                            }],
+                            usage: TokenUsage::default(),
+                        })
+                    }
+                    .boxed()
+                } else {
+                    async move {
+                        Ok(LlmResponse::Text {
+                            text: "file written".to_string(),
+                            reasoning_content: None,
+                            usage: TokenUsage::default(),
+                        })
+                    }
+                    .boxed()
+                }
+            }
         }
     }
 }
 
 async fn start_run_server(behavior: MockBehavior) -> (SocketAddr, SessionStore) {
     let sessions = seeded_store().await;
-    let llm = Arc::new(MultiBackend::new(vec![BackendRegistration::new(
-        "test",
-        "Test",
-        Some(Arc::new(MockBackend { behavior })),
-    )]));
-    let state = ApiState {
-        sessions: sessions.clone(),
-        llm,
-        refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
-        runs: Arc::new(super::runs::RunManager::default()),
-        max_turns: usize::MAX,
-        default_idle_timeout_secs: 30,
-        default_stall_timeout_secs: 30,
-    };
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("bind ephemeral test port");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        axum::serve(listener, router(state)).await.expect("serve");
-    });
+    let addr = start_server_with(
+        sessions.clone(),
+        TestConfig {
+            behavior: Some(behavior),
+            ..TestConfig::default()
+        },
+    )
+    .await;
     (addr, sessions)
 }
 
@@ -714,4 +773,402 @@ async fn run_validation_and_unknown_resources() {
         .await
         .expect("cancel unknown run");
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Security and interactive permissions (#319)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_gates_v1_endpoints_but_not_health() {
+    let addr = start_server_with(
+        seeded_store().await,
+        TestConfig {
+            auth_token: Some("secret-token".to_string()),
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Liveness stays open.
+    let response = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // /v1 requires the bearer token.
+    let response = client
+        .get(format!("http://{addr}/v1/models"))
+        .send()
+        .await
+        .expect("models without token");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body = response.json::<Value>().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "unauthorized");
+
+    let response = client
+        .get(format!("http://{addr}/v1/models"))
+        .bearer_auth("wrong-token")
+        .send()
+        .await
+        .expect("models with wrong token");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(format!("http://{addr}/v1/models"))
+        .bearer_auth("secret-token")
+        .send()
+        .await
+        .expect("models with token");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn workspace_roots_restrict_session_paths() {
+    let allowed = tempfile::tempdir().expect("allowed root");
+    let denied = tempfile::tempdir().expect("denied root");
+    let addr = start_server_with(
+        seeded_store().await,
+        TestConfig {
+            workspace_roots: vec![allowed.path().canonicalize().expect("canonical root")],
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": allowed.path().display().to_string() }))
+        .send()
+        .await
+        .expect("create inside root");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": denied.path().display().to_string() }))
+        .send()
+        .await
+        .expect("create outside root");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body = response.json::<Value>().await.expect("JSON body");
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    // Additional directories are held to the same policy.
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({
+            "cwd": allowed.path().display().to_string(),
+            "additional_directories": [denied.path().display().to_string()],
+        }))
+        .send()
+        .await
+        .expect("create with outside additional dir");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Disk listings cannot probe outside the roots either.
+    let response = client
+        .get(format!(
+            "http://{addr}/v1/sessions?cwd={}",
+            denied.path().display()
+        ))
+        .send()
+        .await
+        .expect("list outside root");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn bypass_permissions_requires_server_opt_in() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let client = reqwest::Client::new();
+
+    // Default policy: bypassPermissions is refused on create and patch.
+    let addr = start_server(seeded_store().await).await;
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": cwd, "permission_mode": "bypassPermissions" }))
+        .send()
+        .await
+        .expect("create with bypass");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let session_id = create_test_session(addr, &cwd).await;
+    let response = client
+        .patch(format!("http://{addr}/v1/sessions/{session_id}"))
+        .json(&serde_json::json!({ "permission_mode": "bypassPermissions" }))
+        .send()
+        .await
+        .expect("patch to bypass");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Explicit server opt-in allows it.
+    let addr = start_server_with(
+        seeded_store().await,
+        TestConfig {
+            allow_bypass_permissions: true,
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": cwd, "permission_mode": "bypassPermissions" }))
+        .send()
+        .await
+        .expect("create with bypass on opted-in server");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created = response.json::<Value>().await.expect("JSON body");
+    assert_eq!(created["permission_mode"], "bypassPermissions");
+}
+
+async fn create_default_mode_session(addr: SocketAddr, cwd: &str) -> String {
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": cwd, "permission_mode": "default" }))
+        .send()
+        .await
+        .expect("create session")
+        .json::<Value>()
+        .await
+        .expect("JSON body");
+    created["id"].as_str().expect("session id").to_string()
+}
+
+async fn wait_for_pending_permission(addr: SocketAddr, run_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (status, body) = get_json(addr, &format!("/v1/runs/{run_id}/permissions")).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let pending = body["permissions"].as_array().expect("permissions array");
+        if let Some(first) = pending.first() {
+            return first.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no permission request appeared in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn run_suspends_for_permission_and_resumes_after_response() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::WriteFileThenDone).await;
+    let client = reqwest::Client::new();
+    let session_id = create_default_mode_session(addr, &cwd).await;
+
+    let created = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "write the file" }))
+        .send()
+        .await
+        .expect("create run")
+        .json::<Value>()
+        .await
+        .expect("JSON body");
+    let run_id = created["id"].as_str().expect("run id").to_string();
+
+    // The run suspends on an interactive permission request for write_file.
+    let permission = wait_for_pending_permission(addr, &run_id).await;
+    let permission_id = permission["id"].as_str().expect("permission id");
+    assert_eq!(permission["tool_name"], "write_file");
+    let options: Vec<&str> = permission["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .filter_map(|option| option["id"].as_str())
+        .collect();
+    assert!(options.contains(&"allow"), "options were {options:?}");
+    assert!(options.contains(&"reject"));
+
+    // The permission is individually addressable.
+    let (status, fetched) = get_json(addr, &format!("/v1/permissions/{permission_id}")).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(fetched["run_id"], run_id.as_str());
+
+    // Unknown options are rejected with the supported list.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/permissions/{permission_id}/respond"
+        ))
+        .json(&serde_json::json!({ "option_id": "nope" }))
+        .send()
+        .await
+        .expect("invalid option");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.json::<Value>().await.expect("JSON body");
+    assert!(
+        body["error"]["details"]["supported"]
+            .as_array()
+            .expect("supported")
+            .iter()
+            .any(|value| value == "allow")
+    );
+
+    // Approve once; the run resumes and completes.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/permissions/{permission_id}/respond"
+        ))
+        .json(&serde_json::json!({ "option_id": "allow" }))
+        .send()
+        .await
+        .expect("approve");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let run = poll_run_until_terminal(addr, &run_id).await;
+    assert_eq!(run["status"], "completed", "run: {run}");
+    assert_eq!(run["result_text"], "file written");
+    let written = std::fs::read_to_string(workspace.path().join("hello.txt"))
+        .expect("tool call wrote the file after approval");
+    assert_eq!(written, "hi from run");
+
+    // Event stream recorded the full permission lifecycle.
+    let events = client
+        .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+        .send()
+        .await
+        .expect("events")
+        .text()
+        .await
+        .expect("events body");
+    assert!(events.contains("event: permission.requested"));
+    assert!(events.contains("event: permission.resolved"));
+    assert!(events.contains("event: tool_call.completed"));
+
+    // The resolved request is gone: a duplicate response is rejected.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/permissions/{permission_id}/respond"
+        ))
+        .json(&serde_json::json!({ "option_id": "allow" }))
+        .send()
+        .await
+        .expect("duplicate response");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cancelling_a_run_expires_pending_permissions() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::WriteFileThenDone).await;
+    let client = reqwest::Client::new();
+    let session_id = create_default_mode_session(addr, &cwd).await;
+
+    let created = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({ "prompt": "write the file" }))
+        .send()
+        .await
+        .expect("create run")
+        .json::<Value>()
+        .await
+        .expect("JSON body");
+    let run_id = created["id"].as_str().expect("run id").to_string();
+
+    let permission = wait_for_pending_permission(addr, &run_id).await;
+    let permission_id = permission["id"]
+        .as_str()
+        .expect("permission id")
+        .to_string();
+
+    let response = client
+        .post(format!("http://{addr}/v1/runs/{run_id}/cancel"))
+        .send()
+        .await
+        .expect("cancel run");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Response-after-cancel race: cancellation expires pending permissions
+    // synchronously before the cancel endpoint returns, so an approval
+    // arriving immediately afterwards deterministically finds nothing to
+    // approve — it must never reach the tool loop.
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/permissions/{permission_id}/respond"
+        ))
+        .json(&serde_json::json!({ "option_id": "allow" }))
+        .send()
+        .await
+        .expect("response racing cancel");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let run = poll_run_until_terminal(addr, &run_id).await;
+    assert_eq!(run["status"], "cancelled", "run: {run}");
+    let (_, body) = get_json(addr, &format!("/v1/runs/{run_id}/permissions")).await;
+    assert_eq!(
+        body["permissions"].as_array().expect("permissions").len(),
+        0
+    );
+    assert!(
+        !workspace.path().join("hello.txt").exists(),
+        "cancelled permission must not execute the tool"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_roots_resolve_symlinks_and_require_existing_dirs() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let outside = tempfile::tempdir().expect("outside dir");
+    let addr = start_server_with(
+        seeded_store().await,
+        TestConfig {
+            workspace_roots: vec![root.path().canonicalize().expect("canonical root")],
+            ..TestConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // A symlink inside the root pointing outside must be rejected: the
+    // policy canonicalizes and stores the canonical path, so the link's
+    // target is what gets checked (symlink-swap regression).
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).expect("create symlink");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": link.display().to_string() }))
+        .send()
+        .await
+        .expect("create through symlink");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Not-yet-existing paths under the root are refused outright, closing
+    // the validate-then-create-symlink TOCTOU window.
+    let missing = root.path().join("does-not-exist-yet");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": missing.display().to_string() }))
+        .send()
+        .await
+        .expect("create with missing cwd");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A real directory inside the root is stored under its canonical path.
+    let real = root.path().join("project");
+    std::fs::create_dir(&real).expect("create project dir");
+    let response = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&serde_json::json!({ "cwd": real.display().to_string() }))
+        .send()
+        .await
+        .expect("create real dir session");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created = response.json::<Value>().await.expect("JSON body");
+    let stored_cwd = created["cwd"].as_str().expect("cwd");
+    assert_eq!(
+        std::path::PathBuf::from(stored_cwd),
+        real.canonicalize().expect("canonical project dir"),
+        "session must store the canonical path, not the caller's spelling"
+    );
 }

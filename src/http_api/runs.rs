@@ -27,14 +27,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use futures::Stream;
-use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::runtime::{
-    EventSink, PermissionBroker, PermissionDecision, PermissionPrompt, RuntimeEvent, ToolCallPhase,
-};
+use crate::runtime::{EventSink, RuntimeEvent, ToolCallPhase};
 use crate::session::{PromptStartError, SessionSnapshot};
 use crate::structured_output::StructuredOutputRequest;
 use crate::tool_loop::{LoopStop, TextSink};
@@ -50,7 +47,7 @@ const MAX_BUFFERED_EVENTS_PER_RUN: usize = 8192;
 const MAX_RETAINED_TERMINAL_RUNS: usize = 256;
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -79,7 +76,7 @@ impl RunStatus {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         self != Self::Running
     }
 }
@@ -132,6 +129,11 @@ impl RunHandle {
 
     pub(super) fn status(&self) -> RunStatus {
         *self.status.read().expect("run status lock")
+    }
+
+    /// Whether cancellation has been requested for this run's turn.
+    pub(super) fn cancel_requested(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     fn last_seq(&self) -> u64 {
@@ -355,43 +357,6 @@ impl EventSink for RunEventSink {
     }
 }
 
-/// Permission broker for HTTP runs until #319 adds interactive responses:
-/// surfaces the request as a run event, then rejects it so the turn keeps
-/// moving instead of hanging on an unanswerable prompt.
-struct AutoRejectingPermissionBroker {
-    run: Arc<RunHandle>,
-}
-
-const HTTP_PERMISSION_UNSUPPORTED: &str = "interactive permission responses are not supported over the HTTP API yet; \
-     the request was automatically rejected. Configure the session with \
-     permission_mode \"auto\", \"acceptEdits\", or \"readOnly\" to avoid \
-     interactive prompts.";
-
-impl PermissionBroker for AutoRejectingPermissionBroker {
-    fn request_permission(
-        &self,
-        prompt: PermissionPrompt,
-    ) -> BoxFuture<'_, Result<PermissionDecision, String>> {
-        self.run.record(
-            "permission.requested",
-            json!({
-                "call_id": prompt.tool_call_id,
-                "tool_name": prompt.tool_name,
-                "input": prompt.raw_input,
-                "permission_notice": prompt.permission_notice,
-                "options": prompt
-                    .options
-                    .iter()
-                    .map(|option| json!({ "id": option.id, "label": option.label }))
-                    .collect::<Vec<_>>(),
-                "auto_response": "rejected",
-                "reason": HTTP_PERMISSION_UNSUPPORTED,
-            }),
-        );
-        Box::pin(async { Err(HTTP_PERMISSION_UNSUPPORTED.to_string()) })
-    }
-}
-
 fn delta_sink(run: Arc<RunHandle>, event_type: &'static str) -> TextSink {
     Arc::new(Mutex::new(move |token: &str| {
         run.record(event_type, json!({ "text": token }));
@@ -519,7 +484,11 @@ async fn execute_run(
         text_sink: delta_sink(run.clone(), "message.delta"),
         thought_sink: delta_sink(run.clone(), "thought.delta"),
         event_sink: &RunEventSink { run: run.clone() },
-        permission_broker: &AutoRejectingPermissionBroker { run: run.clone() },
+        permission_broker: &super::permissions::HttpPermissionBroker {
+            run: run.clone(),
+            registry: state.permissions.clone(),
+            cancel: cancel.clone(),
+        },
     })
     .await;
 
@@ -682,7 +651,18 @@ pub(super) async fn cancel_run(
         .get(&run_id)
         .ok_or_else(|| ApiError::not_found(format!("unknown run '{run_id}'")))?;
     if !run.status().is_terminal() {
+        tracing::info!(
+            target: "audit",
+            run_id = %run.id,
+            session_id = %run.session_id,
+            "http run cancellation requested"
+        );
         run.cancel.cancel();
+        // Expire pending permissions synchronously, under the same
+        // registry transition respond_permission uses, so a response
+        // arriving after this endpoint returns can never approve a tool
+        // call on the cancelled run.
+        state.permissions.expire_for_run(&run.id);
         state.sessions.cancel_prompt(&run.session_id).await;
     }
     Ok(Json(run.resource()))
