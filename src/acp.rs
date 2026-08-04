@@ -118,25 +118,25 @@ use crate::workspace_delta::{WorkspaceDeltaTracker, workspace_delta_for_turn};
 
 /// Stable ids for ACP `SessionConfigOption` selectors. These are live
 /// session inputs from the client, not Anvil setup preferences.
-const PERMISSION_CONFIG_ID: &str = "permission_mode";
-const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
+pub(crate) const PERMISSION_CONFIG_ID: &str = "permission_mode";
+pub(crate) const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
-const MODEL_CONFIG_ID: &str = "model_selection";
+pub(crate) const MODEL_CONFIG_ID: &str = "model_selection";
 /// Per-session reasoning-effort knob.
 /// Empty string in the wire payload clears the user's pick (back to the
 /// model's `default_reasoning_level`). The `off` option explicitly omits
 /// reasoning controls even when the model advertises a default.
-const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+pub(crate) const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
-const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
+pub(crate) const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
 /// Per-session service-tier knob. Codex subscription models currently
 /// advertise `priority`, rendered as Fast, for increased throughput.
-const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
-const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
+pub(crate) const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
+pub(crate) const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
 const CODEX_FAST_SERVICE_TIER_ID: &str = "priority";
 
 fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
@@ -227,41 +227,9 @@ fn validate_additional_directories(
     method: &str,
     directories: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, agent_client_protocol::Error> {
-    for (index, path) in directories.iter().enumerate() {
-        if path.as_os_str().is_empty() {
-            return Err(invalid_additional_directories_error(
-                method,
-                index,
-                path,
-                "non-empty",
-            ));
-        }
-        if !path.is_absolute() {
-            return Err(invalid_additional_directories_error(
-                method, index, path, "absolute",
-            ));
-        }
-        match path.metadata() {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(invalid_additional_directories_error(
-                    method,
-                    index,
-                    path,
-                    "a directory",
-                ));
-            }
-            Err(_) => {
-                return Err(invalid_additional_directories_error(
-                    method,
-                    index,
-                    path,
-                    "an existing directory",
-                ));
-            }
-        }
-    }
-    Ok(directories)
+    crate::session::validate_additional_directories(directories).map_err(|err| {
+        invalid_additional_directories_error(method, err.index, &err.path, err.requirement)
+    })
 }
 
 fn prompt_response_meta(
@@ -630,22 +598,22 @@ const CONFIGURE_KNOWN_KEYS: &[&str] = &[
 /// re-derived option list so the caller can re-emit a `ConfigOptionUpdate`
 /// notification with the spec-required complete state.
 #[derive(Debug)]
-struct ConfigApplyOutcome {
-    updated_options: Vec<SessionConfigOption>,
+pub(crate) struct ConfigApplyOutcome {
+    pub(crate) updated_options: Vec<SessionConfigOption>,
     /// Set only by the `model` arm when the previous reasoning_effort pick
     /// is not in the new model's supported set and the store dropped it.
     /// Both callers surface this to the user.
-    cleared_reasoning: Option<String>,
+    pub(crate) cleared_reasoning: Option<String>,
     /// Set only by the `model` arm when the previous service_tier pick is not
     /// in the new model's supported set and the store dropped it.
-    cleared_service_tier: Option<String>,
+    pub(crate) cleared_service_tier: Option<String>,
 }
 
 /// Validation / dispatch errors from `apply_config_option`. The request
 /// handler maps these into JSON error data; the slash command formats them
 /// into a one-line user message via `human_message`.
 #[derive(Debug)]
-enum ConfigApplyError {
+pub(crate) enum ConfigApplyError {
     UnknownConfigId,
     InvalidValue {
         reason: String,
@@ -655,7 +623,7 @@ enum ConfigApplyError {
 }
 
 impl ConfigApplyError {
-    fn human_message(&self) -> String {
+    pub(crate) fn human_message(&self) -> String {
         match self {
             ConfigApplyError::UnknownConfigId => format!(
                 "unknown config key. Supported: {}",
@@ -746,7 +714,7 @@ fn parse_turn_recap_enabled(value: &str) -> Option<bool> {
     parse_setup_bool(value)
 }
 
-async fn apply_config_option(
+pub(crate) async fn apply_config_option(
     sessions: &SessionStore,
     session_id: &str,
     config_id: &str,
@@ -1418,7 +1386,10 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     })
 }
 
-async fn seed_default_model_if_empty(sessions: &SessionStore, catalog: &[ModelMetadata]) {
+pub(crate) async fn seed_default_model_if_empty(
+    sessions: &SessionStore,
+    catalog: &[ModelMetadata],
+) {
     if sessions.default_model().await.trim().is_empty()
         && let Some(model) = preferred_model(catalog)
     {

@@ -20,6 +20,7 @@ mod deepseek_balance;
 mod discovery;
 mod goal;
 mod host_notice;
+mod http_api;
 mod http_retry;
 mod installer;
 mod kimi_auth;
@@ -195,6 +196,9 @@ struct Args {
 enum Command {
     /// Install Anvil as an ACP agent in a supported editor.
     Install(installer::InstallArgs),
+    /// Run Anvil as an HTTP daemon exposing the versioned REST API
+    /// (sessions, models, tools) on a loopback listener.
+    Serve(http_api::ServeArgs),
 }
 
 impl std::fmt::Debug for Args {
@@ -767,6 +771,13 @@ async fn main() -> Result<()> {
     sessions
         .set_default_reasoning_effort(args.reasoning_effort)
         .await;
+
+    // HTTP daemon mode shares the backend registrations and SessionStore
+    // built above with the ACP path, so both transports use one runtime
+    // and persistence implementation (#317).
+    if let Some(Command::Serve(serve_args)) = args.command {
+        return http_api::serve(serve_args, llm, sessions).await;
+    }
 
     // `0` means "no turn cap" (matching `--max-sessions`/`--max-history-turns`):
     // map it to the max so the `for turn in 0..turn_limit` loop is bounded only

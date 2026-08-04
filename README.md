@@ -78,6 +78,8 @@ anvil --version
 
 Running `anvil` directly starts a stdio JSON-RPC server; use it through an ACP client. Continue with the [installation guide](https://anvil.brokk.ai/install/) or the reproducible [ten-minute evaluation](https://anvil.brokk.ai/evaluate-anvil/).
 
+`anvil serve` starts the same runtime as an HTTP daemon on a loopback listener (default `127.0.0.1:26845`), exposing versioned REST endpoints for session lifecycle, model discovery, and the tool catalog (`/health`, `/v1/models`, `/v1/tools`, `/v1/sessions`). Prompt runs and event streaming over HTTP are under active development ([#315](https://github.com/BrokkAi/anvil/issues/315)).
+
 Configure a supported ACP client directly from the installed binary:
 
 ```bash
