@@ -299,6 +299,45 @@ fn discover_session_context(
     (project_instructions, skills, agents)
 }
 
+/// A lifecycle request carried an `additionalDirectories` entry that cannot
+/// become an executable workspace root. `requirement` is the property the
+/// path failed ("absolute", "an existing directory", ...), phrased so both
+/// the ACP and HTTP adapters can render "path N must be <requirement>".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditionalDirectoryError {
+    pub index: usize,
+    pub path: PathBuf,
+    pub requirement: &'static str,
+}
+
+/// Validate requested additional workspace roots for a session lifecycle
+/// operation. Shared by the ACP handlers and the HTTP API so both transports
+/// enforce identical rules: every entry must be a non-empty absolute path to
+/// an existing directory.
+pub(crate) fn validate_additional_directories(
+    directories: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, AdditionalDirectoryError> {
+    for (index, path) in directories.iter().enumerate() {
+        let fail = |requirement: &'static str| AdditionalDirectoryError {
+            index,
+            path: path.clone(),
+            requirement,
+        };
+        if path.as_os_str().is_empty() {
+            return Err(fail("non-empty"));
+        }
+        if !path.is_absolute() {
+            return Err(fail("absolute"));
+        }
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(fail("a directory")),
+            Err(_) => return Err(fail("an existing directory")),
+        }
+    }
+    Ok(directories)
+}
+
 /// An ACP lifecycle request referenced an MCP server transport Anvil does not
 /// support. Stdio, HTTP, and SSE are supported; unknown future transports are
 /// rejected rather than silently dropped, which would leave the session looking

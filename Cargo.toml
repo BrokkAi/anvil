@@ -25,6 +25,9 @@ path = "src/main.rs"
 
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable"] }
+# HTTP daemon for `anvil serve` (#317). Server-side only; LLM/MCP client
+# traffic stays on `reqwest`.
+axum = "0.8"
 # Dependency-renamed so imports stay `anvil_minimizer::` while the published
 # crate is namespaced. The minimizer is versioned in lockstep with this crate:
 # bump this requirement, the minimizer's version, and the root version

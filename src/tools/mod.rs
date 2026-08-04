@@ -762,6 +762,33 @@ fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOL_NAMES.contains(&name)
 }
 
+/// One row of the static tool catalog exposed over the HTTP API
+/// (`GET /v1/tools`). Derived from the `TOOLS` metadata table so the HTTP
+/// surface cannot drift from the permission gate's view of the harness.
+/// Rows for MCP-loaded tools describe Anvil's default Bifrost toolset; a
+/// session's live registry may expose fewer (server disabled) or more
+/// (extra MCP servers) at prompt time.
+pub(crate) struct ToolCatalogEntry {
+    pub(crate) name: &'static str,
+    pub(crate) kind: ToolKind,
+    pub(crate) display_name: &'static str,
+    pub(crate) concurrency_safe: bool,
+    pub(crate) builtin: bool,
+}
+
+pub(crate) fn tool_catalog() -> Vec<ToolCatalogEntry> {
+    TOOLS
+        .iter()
+        .map(|meta| ToolCatalogEntry {
+            name: meta.name,
+            kind: meta.kind,
+            display_name: meta.display_name,
+            concurrency_safe: meta.concurrency_safe,
+            builtin: is_builtin_tool(meta.name),
+        })
+        .collect()
+}
+
 fn is_harness_only_mcp_tool(name: &str) -> bool {
     name == "refresh"
 }
