@@ -23,6 +23,10 @@ use crate::llm_client::{
     messages_include_images, rewrite_image_prompt_provider_error,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
+use crate::runtime::{
+    PermissionBroker, PermissionDecision, PermissionOption as RuntimePermissionOption,
+    PermissionOptionKind as RuntimePermissionOptionKind, PermissionPrompt,
+};
 
 use crate::semantic_rerank;
 use crate::session::{
@@ -672,7 +676,7 @@ fn permission_options(
     tool_name: &str,
     shell_sandboxed: bool,
     always_allow_label: Option<&str>,
-) -> Vec<PermissionOption> {
+) -> Vec<RuntimePermissionOption> {
     permission_options_for_request(tool_name, shell_sandboxed, false, always_allow_label)
 }
 
@@ -689,51 +693,51 @@ fn permission_options_for_request(
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
     always_allow_label: Option<&str>,
-) -> Vec<PermissionOption> {
+) -> Vec<RuntimePermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
         if shell_sandboxed && sandbox_escalation_requested {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_outside_sandbox"),
-                "Run outside sandbox",
-                PermissionOptionKind::AllowOnce,
-            ));
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("reject"),
-                "No",
-                PermissionOptionKind::RejectOnce,
-            ));
+            options.push(RuntimePermissionOption {
+                id: "allow_outside_sandbox".to_string(),
+                label: "Run outside sandbox".to_string(),
+                kind: RuntimePermissionOptionKind::AllowOnce,
+            });
+            options.push(RuntimePermissionOption {
+                id: "reject".to_string(),
+                label: "No".to_string(),
+                kind: RuntimePermissionOptionKind::RejectOnce,
+            });
             return options;
         }
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow"),
-            "Allow",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(RuntimePermissionOption {
+            id: "allow".to_string(),
+            label: "Allow".to_string(),
+            kind: RuntimePermissionOptionKind::AllowOnce,
+        });
         if let Some(label) = always_allow_label {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_always"),
-                format!("Always allow {label}"),
-                PermissionOptionKind::AllowAlways,
-            ));
+            options.push(RuntimePermissionOption {
+                id: "allow_always".to_string(),
+                label: format!("Always allow {label}"),
+                kind: RuntimePermissionOptionKind::AllowAlways,
+            });
         }
     } else {
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow_always"),
-            format!("Always allow {tool_name}"),
-            PermissionOptionKind::AllowAlways,
-        ));
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow"),
-            "Allow",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(RuntimePermissionOption {
+            id: "allow_always".to_string(),
+            label: format!("Always allow {tool_name}"),
+            kind: RuntimePermissionOptionKind::AllowAlways,
+        });
+        options.push(RuntimePermissionOption {
+            id: "allow".to_string(),
+            label: "Allow".to_string(),
+            kind: RuntimePermissionOptionKind::AllowOnce,
+        });
     }
-    options.push(PermissionOption::new(
-        PermissionOptionId::new("reject"),
-        "Reject",
-        PermissionOptionKind::RejectOnce,
-    ));
+    options.push(RuntimePermissionOption {
+        id: "reject".to_string(),
+        label: "Reject".to_string(),
+        kind: RuntimePermissionOptionKind::RejectOnce,
+    });
     options
 }
 
@@ -750,10 +754,7 @@ fn permission_grant_for_selection(
         sandbox_escalation_requested,
         always_allow_label,
     );
-    if !valid_options
-        .iter()
-        .any(|option| option.option_id.0.as_ref() == option_id)
-    {
+    if !valid_options.iter().any(|option| option.id == option_id) {
         tracing::warn!(
             "request_permission returned unknown option id '{option_id}'; treating as reject"
         );
@@ -863,6 +864,68 @@ impl<'a> SpawnedCx<'a> {
     /// witness that guards `request_user_permission`.
     pub(crate) fn cx(&self) -> &ConnectionTo<Client> {
         self.cx
+    }
+}
+
+impl PermissionBroker for SpawnedCx<'_> {
+    fn request_permission(
+        &self,
+        prompt: PermissionPrompt,
+    ) -> futures::future::BoxFuture<'_, Result<PermissionDecision, String>> {
+        Box::pin(async move {
+            let PermissionPrompt {
+                session_id,
+                tool_name,
+                tool_call_id,
+                raw_input,
+                permission_notice,
+                options,
+                ..
+            } = prompt;
+
+            let title = announce::permission_prompt_title(&tool_name, &raw_input);
+            let fields = ToolCallUpdateFields::new()
+                .kind(ToolRegistry::tool_kind(&tool_name))
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(announce::permission_request_content(
+                    &tool_name,
+                    &raw_input,
+                    permission_notice.as_deref(),
+                ))
+                .raw_input(raw_input);
+            let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
+            let options = options
+                .into_iter()
+                .map(|option| {
+                    let kind = match option.kind {
+                        RuntimePermissionOptionKind::AllowOnce => PermissionOptionKind::AllowOnce,
+                        RuntimePermissionOptionKind::AllowAlways => {
+                            PermissionOptionKind::AllowAlways
+                        }
+                        RuntimePermissionOptionKind::RejectOnce => PermissionOptionKind::RejectOnce,
+                    };
+                    PermissionOption::new(PermissionOptionId::new(option.id), option.label, kind)
+                })
+                .collect();
+            let request = RequestPermissionRequest::new(session_id, tool_call, options);
+            emit_terminal_notification(TerminalNotificationEvent::Prompt);
+
+            // ACP's blocking request must remain alive until the client answers,
+            // including when prompt cancellation is in progress. Dropping it
+            // early leaves the client's required response without a receiver.
+            let response = self.cx().send_request(request).block_task().await;
+            match response {
+                Ok(resp) => match resp.outcome {
+                    RequestPermissionOutcome::Selected(selected) => Ok(
+                        PermissionDecision::Selected(selected.option_id.0.to_string()),
+                    ),
+                    RequestPermissionOutcome::Cancelled => Ok(PermissionDecision::Cancelled),
+                    _ => Ok(PermissionDecision::Unsupported),
+                },
+                Err(error) => Err(error.to_string()),
+            }
+        })
     }
 }
 
@@ -1785,9 +1848,9 @@ fn resolve_execution_policy(
 /// the session's `PermissionMode` and the tool's `ToolKind`, a call is auto-allowed,
 /// auto-rejected, or escalated to the client via `session/request_permission`.
 ///
-/// SAFETY: this function calls `SentRequest::block_task().await`, which is only
-/// safe inside `ConnectionTo::spawn`. The `SpawnedCx<'_>` parameter encodes
-/// that requirement -- callers must construct it inside a spawned task.
+/// Interactive permission decisions are delegated to `permission_broker`.
+/// ACP callers construct their broker inside `ConnectionTo::spawn`; other
+/// transports can provide their own implementation without an ACP connection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     llm: &Arc<dyn LlmBackend>,
@@ -1802,7 +1865,8 @@ pub(crate) async fn run(
     cancel: CancellationToken,
     on_text: TextSink,
     on_thought: TextSink,
-    spawned_cx: SpawnedCx<'_>,
+    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: String,
     sessions: SessionStore,
     original_user_request: String,
@@ -2066,7 +2130,8 @@ pub(crate) async fn run(
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                &spawned_cx,
+                spawned_cx,
+                permission_broker,
                 &session_id,
                 &sessions,
                 notifications,
@@ -2497,7 +2562,8 @@ pub(crate) async fn run(
                     max_turns,
                     idle_timeout,
                     cancel.clone(),
-                    &spawned_cx,
+                    spawned_cx,
+                    permission_broker,
                     &session_id,
                     &sessions,
                     notifications,
@@ -2902,6 +2968,7 @@ async fn execute_step_tool_calls(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -2943,6 +3010,7 @@ async fn execute_step_tool_calls(
                 idle_timeout,
                 cancel.clone(),
                 spawned_cx,
+                permission_broker,
                 session_id,
                 sessions,
                 notifications,
@@ -3189,7 +3257,7 @@ async fn execute_step_tool_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3323,6 +3391,7 @@ async fn execute_step_tool_calls(
                             idle_timeout,
                             cancel.clone(),
                             spawned_cx,
+                            permission_broker,
                             session_id,
                             sessions,
                             depth + 1,
@@ -3508,6 +3577,7 @@ async fn execute_parallel_safe_calls(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -3696,7 +3766,7 @@ async fn execute_parallel_safe_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3803,6 +3873,7 @@ async fn execute_parallel_safe_calls(
                         idle_timeout,
                         cancel,
                         spawned_cx,
+                        permission_broker,
                         session_id,
                         sessions,
                         depth + 1,
@@ -4114,7 +4185,7 @@ async fn deterministic_gate_rejection(
 /// execute, or `Reject` to feed the LLM a denial message instead.
 async fn consult_gate(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
 ) -> GateOutcome {
@@ -4161,7 +4232,7 @@ async fn consult_gate(
             GateOutcome::without_usage(
                 request_user_permission_or_reject(
                     sessions,
-                    spawned_cx,
+                    permission_broker,
                     cancel,
                     request,
                     evaluation,
@@ -4391,7 +4462,7 @@ fn permission_classifier_trace_record(
 
 async fn request_user_permission_or_reject(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4401,7 +4472,7 @@ async fn request_user_permission_or_reject(
     let rejected_permission_notice = permission_notice.clone();
     match request_user_permission_with_evaluation(
         sessions,
-        spawned_cx,
+        permission_broker,
         cancel,
         request,
         evaluation,
@@ -4459,7 +4530,7 @@ fn sanitize_permission_rationale(rationale: &str) -> String {
 
 async fn request_user_permission_with_evaluation(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4501,12 +4572,11 @@ async fn request_user_permission_with_evaluation(
         None => None,
     };
     let grant = request_user_permission(
-        spawned_cx,
+        permission_broker,
         cancel,
         PermissionRequest {
             session_id: request.session_id,
             tool_name: request.tool_name,
-            kind: request.kind,
             tool_call_id: request.tool_call_id,
             raw_input: request.raw_input,
             shell_sandboxed: evaluation.shell_sandboxed,
@@ -4914,7 +4984,6 @@ struct GateCheck<'a> {
 struct PermissionRequest<'a> {
     session_id: &'a str,
     tool_name: &'a str,
-    kind: ToolKind,
     tool_call_id: &'a str,
     raw_input: &'a Value,
     shell_sandboxed: bool,
@@ -4926,14 +4995,13 @@ struct PermissionRequest<'a> {
 }
 
 async fn request_user_permission(
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     _cancel: &CancellationToken,
     request: PermissionRequest<'_>,
 ) -> Result<PermissionGrant, String> {
     let PermissionRequest {
         session_id,
         tool_name,
-        kind,
         tool_call_id,
         raw_input,
         shell_sandboxed,
@@ -4971,55 +5039,37 @@ async fn request_user_permission(
     ) {
         return Err(reason);
     }
-    let fields = ToolCallUpdateFields::new()
-        .kind(kind)
-        .status(ToolCallStatus::Pending)
-        .title(title)
-        .content(announce::permission_request_content(
-            tool_name,
-            raw_input,
-            permission_notice.as_deref(),
-        ))
-        .raw_input(raw_input.clone());
-    let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
-
     let options = permission_options_for_request(
         tool_name,
         shell_sandboxed,
         sandbox_escalation_requested,
         always_allow_label.as_deref(),
     );
+    let decision = permission_broker
+        .request_permission(PermissionPrompt {
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            raw_input: raw_input.clone(),
+            permission_notice: permission_notice.clone(),
+            options,
+        })
+        .await;
 
-    let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
-    emit_terminal_notification(TerminalNotificationEvent::Prompt);
-
-    // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
-    // on `run` above. We deliberately do not race this with the prompt
-    // cancellation token: ACP requires clients to answer pending permission
-    // requests with `RequestPermissionOutcome::Cancelled` when they cancel a
-    // prompt. Dropping this in-flight request first leaves the client's
-    // required response with no receiver, which the ACP transport treats as an
-    // internal connection error.
-    let response = spawned_cx.cx().send_request(request).block_task().await;
-
-    match response {
-        Ok(resp) => match resp.outcome {
-            RequestPermissionOutcome::Selected(selected) => {
-                let id: &str = &selected.option_id.0;
-                permission_grant_for_selection(
-                    tool_name,
-                    id,
-                    shell_sandboxed,
-                    sandbox_escalation_requested,
-                    always_allow_label.as_deref(),
-                )
-            }
-            RequestPermissionOutcome::Cancelled => Err(
-                "Tool use denied: the prompt was cancelled before the user responded.".to_string(),
-            ),
-            // Future-proof: schema is #[non_exhaustive].
-            _ => Err("Tool use denied: unknown permission outcome.".to_string()),
-        },
+    match decision {
+        Ok(PermissionDecision::Selected(id)) => permission_grant_for_selection(
+            tool_name,
+            &id,
+            shell_sandboxed,
+            sandbox_escalation_requested,
+            always_allow_label.as_deref(),
+        ),
+        Ok(PermissionDecision::Cancelled) => {
+            Err("Tool use denied: the prompt was cancelled before the user responded.".to_string())
+        }
+        Ok(PermissionDecision::Unsupported) => {
+            Err("Tool use denied: unknown permission outcome.".to_string())
+        }
         Err(err) => {
             tracing::warn!("request_permission transport error: {err}");
             Err(format!(
@@ -5692,6 +5742,7 @@ async fn execute_subagent(
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     depth: usize,
@@ -5804,7 +5855,8 @@ async fn execute_subagent(
         cancel,
         noop_text,
         noop_thought,
-        SpawnedCx::new(spawned_cx.cx()),
+        spawned_cx,
+        permission_broker,
         session_id.to_string(),
         sessions.clone(),
         prompt.to_string(),
@@ -6058,6 +6110,78 @@ mod tests {
     };
     use futures::future::{BoxFuture, FutureExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingPermissionBroker {
+        decision: PermissionDecision,
+        prompt: Arc<Mutex<Option<PermissionPrompt>>>,
+    }
+
+    impl PermissionBroker for RecordingPermissionBroker {
+        fn request_permission(
+            &self,
+            prompt: PermissionPrompt,
+        ) -> BoxFuture<'_, Result<PermissionDecision, String>> {
+            *self.prompt.lock().expect("prompt lock") = Some(prompt);
+            futures::future::ready(Ok(self.decision.clone())).boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_uses_transport_independent_broker() {
+        let recorded = Arc::new(Mutex::new(None));
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Selected("allow_outside_sandbox".to_string()),
+            prompt: recorded.clone(),
+        };
+        let raw_input = serde_json::json!({"command": "cargo test"});
+
+        let grant = request_user_permission(
+            &broker,
+            &CancellationToken::new(),
+            PermissionRequest {
+                session_id: "session-1",
+                tool_name: "run_shell_command",
+                tool_call_id: "call-1",
+                raw_input: &raw_input,
+                shell_sandboxed: true,
+                sandbox_escalation_requested: true,
+                always_allow_label: None,
+                permission_notice: Some("Needs network access".to_string()),
+            },
+        )
+        .await
+        .expect("permission should be granted");
+
+        assert_eq!(grant.sandbox_policy_override, Some(SandboxPolicy::None));
+        let prompt = recorded
+            .lock()
+            .expect("prompt lock")
+            .clone()
+            .expect("recorded prompt");
+        assert_eq!(prompt.session_id, "session-1");
+        assert_eq!(prompt.tool_name, "run_shell_command");
+        assert_eq!(prompt.tool_call_id, "call-1");
+        assert_eq!(prompt.raw_input, raw_input);
+        assert_eq!(
+            prompt.permission_notice.as_deref(),
+            Some("Needs network access")
+        );
+        assert_eq!(
+            prompt.options,
+            vec![
+                RuntimePermissionOption {
+                    id: "allow_outside_sandbox".to_string(),
+                    label: "Run outside sandbox".to_string(),
+                    kind: RuntimePermissionOptionKind::AllowOnce,
+                },
+                RuntimePermissionOption {
+                    id: "reject".to_string(),
+                    label: "No".to_string(),
+                    kind: RuntimePermissionOptionKind::RejectOnce,
+                },
+            ]
+        );
+    }
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -9142,7 +9266,7 @@ mod tests {
             );
             let labels: Vec<_> = options
                 .iter()
-                .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+                .map(|option| (option.id.as_str(), option.label.as_str()))
                 .collect();
 
             assert_eq!(
@@ -9161,10 +9285,7 @@ mod tests {
     fn shell_permission_prompt_hides_always_allow_without_prefix() {
         // No extractable/offerable prefix -> no "Always allow" choice.
         let options = permission_options("run_shell_command", true, None);
-        let ids: Vec<_> = options
-            .iter()
-            .map(|option| option.option_id.0.as_ref())
-            .collect();
+        let ids: Vec<_> = options.iter().map(|option| option.id.as_str()).collect();
 
         assert_eq!(ids, vec!["allow", "reject"]);
     }
@@ -9174,7 +9295,7 @@ mod tests {
         let options = permission_options_for_request("run_shell_command", true, true, None);
         let labels: Vec<_> = options
             .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .map(|option| (option.id.as_str(), option.label.as_str()))
             .collect();
 
         assert_eq!(
@@ -9457,7 +9578,7 @@ mod tests {
         let options = permission_options("write_file", false, None);
         let labels: Vec<_> = options
             .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .map(|option| (option.id.as_str(), option.label.as_str()))
             .collect();
 
         assert_eq!(

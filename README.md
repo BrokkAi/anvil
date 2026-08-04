@@ -43,7 +43,22 @@ custom TUI  --------------------------------------->  tools + sessions
 
 ## Install and Evaluate
 
-Download a checksum-verified binary from [GitHub Releases](https://github.com/BrokkAi/anvil/releases/latest), or install from crates.io:
+Install with Homebrew on macOS (Apple Silicon and Intel) or Linux (x86-64 and
+ARM64 glibc):
+
+```bash
+brew install brokkai/tap/anvil
+anvil --version
+```
+
+Or install the latest checksum-verified release on macOS, Linux, WSL, or Android/Termux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/anvil/refs/heads/master/install.sh | bash
+anvil --version
+```
+
+To review the installer before running it, download `install.sh`, inspect it, then run it with `bash`. You can also download an archive from [GitHub Releases](https://github.com/BrokkAi/anvil/releases/latest), or install from crates.io:
 
 ```bash
 rustup target add wasm32-wasip2

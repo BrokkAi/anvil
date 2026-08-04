@@ -34,6 +34,7 @@ mod p2t;
 mod plan;
 mod plugins;
 mod responses_api;
+mod runtime;
 mod sandbox_backend;
 mod secrets;
 mod semantic_rerank;
