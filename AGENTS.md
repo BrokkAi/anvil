@@ -46,7 +46,11 @@ master.
 
 ### 2. Version bump (one commit/PR, all of it together)
 
-1. Bump `version` in the root `Cargo.toml`.
+1. Bump the version in **three places, to the same value** (CI and the
+   publish workflow both enforce the lockstep): `version` in the root
+   `Cargo.toml`, `version` in `crates/anvil-minimizer/Cargo.toml`, and the
+   `version` requirement on the `anvil-minimizer` dependency line in the root
+   `Cargo.toml`.
 2. Refresh the lockfile: `cargo update --workspace --offline`.
 3. **Regenerate the shipped license reports — they embed the crate version**,
    so every version bump changes them and CI diffs them against the committed
@@ -65,18 +69,23 @@ master.
    uncommitted):
 
    ```bash
-   cargo publish --dry-run -p brokk-anvil-minimizer -p brokk-anvil --locked
+   cargo publish --dry-run -p brokk-anvil-minimizer --locked
+   cargo publish --dry-run --no-verify -p brokk-anvil-minimizer -p brokk-anvil --locked
    ```
 
-   Caveat: the root `build.rs` runs a nested `cargo metadata` during publish
-   verification, and that nested call resolves dependencies from crates.io —
-   not from the local workspace. Every workspace dependency of `brokk-anvil`
-   (currently `brokk-anvil-minimizer`) must therefore already be published at
-   the exact pinned version. If the minimizer changed, bump its version in
-   `crates/anvil-minimizer/Cargo.toml` **and** in the root `Cargo.toml`
-   dependency line; the publish workflow publishes it before `brokk-anvil`.
-   The `anvil-minimizer` dependency is dependency-renamed: the package on
-   crates.io is `brokk-anvil-minimizer`, imports stay `anvil_minimizer::`.
+   (Both packages must be listed in the second command: packaging resolves
+   the dependency graph, and only a multi-package invocation overlays the
+   local, not-yet-published minimizer version.)
+
+   `brokk-anvil` cannot run its **full** verification build until the
+   lockstep minimizer version is on crates.io: the root `build.rs` runs a
+   nested `cargo metadata` during publish verification, and that nested call
+   resolves dependencies from the registry, not the local workspace. The
+   publish workflow handles this ordering — it uploads the minimizer first,
+   and `cargo publish` runs brokk-anvil's full verification build (against
+   the just-published minimizer) before uploading it. The `anvil-minimizer`
+   dependency is dependency-renamed: the package on crates.io is
+   `brokk-anvil-minimizer`, imports stay `anvil_minimizer::`.
 6. `cargo clippy --all-targets -- -D warnings` — note that Windows CI compiles
    test targets too: a `#[cfg(test)]` helper whose callers are all inside a
    `#[cfg(all(test, unix))]` module is dead code on Windows and fails the
@@ -95,8 +104,8 @@ this). Pushing it triggers:
 
 - **GitHub Release** — builds the five platform zips + `.sha256` sidecars and
   creates the release (~20 minutes).
-- **Publish crate** — dry-run gate, then publishes `brokk-anvil-minimizer`
-  (only when its version is new) and `brokk-anvil` to crates.io. Retry-safe:
+- **Publish crate** — lockstep + dry-run gates, then publishes
+  `brokk-anvil-minimizer` followed by `brokk-anvil` to crates.io. Retry-safe:
   already-published versions are skipped.
 - **Docs** — deploys the website.
 

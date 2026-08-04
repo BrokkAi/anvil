@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil-minimizer"
-version = "0.1.0"
+version = "0.24.3"
 dependencies = [
  "brush-parser",
  "parking_lot",
