@@ -1,3 +1,5 @@
+#![cfg(feature = "http-api")]
+
 //! Daemon-level smoke test for `anvil serve` (#317): spawns the real
 //! binary, waits for the machine-readable `serve.ready` line on stdout,
 //! and exercises the REST session lifecycle over a real localhost

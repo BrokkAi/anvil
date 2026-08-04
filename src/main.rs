@@ -20,6 +20,7 @@ mod deepseek_balance;
 mod discovery;
 mod goal;
 mod host_notice;
+#[cfg(feature = "http-api")]
 mod http_api;
 mod http_retry;
 mod installer;
@@ -198,7 +199,8 @@ enum Command {
     /// Install Anvil as an ACP agent in a supported editor.
     Install(installer::InstallArgs),
     /// Run Anvil as an HTTP daemon exposing the versioned REST API
-    /// (sessions, models, tools) on a loopback listener.
+    /// (sessions, models, tools, runs) on a loopback listener.
+    #[cfg(feature = "http-api")]
     Serve(http_api::ServeArgs),
 }
 
@@ -785,6 +787,7 @@ async fn main() -> Result<()> {
     // HTTP daemon mode shares the backend registrations, SessionStore, and
     // turn limits built above with the ACP path, so both transports use one
     // runtime and persistence implementation (#317, #318).
+    #[cfg(feature = "http-api")]
     if let Some(Command::Serve(serve_args)) = args.command {
         return http_api::serve(
             serve_args,
