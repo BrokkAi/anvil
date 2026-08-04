@@ -4612,60 +4612,38 @@ async fn run_model_turn_in_spawn(
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
     let loop_future = async {
-        if let Some(config) = crate::asgard::config() {
-            let (outcome, usage_by_model) = crate::asgard::run_asgard_trajectory_loop(
-                cx,
-                sessions,
-                session_id,
-                llm,
-                registry,
-                model,
-                reasoning_effort,
-                service_tier,
-                structured_output_request,
-                messages,
-                idle_timeout,
-                cancel,
-                config,
-                context_length,
-                context_prefix_len,
-                initial_plan.clone(),
-            )
-            .await;
-            (outcome, Some(usage_by_model))
-        } else {
-            let outcome = crate::tool_loop::run(
-                llm,
-                registry,
-                model,
-                reasoning_effort,
-                service_tier,
-                structured_output_request,
-                messages,
-                max_turns,
-                idle_timeout,
-                cancel,
-                text_sink,
-                thought_sink,
-                &spawned_cx,
-                &spawned_cx,
-                session_id.to_string(),
-                sessions.clone(),
-                prompt_text_for_turn.clone(),
-                crate::tool_loop::NotificationMode::Live,
-                0,
-                None,
-                None,
-                false,
-                None,
-                None,
-                context_length,
-                context_prefix_len,
-                initial_plan,
-            )
-            .await;
-            (outcome, None)
-        }
+        let outcome = crate::tool_loop::run(
+            llm,
+            registry,
+            model,
+            reasoning_effort,
+            service_tier,
+            structured_output_request,
+            messages,
+            max_turns,
+            idle_timeout,
+            cancel,
+            text_sink,
+            thought_sink,
+            &spawned_cx,
+            &spawned_cx,
+            session_id.to_string(),
+            sessions.clone(),
+            prompt_text_for_turn.clone(),
+            crate::tool_loop::NotificationMode::Live,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+            context_length,
+            context_prefix_len,
+            initial_plan,
+        )
+        .await;
+        let usage_by_model: Option<BTreeMap<String, crate::llm_client::TokenUsage>> = None;
+        (outcome, usage_by_model)
     };
     let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
@@ -4686,7 +4664,6 @@ async fn run_model_turn_in_spawn(
                         retryable: false,
                         message: "agent loop panicked".to_string(),
                     }),
-                    continuation_messages: Vec::new(),
                     current_plan: None,
                     compaction_checkpoint: None,
                 },
@@ -4694,17 +4671,6 @@ async fn run_model_turn_in_spawn(
             )
         }
     };
-    if is_asgard_startup_failure(
-        crate::asgard::config().is_some(),
-        &outcome,
-        usage_by_model.as_ref(),
-    ) {
-        let message = match &outcome.stop {
-            crate::tool_loop::LoopStop::Failed(failure) => failure.message.clone(),
-            _ => "Asgard failed before startup completed".to_string(),
-        };
-        return Err(LoopIterationError::Terminal(message));
-    }
     outcome.usage.add(initial_usage);
     if let Some(usage_by_model) = usage_by_model.as_mut() {
         usage_by_model
@@ -4718,7 +4684,6 @@ async fn run_model_turn_in_spawn(
         replay_events,
         usage: turn_usage,
         stop,
-        continuation_messages: _,
         current_plan,
         compaction_checkpoint,
     } = outcome;
@@ -4819,19 +4784,6 @@ async fn run_model_turn_in_spawn(
         tool_stats,
         persisted_fragment_id,
     })
-}
-
-fn is_asgard_startup_failure(
-    asgard_enabled: bool,
-    outcome: &crate::tool_loop::LoopOutcome,
-    usage_by_model: Option<&BTreeMap<String, crate::llm_client::TokenUsage>>,
-) -> bool {
-    asgard_enabled
-        && matches!(outcome.stop, crate::tool_loop::LoopStop::Failed(_))
-        && outcome.tool_exchanges.is_empty()
-        && outcome.replay_events.is_empty()
-        && outcome.usage.is_zero()
-        && usage_by_model.is_none_or(BTreeMap::is_empty)
 }
 
 fn append_mcp_instructions_to_system_prompt(messages: &mut [ChatMessage], instructions: &str) {
@@ -10581,37 +10533,6 @@ mod tests {
             acp_stop_reason(&LoopStop::MaxTurns { max_turns: 200 }, true),
             StopReason::Cancelled,
         );
-    }
-
-    #[test]
-    fn asgard_startup_failure_is_prompt_level_error_candidate() {
-        use crate::tool_loop::{LoopOutcome, LoopStop, TurnFailure};
-
-        let outcome = LoopOutcome {
-            response: "\n**Error:** Asgard failed: baseline commit failed\n".to_string(),
-            tool_exchanges: Vec::new(),
-            replay_events: Vec::new(),
-            usage: crate::llm_client::TokenUsage::default(),
-            stop: LoopStop::Failed(TurnFailure {
-                retryable: false,
-                message: "Asgard failed: baseline commit failed".to_string(),
-            }),
-            continuation_messages: Vec::new(),
-            current_plan: None,
-            compaction_checkpoint: None,
-        };
-        let usage_by_model = BTreeMap::new();
-
-        assert!(is_asgard_startup_failure(
-            true,
-            &outcome,
-            Some(&usage_by_model)
-        ));
-        assert!(!is_asgard_startup_failure(
-            false,
-            &outcome,
-            Some(&usage_by_model)
-        ));
     }
 
     #[test]

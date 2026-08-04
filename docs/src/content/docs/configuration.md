@@ -40,9 +40,6 @@ anvil [OPTIONS]
 | `--default-model` | — | unset | Default wire id or bare provider model id for new sessions. |
 | `--reasoning-effort` | — | provider default | Seed new sessions with a supported reasoning effort, or `off`. |
 | `--max-turns` | — | `0` | Prompt tool-loop ceiling; `0` is unbounded. |
-| `--asgard-model` | — | unset | Repeatable provider-qualified candidate model, up to five ordered lanes. |
-| `--asgard-supervisor` | — | session model | Supervisor model used when Asgard candidates are configured. |
-| `--asgard-window-steps` | — | `8` | Deprecated compatibility flag; the supervisor now chooses window length. |
 | `--max-sessions` | — | `50` | Resident-session LRU limit; `0` disables it. |
 | `--max-history-turns` | — | `50` | In-memory history-turn limit; `0` disables it. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | Wait for first meaningful stream progress. |

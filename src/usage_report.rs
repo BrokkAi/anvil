@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_usage_keeps_model_attribution_for_cost_and_acp_metadata() {
+    fn usage_by_model_keeps_model_attribution_for_cost_and_acp_metadata() {
         let flash_usage = crate::llm_client::TokenUsage {
             input_tokens: 100,
             output_tokens: 10,
