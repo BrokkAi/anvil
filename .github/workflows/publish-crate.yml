@@ -63,16 +63,42 @@ jobs:
           fi
           echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
 
-      - name: Verify package
-        run: cargo publish --dry-run -p brokk-anvil --locked
+      # Multi-package dry-run resolves brokk-anvil-minimizer from the local
+      # workspace, so this gate works even before the minimizer version exists
+      # on crates.io.
+      - name: Verify packages
+        run: cargo publish --dry-run -p brokk-anvil-minimizer -p brokk-anvil --locked
 
       - name: Authenticate with crates.io
         if: github.event_name == 'push' || github.event.inputs.publish == 'true'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1.0.4
 
-      - name: Publish crate
+      # Publish the minimizer before brokk-anvil (which depends on it), and
+      # skip any version that is already on crates.io so a partially failed
+      # run can be retried safely. `cargo publish` blocks until the uploaded
+      # crate has propagated to the index, so the second publish can resolve
+      # the first.
+      - name: Publish crates
         if: github.event_name == 'push' || github.event.inputs.publish == 'true'
-        run: cargo publish -p brokk-anvil --locked
+        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          ua="BrokkAi/anvil publish-crate workflow (https://github.com/BrokkAi/anvil)"
+          version_published() {
+            curl -sf --retry 3 -H "User-Agent: $ua" \
+              "https://crates.io/api/v1/crates/$1/$2" > /dev/null
+          }
+          publish_if_missing() {
+            local crate="$1" manifest="$2" version
+            version=$(grep -m1 '^version = ' "$manifest" | sed -E 's/version = "(.*)"/\1/')
+            if version_published "$crate" "$version"; then
+              echo "$crate $version is already on crates.io; skipping"
+            else
+              cargo publish -p "$crate" --locked
+            fi
+          }
+          publish_if_missing brokk-anvil-minimizer crates/anvil-minimizer/Cargo.toml
+          publish_if_missing brokk-anvil Cargo.toml

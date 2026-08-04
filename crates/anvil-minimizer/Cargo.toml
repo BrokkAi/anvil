@@ -1,10 +1,10 @@
 [package]
-name = "anvil-minimizer"
+name = "brokk-anvil-minimizer"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-publish = false
-description = "Vendored copy of oh-my-pi's pi-shell output minimizer (adapts MIT-licensed algorithms from rtk-ai/rtk; see NOTICE)."
+repository = "https://github.com/BrokkAi/anvil"
+description = "Vendored copy of oh-my-pi's pi-shell output minimizer (adapts MIT-licensed algorithms from rtk-ai/rtk; see NOTICE). Support crate for brokk-anvil."
 
 [dependencies]
 brush-parser = "0.3"

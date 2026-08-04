@@ -31,6 +31,89 @@ On Linux, `bubblewrap` (`bwrap`) must be installed for `runShellCommand` OS-leve
 - **Context compaction** lives in `src/context_manager.rs`. `compact_history` replaces the older dynamic model-history prefix with a cumulative `<state_snapshot>`, retains a recent exact tail, and pins the current `update_plan` value. The canonical system/AGENTS/skills prefix is never summarized. Oversized compactor input is chunked and reduced before the final snapshot pass. Checkpoints persist through the Anvil-only `anvilCompactionContentId` task field; raw turns and legacy `summaryContentId` data remain untouched for ACP/Brokk replay and rewind. Automatic compaction may run before a new user turn or between completed tool exchanges; Asgard compacts only the selected canonical trajectory between windows.
 - **Lint suppressions**: do not add `#[allow(...)]` to get around linting. Prefer refactoring the code so the lint passes; if a suppression is truly necessary, document the invariant or external constraint that makes it safe.
 
+## Release workflow
+
+Releases are driven by a `vX.Y.Z` tag on master. The tag fans out to three
+workflows at once (GitHub Release, Publish crate, Docs), so **everything below
+must be true before the tag is pushed** — a red master or a stale generated
+file turns into a failed publication, not just a failed check.
+
+### 1. Preflight — master must be green
+
+Check the latest master CI run (`gh run list --workflow=ci.yml --branch master`),
+including the Windows job and the `dependency licenses` job. Never tag on a red
+master.
+
+### 2. Version bump (one commit/PR, all of it together)
+
+1. Bump `version` in the root `Cargo.toml`.
+2. Refresh the lockfile: `cargo update --workspace --offline`.
+3. **Regenerate the shipped license reports — they embed the crate version**,
+   so every version bump changes them and CI diffs them against the committed
+   files (pinned tools: `cargo-about` 0.9.1, `cargo-deny` 0.20.2, same as CI):
+
+   ```bash
+   cargo about generate --offline --config licenses/about.toml --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
+   node scripts/generate-supplemental-third-party-notices.mjs licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+   cargo deny --config licenses/deny.toml --locked check licenses
+   ```
+
+4. Update version examples in the docs
+   (`docs/src/content/docs/install.md`, `npm/README.md`,
+   `npm/launcher/README.md`, `npm/build-npm-packages.mjs` usage comments).
+5. Verify crates.io publishability locally (add `--allow-dirty` while
+   uncommitted):
+
+   ```bash
+   cargo publish --dry-run -p brokk-anvil-minimizer -p brokk-anvil --locked
+   ```
+
+   Caveat: the root `build.rs` runs a nested `cargo metadata` during publish
+   verification, and that nested call resolves dependencies from crates.io —
+   not from the local workspace. Every workspace dependency of `brokk-anvil`
+   (currently `brokk-anvil-minimizer`) must therefore already be published at
+   the exact pinned version. If the minimizer changed, bump its version in
+   `crates/anvil-minimizer/Cargo.toml` **and** in the root `Cargo.toml`
+   dependency line; the publish workflow publishes it before `brokk-anvil`.
+   The `anvil-minimizer` dependency is dependency-renamed: the package on
+   crates.io is `brokk-anvil-minimizer`, imports stay `anvil_minimizer::`.
+6. `cargo clippy --all-targets -- -D warnings` — note that Windows CI compiles
+   test targets too: a `#[cfg(test)]` helper whose callers are all inside a
+   `#[cfg(all(test, unix))]` module is dead code on Windows and fails the
+   build there even when local (unix) clippy is clean. Gate helpers exactly as
+   their callers are gated.
+7. Merge to master and wait for CI to be fully green again.
+
+### 3. Tag
+
+```bash
+git tag -a vX.Y.Z -m "Anvil X.Y.Z: <summary>" && git push origin vX.Y.Z
+```
+
+The tag must match the root `Cargo.toml` version (both tag workflows enforce
+this). Pushing it triggers:
+
+- **GitHub Release** — builds the five platform zips + `.sha256` sidecars and
+  creates the release (~20 minutes).
+- **Publish crate** — dry-run gate, then publishes `brokk-anvil-minimizer`
+  (only when its version is new) and `brokk-anvil` to crates.io. Retry-safe:
+  already-published versions are skipped.
+- **Docs** — deploys the website.
+
+If a tag workflow fails: fix master first. Delete and re-push the tag only if
+the GitHub release object was never created; otherwise re-run via each
+workflow's `workflow_dispatch` (Publish crate has a `publish` input).
+
+### 4. npm (after the GitHub release exists)
+
+Run the manual `publish-npm.yml` workflow with the tag — first with the
+`publish` input unchecked (build + validate + smoke test only), then checked
+to publish via npm trusted publishing. The six npm packages are built from the
+checksum-verified GitHub release zips; the root `@brokkai/anvil` is only ever
+published after all five platform packages are publicly visible. First-time
+setup and the manual bootstrap runbook live in `npm/README.md`. The Homebrew
+tap follows tagged releases automatically on a schedule.
+
 ## Adding a new built-in tool
 
 1. Add a `ToolMeta` row in `src/tools/mod.rs` (`TOOLS` constant).

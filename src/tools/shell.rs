@@ -653,8 +653,10 @@ impl ShellTimeout {
 
 /// Seconds-taking entry point kept for the tests that predate
 /// [`ShellTimeout`]; production dispatch resolves the budget from the tool
-/// arguments and calls [`run_shell_command_with_timeout`] directly.
-#[cfg(test)]
+/// arguments and calls [`run_shell_command_with_timeout`] directly. Every
+/// caller lives in the unix-only test module below, so the gate must match
+/// or Windows test builds flag it as dead code.
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_shell_command_cancellable(
     cwd: &Path,

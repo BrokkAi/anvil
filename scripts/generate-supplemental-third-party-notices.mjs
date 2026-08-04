@@ -18,7 +18,7 @@ const outputPath = path.resolve(
 // inventory catches standalone notices and native payloads that can otherwise
 // appear without anyone deciding whether an additional artifact notice is due.
 const auditedStandaloneNotices = new Set([
-  "anvil-minimizer/NOTICE",
+  "brokk-anvil-minimizer/NOTICE",
   "cfg_aliases/NOTICES.md",
 ]);
 const auditedLinksPackages = new Set([

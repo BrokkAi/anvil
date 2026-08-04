@@ -171,19 +171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-minimizer"
-version = "0.1.0"
-dependencies = [
- "brush-parser",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "toml 1.1.4+spec-1.1.0",
- "xxhash-rust",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,7 +831,6 @@ name = "brokk-anvil"
 version = "0.24.3"
 dependencies = [
  "agent-client-protocol",
- "anvil-minimizer",
  "anyhow",
  "aws-config",
  "aws-credential-types",
@@ -853,6 +839,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "base64",
  "brokk-acp-sandbox",
+ "brokk-anvil-minimizer",
  "bytes",
  "chrono",
  "clap",
@@ -886,6 +873,19 @@ dependencies = [
  "windows-sys 0.61.2",
  "wiremock",
  "zip",
+]
+
+[[package]]
+name = "brokk-anvil-minimizer"
+version = "0.1.0"
+dependencies = [
+ "brush-parser",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "toml 1.1.4+spec-1.1.0",
+ "xxhash-rust",
 ]
 
 [[package]]
