@@ -903,3 +903,42 @@ constant's doc comment so it is not re-tried.
 NOTE: the musl binary was deliberately NOT rebuilt while duoDR-r3/r4
 are in flight, so both seeds stay internally consistent at 30s. The
 revert lands in the next build.
+
+### VERDICT: two healthy DR-on seeds (2026-08-03) — DR does not buy score
+
+duoDR-s1 = **13/20**, zero timeouts, $4.86/graded task, 7844s.
+duoDR-s2 = **13/20**, 1 timeout (opa-template), $4.56/task, 16154s.
+Both on: anvil ef37e270 (60s stall, reverted), mj 83a6160d @ merged
+HEAD (my oracle/advisory review + park rule + owner's 92e6e7d
+analyze_diff), brokkbench 675314114b0 (blocked_hosts), and
+**--bifrost-bin staging the local 0.8.18 binary**.
+
+**Review tooling confirmed healthy** (the reason r3/r4 were scrapped):
+s1 53 symbol-tool calls / 12 failed; s2 66 / 7. Compare r1 48/10
+(healthy), r2 12/25 and r3 14/31 (broken). Root cause of the breakage:
+anvil provisions bifrost by downloading
+github.com/BrokkAi/bifrost/releases — which the blocked_hosts denylist
+blocks. --bifrost-bin sidesteps it; the harness already had the flag.
+
+**DR-on 26/40 vs DR-off 27/40** — dead level, and DR-on pays ~$1/task
+for the opus seat. With tools, time, and a clean environment, the
+review still launched **ZERO specialist lanes in 40 tasks** and
+returned **33 clean / 5 completed, no findings verdicts at all**.
+
+Loss profile is now almost purely near-miss (the class DR exists to
+catch, and clears): s1 losses tomlkit 59/60, textual 19/20, cliffy
+36/37, psm 69/72, opa-rego 22/25, sqlfmt 29/32, fastapi 134/137.
+Per-task s1-vs-s2 flips (6 of 20: cliffy, dynamodb, kysely,
+opa-template, textual, tomlkit) show single-seed noise is +-3, so
+26-vs-27 is indistinguishable.
+psm 69/72 for the 9th consecutive run; opa-rego 22/25 = the
+GroundPrefix reading, not the build failure.
+
+Discarded diagnostics (bifrost absent, not seeds): r3 10/20, r4
+killed at 13/16.
+
+RECOMMENDATION: stop paying for DR in this configuration. The
+remaining score is gated by wrong-intent near-misses that a
+same-artifact reviewer cannot see; the next lever is an external
+oracle at IMPLEMENTATION time (spec-ambiguity enumeration, repo
+convention checks), not another review pass.
