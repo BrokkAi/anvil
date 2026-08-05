@@ -1,0 +1,49 @@
+// Generated from openapi/anvil.v1.yaml (Anvil Agent API contract 1.0.0).
+// Generator: @hey-api/openapi-ts 0.99.0. Do not edit by hand.
+
+export type AuthToken = string | undefined;
+
+export interface Auth {
+  /**
+   * Which part of the request do we use to send the auth?
+   *
+   * @default 'header'
+   */
+  in?: 'header' | 'query' | 'cookie';
+  /**
+   * A unique identifier for the security scheme.
+   *
+   * Defined only when there are multiple security schemes whose `Auth`
+   * shape would otherwise be identical.
+   */
+  key?: string;
+  /**
+   * Header or query parameter name.
+   *
+   * @default 'Authorization'
+   */
+  name?: string;
+  scheme?: 'basic' | 'bearer';
+  type: 'apiKey' | 'http';
+}
+
+export const getAuthToken = async (
+  auth: Auth,
+  callback: ((auth: Auth) => Promise<AuthToken> | AuthToken) | AuthToken,
+): Promise<string | undefined> => {
+  const token = typeof callback === 'function' ? await callback(auth) : callback;
+
+  if (!token) {
+    return;
+  }
+
+  if (auth.scheme === 'bearer') {
+    return `Bearer ${token}`;
+  }
+
+  if (auth.scheme === 'basic') {
+    return `Basic ${btoa(token)}`;
+  }
+
+  return token;
+};

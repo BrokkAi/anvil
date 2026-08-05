@@ -42,6 +42,46 @@ jobs:
         python -m build python --outdir python/dist
         python -m twine check python/dist/*
 
+  typescript-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: sdk/typescript/package-lock.json
+
+    - name: Install pinned SDK build tools
+      run: npm ci --prefix sdk/typescript
+
+    - name: Check locked dependencies
+      run: npm audit --prefix sdk/typescript --audit-level=high
+
+    - name: Regenerate the wire layer
+      run: node scripts/generate-sdks.mjs
+
+    - name: Require checked-in generated output
+      run: git diff --exit-code -- sdk/typescript/src/generated
+
+    - name: Build and test the package
+      run: npm --prefix sdk/typescript test
+
+    - name: Inspect the publish tarball
+      run: npm pack ./sdk/typescript --dry-run
+
+    - name: Install Rust toolchain for live conformance
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-wasip2
+
+    - name: Exercise the SDK against the real Anvil server
+      env:
+        ANVIL_TS_SDK_CONFORMANCE: "1"
+      run: cargo test --locked --test http_conformance daemon_conforms_to_checked_in_contract -- --nocapture
+
   licenses:
     name: dependency licenses
     runs-on: ubuntu-latest
