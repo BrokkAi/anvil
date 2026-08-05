@@ -82,8 +82,8 @@ use agent_client_protocol::schema::v1::{
     UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
-    on_receive_notification, on_receive_request,
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, Handled, Responder,
+    on_receive_dispatch, on_receive_notification, on_receive_request,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -1275,6 +1275,22 @@ fn spawn_delayed_session_usage_update(
 /// store's cached model catalog. Background callers queue on the shared
 /// refresh lock instead of skipping work when another refresh is in
 /// flight. Shared by `session/new` and provider login/logout flows.
+/// Process-wide switch for the courtesy chatter session lifecycle handlers
+/// stream into new sessions (the delayed setup notice and model-catalog
+/// refresh progress). The headless `--print` client flips this on before
+/// building the agent: its stdout contract is "the final assistant message",
+/// and interactive guidance would corrupt the pipeable output.
+static SUPPRESS_SESSION_NOTICES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn suppress_session_notices() {
+    SUPPRESS_SESSION_NOTICES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn session_notices_suppressed() -> bool {
+    SUPPRESS_SESSION_NOTICES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn spawn_background_refresh(
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     llm: Arc<MultiBackend>,
@@ -1282,6 +1298,11 @@ fn spawn_background_refresh(
     transcript: Option<(ConnectionTo<Client>, String, &'static str)>,
     initial_delay: Option<Duration>,
 ) {
+    let transcript = if session_notices_suppressed() {
+        None
+    } else {
+        transcript
+    };
     tokio::spawn(async move {
         if let Some(delay) = initial_delay {
             tokio::time::sleep(delay).await;
@@ -1326,6 +1347,9 @@ fn spawn_delayed_setup_notice(
     catalog: Vec<ModelMetadata>,
     sessions: SessionStore,
 ) {
+    if session_notices_suppressed() {
+        return;
+    }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let state = sessions.setup_state_snapshot();
@@ -1496,6 +1520,30 @@ pub async fn run_agent(
     default_idle_timeout_secs: u64,
     default_stall_timeout_secs: u64,
 ) -> agent_client_protocol::Result<()> {
+    agent_component(
+        llm,
+        sessions,
+        max_turns,
+        default_idle_timeout_secs,
+        default_stall_timeout_secs,
+    )
+    .connect_to(ByteStreams::new(
+        tokio::io::stdout().compat_write(),
+        tokio::io::stdin().compat(),
+    ))
+    .await
+}
+
+/// Build the ACP agent as a transport-agnostic component. `run_agent` wires it
+/// to stdio; the headless `--print` client connects it in-process to a
+/// one-shot ACP client instead, so both paths share one agent implementation.
+pub fn agent_component(
+    llm: Arc<MultiBackend>,
+    sessions: SessionStore,
+    max_turns: usize,
+    default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
+) -> impl ConnectTo<Client> {
     let llm_init = llm.clone();
     let sessions_init = sessions.clone();
 
@@ -3336,11 +3384,6 @@ pub async fn run_agent(
             },
             on_receive_dispatch!(),
         )
-        .connect_to(ByteStreams::new(
-            tokio::io::stdout().compat_write(),
-            tokio::io::stdin().compat(),
-        ))
-        .await
 }
 
 pub(crate) fn resolve_idle_timeouts(

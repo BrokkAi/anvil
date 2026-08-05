@@ -19,6 +19,7 @@ mod deepseek_auth;
 mod deepseek_balance;
 mod discovery;
 mod goal;
+mod headless;
 mod host_notice;
 #[cfg(feature = "http-api")]
 mod http_api;
@@ -71,6 +72,54 @@ use crate::multi_backend::{BackendRegistration, MultiBackend};
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Run one prompt headlessly and exit: connect a built-in ACP client to
+    /// the in-process agent, stream or print the result, then quit. Omit the
+    /// value, or pass `-`, to read the prompt from stdin. For a prompt that
+    /// starts with `-`, use `--print=<prompt>` or stdin. Mirrors Mjolnir's
+    /// `mj --print` contract (#356).
+    #[arg(
+        short = 'p',
+        long = "print",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = "-"
+    )]
+    print: Option<String>,
+
+    /// Output format for --print: `text` prints the final assistant message,
+    /// `json` prints one object at exit, `stream-json` prints
+    /// newline-delimited records as they happen with `result` last.
+    #[arg(long, value_enum, default_value_t = headless::OutputFormat::Text, requires = "print")]
+    output_format: headless::OutputFormat,
+
+    /// Permission policy for --print. `manual` rejects every permission
+    /// request so a run can never hang (the safe default), `auto` accepts
+    /// edit/delete/move requests but rejects shell execution, `yolo` accepts
+    /// everything.
+    #[arg(long, value_enum, requires = "print")]
+    permission_mode: Option<headless::PermissionMode>,
+
+    /// Working directory for the --print session. Defaults to the current
+    /// directory.
+    #[arg(long, value_name = "PATH", requires = "print")]
+    cwd: Option<PathBuf>,
+
+    /// Model for the --print session, with an optional trailing `+<effort>`
+    /// (off, none, minimal, low, medium, high, xhigh, max) to set the
+    /// session's reasoning effort independent of the model default.
+    #[arg(
+        long,
+        value_name = "MODEL[+EFFORT]",
+        requires = "print",
+        value_parser = headless::parse_model_override
+    )]
+    model: Option<(String, Option<String>)>,
+
+    /// Resume an existing session by id instead of creating a new one. The
+    /// session's original working directory must match.
+    #[arg(long, value_name = "SESSION_ID", requires = "print")]
+    resume: Option<String>,
 
     /// Override the default model id for new sessions. Accepts a wire
     /// form (`codex::<id>`, `ollama::llama3:latest`) or a bare id
@@ -208,6 +257,12 @@ impl std::fmt::Debug for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Args")
             .field("command", &self.command)
+            .field("print", &self.print)
+            .field("output_format", &self.output_format)
+            .field("permission_mode", &self.permission_mode)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("resume", &self.resume)
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
@@ -579,6 +634,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    if args.print.is_some() && args.command.is_some() {
+        anyhow::bail!("--print cannot be combined with a subcommand");
+    }
+
     if let Some(Command::Install(install_args)) = &args.command {
         installer::install(install_args)?;
         return Ok(());
@@ -783,6 +842,29 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
+
+    // Headless one-shot mode (#356): drive the same agent component with the
+    // built-in ACP client instead of serving stdio.
+    if let Some(prompt_arg) = args.print {
+        return headless::run(
+            headless::RunConfig {
+                prompt_arg,
+                output_format: args.output_format,
+                permission_mode: args
+                    .permission_mode
+                    .unwrap_or(headless::PermissionMode::Manual),
+                cwd: args.cwd,
+                model: args.model,
+                resume: args.resume,
+            },
+            llm,
+            sessions,
+            max_turns,
+            args.llm_idle_timeout_secs,
+            args.llm_stall_timeout_secs,
+        )
+        .await;
+    }
 
     // HTTP daemon mode shares the backend registrations, SessionStore, and
     // turn limits built above with the ACP path, so both transports use one
