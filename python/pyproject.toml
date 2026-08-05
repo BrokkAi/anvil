@@ -45,6 +45,7 @@ Issues = "https://github.com/BrokkAi/anvil/issues"
 
 [project.scripts]
 anvil = "brokk_anvil.launcher:main"
+brokk-anvil = "brokk_anvil.launcher:main"
 
 [tool.hatch.version]
 path = "brokk_anvil/__init__.py"
