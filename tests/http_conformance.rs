@@ -587,7 +587,12 @@ impl Harness {
 
 #[test]
 fn daemon_conforms_to_checked_in_contract() {
-    let script = vec![
+    let typescript_sdk_conformance = std::env::var_os("ANVIL_TS_SDK_CONFORMANCE").is_some();
+    let mut script = Vec::new();
+    if typescript_sdk_conformance {
+        script.push(sse_text("SDK conformance complete", None));
+    }
+    script.extend([
         // Run A (acceptEdits session): plan, write-with-diff, execution
         // failure, malformed arguments, then a final reasoning + text turn.
         sse_tool_call(
@@ -621,7 +626,7 @@ fn daemon_conforms_to_checked_in_contract() {
         ProviderScript::Hang,
         // Run E: scripted provider failure -> failed terminal.
         ProviderScript::Fail,
-    ];
+    ]);
     let provider_url = start_mock_provider(script);
 
     let contract = Contract::load();
@@ -636,6 +641,18 @@ fn daemon_conforms_to_checked_in_contract() {
     };
     let contract = &harness.contract;
     let base = &harness.base;
+
+    if typescript_sdk_conformance {
+        let workspace = tempfile::tempdir().expect("TypeScript SDK workspace");
+        let status = Command::new("node")
+            .arg("sdk/typescript/tests/conformance.mjs")
+            .arg(base)
+            .arg(workspace.path())
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("run TypeScript SDK conformance client");
+        assert!(status.success(), "TypeScript SDK conformance failed");
+    }
 
     // Server + catalog endpoints.
     get_json(contract, base, "/health", "/health");
