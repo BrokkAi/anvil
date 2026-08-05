@@ -18,10 +18,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { ROOT_PACKAGE, logStep, sha256Of } from './lib/common.mjs';
+import { versionExists, waitUntilVisible } from './lib/registry.mjs';
 
 const NPM_DIR = path.dirname(fileURLToPath(import.meta.url));
-const VISIBILITY_ATTEMPTS = 20;
-const VISIBILITY_DELAY_MS = 15_000;
 
 function parseArgs(argv) {
   const args = { dist: path.join(NPM_DIR, 'dist'), publish: false };
@@ -42,25 +41,6 @@ function npm(args, options = {}) {
   const result = spawnSync('npm', args, { encoding: 'utf8', ...options });
   if (result.error) throw new Error(`npm failed to start: ${result.error.message}`);
   return result;
-}
-
-function versionExists(name, version) {
-  const result = npm(['view', `${name}@${version}`, 'version', '--json']);
-  if (result.status === 0) {
-    const parsed = JSON.parse(result.stdout.trim() || 'null');
-    return parsed === version || (Array.isArray(parsed) && parsed.includes(version));
-  }
-  if (/E404/.test(result.stderr)) return false;
-  throw new Error(`npm view ${name}@${version} failed:\n${result.stderr}`);
-}
-
-async function waitUntilVisible(name, version) {
-  for (let attempt = 1; attempt <= VISIBILITY_ATTEMPTS; attempt += 1) {
-    if (versionExists(name, version)) return;
-    process.stdout.write(`  ${name}@${version} not visible yet (attempt ${attempt}/${VISIBILITY_ATTEMPTS})\n`);
-    await new Promise((resolve) => setTimeout(resolve, VISIBILITY_DELAY_MS));
-  }
-  throw new Error(`${name}@${version} did not become visible in the registry`);
 }
 
 function publishTarball(pkg, distDir, doPublish) {
