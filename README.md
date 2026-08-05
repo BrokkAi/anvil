@@ -78,6 +78,20 @@ anvil --version
 
 Running `anvil` directly starts a stdio JSON-RPC server; use it through an ACP client. Continue with the [installation guide](https://anvil.brokk.ai/install/) or the reproducible [ten-minute evaluation](https://anvil.brokk.ai/evaluate-anvil/).
 
+For scripts, CI jobs, and Makefiles, `anvil --print` runs one prompt headlessly with a built-in ACP client and exits — no external client required:
+
+```bash
+anvil -p "summarize the failing test"       # prompt as an argument
+echo "fix this test" | anvil -p             # or on stdin (also: anvil -p -)
+anvil -p "…" --output-format json           # one JSON object at exit
+anvil -p "…" --output-format stream-json    # newline-delimited records, result last
+anvil -p "…" --permission-mode yolo         # manual (default) | auto | yolo
+anvil -p "…" --cwd /path/to/repo --model "codex::gpt-5-codex+high"
+anvil -p "…" --resume SESSION_ID            # continue an existing session
+```
+
+Headless runs never block on a human: `manual` rejects every permission request, `auto` accepts edit/delete/move but rejects shell execution, and `yolo` accepts everything. The final assistant message goes to stdout (`text`), or a machine-readable payload with `session_id`, `resumed`, `result`, `stop_reason`, `usage`, and `error` (`json` / `stream-json`); progress and diagnostics stay on stderr, and the exit code is non-zero on agent or transport failure ([#356](https://github.com/BrokkAi/anvil/issues/356)).
+
 `anvil serve` (included in all official binaries; source builds can opt out with `cargo build --no-default-features --features wasm-sandbox`) starts the same runtime as an HTTP daemon on a loopback listener (default `127.0.0.1:26845`), exposing versioned REST endpoints for session lifecycle, model discovery, the tool catalog, and asynchronous prompt runs with Server-Sent-Event streaming and cancellation (`/health`, `/v1/models`, `/v1/tools`, `/v1/sessions`, `/v1/runs`). The daemon supports bearer-token authentication (required for non-loopback binding), server-enforced workspace roots, and interactive permission approval endpoints. The wire contract is versioned and checked in under [`openapi/`](openapi/) (OpenAPI document, SSE event schema, and compatibility policy), with a black-box conformance suite holding the implementation to it; generated SDKs are under active development ([#315](https://github.com/BrokkAi/anvil/issues/315)).
 
 Configure a supported ACP client directly from the installed binary:
