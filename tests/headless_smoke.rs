@@ -548,6 +548,64 @@ fn print_stream_json_emits_records_with_result_last() {
 }
 
 #[test]
+fn print_auto_mode_allows_first_class_move_and_delete() {
+    let env = smoke_env();
+    std::fs::write(env.cwd.join("source.txt"), "move me").expect("write source file");
+    let provider = start_provider(vec![
+        tool_call_sse_body_for(
+            "call_move",
+            "move_file",
+            r#"{"source_path":"source.txt","destination_path":"moved.txt"}"#,
+        ),
+        tool_call_sse_body_for("call_delete", "delete_file", r#"{"file_path":"moved.txt"}"#),
+        text_sse_body("File moved and deleted."),
+    ]);
+    let cwd = env.cwd.display().to_string();
+    let output = run_print(
+        &env,
+        &provider,
+        &[
+            "-p",
+            "Move source.txt to moved.txt, then delete it.",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "auto",
+            "--cwd",
+            &cwd,
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "auto run failed;\nstdout:\n{}\nstderr:\n{}",
+        stdout_str(&output),
+        stderr_str(&output)
+    );
+    assert!(!env.cwd.join("source.txt").exists());
+    assert!(!env.cwd.join("moved.txt").exists());
+
+    let records = parse_stream_stdout(&output);
+    let permissions: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|record| record["type"] == "permission")
+        .map(|record| {
+            (
+                record["tool_call_id"].as_str().expect("permission call id"),
+                record["decision"].as_str().expect("permission decision"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        permissions,
+        vec![("call_move", "allow"), ("call_delete", "allow")]
+    );
+    let result = records.last().expect("result record");
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["result"], "File moved and deleted.");
+}
+
+#[test]
 fn print_yolo_mode_allows_edits() {
     let env = smoke_env();
     let provider = start_provider(vec![

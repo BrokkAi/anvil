@@ -58,6 +58,17 @@ struct WriteFileArgs {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeleteFileArgs {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveFileArgs {
+    source_path: String,
+    destination_path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct EditEntryArgs {
     old_string: String,
@@ -253,6 +264,19 @@ impl BuiltinArgsContract for WriteFileArgs {
 }
 
 #[cfg(test)]
+impl BuiltinArgsContract for DeleteFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("file_path", "string")];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for MoveFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["source_path", "destination_path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("source_path", "string"), ("destination_path", "string")];
+}
+
+#[cfg(test)]
 impl BuiltinArgsContract for EditFileArgs {
     const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "edits"];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
@@ -364,6 +388,18 @@ const TOOLS: &[ToolMeta] = &[
         name: "write_file",
         kind: ToolKind::Edit,
         display_name: "Writing file",
+        concurrency_safe: false,
+    },
+    ToolMeta {
+        name: "delete_file",
+        kind: ToolKind::Delete,
+        display_name: "Deleting file",
+        concurrency_safe: false,
+    },
+    ToolMeta {
+        name: "move_file",
+        kind: ToolKind::Move,
+        display_name: "Moving file",
         concurrency_safe: false,
     },
     ToolMeta {
@@ -750,6 +786,8 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
+    "delete_file",
+    "move_file",
     "edit",
     "list_directory",
     "grep_search",
@@ -1067,6 +1105,42 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["file_path", "content"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("delete_file") {
+            defs.push(tool_def(
+                "delete_file",
+                "Deletes one regular file from the local filesystem. Directory and symlink deletion is refused. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the regular file to delete. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        }
+                    },
+                    "required": ["file_path"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("move_file") {
+            defs.push(tool_def(
+                "move_file",
+                "Moves or renames one regular file without overwriting an existing destination. Directory and symlink moves are refused. Both paths must remain inside configured workspace roots; missing destination parent directories are created.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "source_path": {
+                            "type": "string",
+                            "description": "Path to the existing regular file. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        },
+                        "destination_path": {
+                            "type": "string",
+                            "description": "New path for the file. The destination must not already exist. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        }
+                    },
+                    "required": ["source_path", "destination_path"]
                 }),
             ));
         }
@@ -1523,6 +1597,38 @@ impl ToolRegistry {
                 let additional_roots = self.additional_roots.clone();
                 run_blocking_filesystem_tool(move || {
                     filesystem::write_file_in_roots(&cwd, &additional_roots, &path, &content)
+                })
+                .await
+            }
+            "delete_file" => {
+                let args: DeleteFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
+                let path = args.file_path;
+                run_blocking_filesystem_tool(move || {
+                    filesystem::delete_file_in_roots(&cwd, &additional_roots, &path)
+                })
+                .await
+            }
+            "move_file" => {
+                let args: MoveFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
+                let source_path = args.source_path;
+                let destination_path = args.destination_path;
+                run_blocking_filesystem_tool(move || {
+                    filesystem::move_file_in_roots(
+                        &cwd,
+                        &additional_roots,
+                        &source_path,
+                        &destination_path,
+                    )
                 })
                 .await
             }
@@ -2381,6 +2487,12 @@ mod tests {
         assert_eq!(ToolRegistry::tool_kind("scan_usages"), ToolKind::Search);
     }
 
+    #[test]
+    fn first_class_file_mutations_have_acp_delete_and_move_kinds() {
+        assert_eq!(ToolRegistry::tool_kind("delete_file"), ToolKind::Delete);
+        assert_eq!(ToolRegistry::tool_kind("move_file"), ToolKind::Move);
+    }
+
     #[tokio::test]
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
@@ -2505,6 +2617,8 @@ mod tests {
 
         assert_builtin_schema_matches::<ReadFileArgs>(&defs, "read_file");
         assert_builtin_schema_matches::<WriteFileArgs>(&defs, "write_file");
+        assert_builtin_schema_matches::<DeleteFileArgs>(&defs, "delete_file");
+        assert_builtin_schema_matches::<MoveFileArgs>(&defs, "move_file");
         assert_builtin_schema_matches::<EditFileArgs>(&defs, "edit");
         assert_builtin_schema_matches::<ListDirectoryArgs>(&defs, "list_directory");
         assert_builtin_schema_matches::<GrepSearchArgs>(&defs, "grep_search");
@@ -2642,6 +2756,14 @@ mod tests {
             "content",
         )
         .await;
+        assert_invalid_builtin_args(&registry, "delete_file", json!({}), "file_path").await;
+        assert_invalid_builtin_args(
+            &registry,
+            "move_file",
+            json!({ "source_path": "x" }),
+            "destination_path",
+        )
+        .await;
         assert_invalid_builtin_args(
             &registry,
             "edit",
@@ -2741,6 +2863,46 @@ mod tests {
             std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
             "alpha\nBETA\n"
         );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn first_class_move_and_delete_dispatch_through_registry() {
+        let cwd = fresh_tmp_dir("move-delete-dispatch");
+        std::fs::write(cwd.join("source.txt"), "content").unwrap();
+        let mut registry = registry_with_skills(vec![]);
+        registry.cwd = cwd.clone();
+
+        let moved = registry
+            .execute(
+                "move_file",
+                json!({
+                    "source_path": "source.txt",
+                    "destination_path": "nested/destination.txt"
+                }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(cwd.join("nested/destination.txt").exists());
+
+        let deleted = registry
+            .execute(
+                "delete_file",
+                json!({ "file_path": "nested/destination.txt" }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!cwd.join("nested/destination.txt").exists());
         std::fs::remove_dir_all(&cwd).ok();
     }
 

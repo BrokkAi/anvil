@@ -3327,7 +3327,7 @@ async fn execute_step_tool_calls(
                 );
 
                 let pre_write: Option<Option<String>> =
-                    if matches!(tool_name.as_str(), "write_file" | "edit") {
+                    if matches!(tool_name.as_str(), "write_file" | "edit" | "delete_file") {
                         capture_pre_write_text(
                             registry.cwd(),
                             registry.additional_roots(),
@@ -5171,8 +5171,10 @@ fn trajectory_window_time_limit_notice(
 
 fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     tool_exchanges.iter().any(|exchange| {
-        matches!(exchange.tool_name.as_str(), "edit" | "write_file")
-            && !tool_result_failed(&exchange.result)
+        matches!(
+            exchange.tool_name.as_str(),
+            "edit" | "write_file" | "delete_file" | "move_file"
+        ) && !tool_result_failed(&exchange.result)
     })
 }
 
@@ -5184,20 +5186,25 @@ fn has_successful_training_file_change(
         if tool_result_failed(&exchange.result) {
             return false;
         }
-        let Some(path) = file_change_target_path(exchange) else {
-            return false;
-        };
-        packet.files.iter().any(|file| file.path == path)
+        file_change_target_paths(exchange)
+            .iter()
+            .any(|path| packet.files.iter().any(|file| file.path == *path))
     })
 }
 
-fn file_change_target_path(exchange: &ToolExchange) -> Option<String> {
-    if !matches!(exchange.tool_name.as_str(), "edit" | "write_file") {
-        return None;
-    }
-    let args = serde_json::from_str::<Value>(&exchange.arguments).ok()?;
-    let path = args.get("file_path")?.as_str()?;
-    normalize_tool_path(path)
+fn file_change_target_paths(exchange: &ToolExchange) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<Value>(&exchange.arguments) else {
+        return Vec::new();
+    };
+    let keys: &[&str] = match exchange.tool_name.as_str() {
+        "edit" | "write_file" | "delete_file" => &["file_path"],
+        "move_file" => &["source_path", "destination_path"],
+        _ => return Vec::new(),
+    };
+    keys.iter()
+        .filter_map(|key| args.get(*key).and_then(Value::as_str))
+        .filter_map(normalize_tool_path)
+        .collect()
 }
 
 fn normalize_tool_path(path: &str) -> Option<String> {
@@ -6031,7 +6038,7 @@ fn capture_pre_write_text(
     }
 }
 
-/// Assemble a `Diff` block for a successful write/edit call from the parsed
+/// Assemble a `Diff` block for a successful write/edit/delete call from the parsed
 /// args plus the captured prior content. Returns `None` if we couldn't
 /// pull the path/content (in which case the caller falls back to text).
 fn build_editing_diff(
@@ -6053,6 +6060,7 @@ fn build_editing_diff(
             let prior_text = prior.as_ref()?;
             apply_edit_args_for_diff(prior_text, parsed_input)?
         }
+        "delete_file" => String::new(),
         _ => return None,
     };
     Some(ToolExchangeDiff {
@@ -8140,6 +8148,36 @@ mod tests {
     }
 
     #[test]
+    fn file_change_tracking_counts_delete_and_both_move_paths() {
+        let deleted = file_exchange_for_test("delete_file", "src/lib.rs");
+        let moved = ToolExchange {
+            call_id: "call-move_file".to_string(),
+            tool_name: "move_file".to_string(),
+            arguments: serde_json::json!({
+                "source_path": "src/old.rs",
+                "destination_path": "src/new.rs"
+            })
+            .to_string(),
+            result: "Moved 'src/old.rs' to 'src/new.rs'".to_string(),
+            ..ToolExchange::default()
+        };
+
+        assert!(has_successful_file_change(std::slice::from_ref(&deleted)));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&deleted),
+            &training_packet_for_test("src/lib.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/old.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/new.rs")
+        ));
+    }
+
+    #[test]
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
         let packet = training_packet_for_test("src/lib.rs");
@@ -8424,6 +8462,16 @@ mod tests {
                 "edit",
                 ToolRegistry::tool_kind("edit"),
                 serde_json::json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
+            ),
+            (
+                "delete_file",
+                ToolRegistry::tool_kind("delete_file"),
+                serde_json::json!({"file_path": "app.js"}),
+            ),
+            (
+                "move_file",
+                ToolRegistry::tool_kind("move_file"),
+                serde_json::json!({"source_path": "app.js", "destination_path": "moved.js"}),
             ),
             (
                 "run_shell_command",
@@ -8956,6 +9004,20 @@ mod tests {
             ),
             PureGateDecision::Prompt
         );
+    }
+
+    #[test]
+    fn accept_edits_sends_delete_and_move_to_the_client_permission_policy() {
+        for (kind, name) in [
+            (ToolKind::Delete, "delete_file"),
+            (ToolKind::Move, "move_file"),
+        ] {
+            assert_eq!(
+                decide(PermissionMode::AcceptEdits, kind, name, false, false),
+                PureGateDecision::Prompt,
+                "{name} must reach the client so headless auto can approve it"
+            );
+        }
     }
 
     #[test]

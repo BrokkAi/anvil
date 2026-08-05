@@ -564,6 +564,141 @@ pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
     write_file_in_roots(cwd, &[], path, content)
 }
 
+fn requested_path(cwd: &Path, path: &str) -> std::path::PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn leaf_is_symlink(cwd: &Path, path: &str) -> bool {
+    std::fs::symlink_metadata(requested_path(cwd, path))
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub fn delete_file(cwd: &Path, path: &str) -> ToolResult {
+    delete_file_in_roots(cwd, &[], path)
+}
+
+pub fn delete_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+) -> ToolResult {
+    let resolved = match super::safe_resolve_in_roots(cwd, additional_roots, path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: error,
+            };
+        }
+    };
+    if leaf_is_symlink(cwd, path) {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to delete symlink '{path}'"),
+        };
+    }
+    if !resolved.is_file() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to delete '{path}': not a regular file"),
+        };
+    }
+    match std::fs::remove_file(&resolved) {
+        Ok(()) => ToolResult {
+            status: ToolStatus::Success,
+            output: format!("Deleted '{path}'"),
+        },
+        Err(error) => ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Failed to delete '{path}': {error}"),
+        },
+    }
+}
+
+#[cfg(test)]
+pub fn move_file(cwd: &Path, source_path: &str, destination_path: &str) -> ToolResult {
+    move_file_in_roots(cwd, &[], source_path, destination_path)
+}
+
+pub fn move_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    source_path: &str,
+    destination_path: &str,
+) -> ToolResult {
+    let source = match super::safe_resolve_in_roots(cwd, additional_roots, source_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: error,
+            };
+        }
+    };
+    if leaf_is_symlink(cwd, source_path) {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to move symlink '{source_path}'"),
+        };
+    }
+    if !source.is_file() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to move '{source_path}': not a regular file"),
+        };
+    }
+
+    let destination =
+        match super::safe_resolve_for_write_in_roots(cwd, additional_roots, destination_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return ToolResult {
+                    status: ToolStatus::RequestError,
+                    output: error,
+                };
+            }
+        };
+    if source == destination {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: "Source and destination refer to the same file".to_string(),
+        };
+    }
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to overwrite existing destination '{destination_path}'"),
+        };
+    }
+    if let Some(parent) = destination.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return ToolResult {
+            status: ToolStatus::InternalError,
+            output: format!(
+                "Failed to create directories for destination '{destination_path}': {error}"
+            ),
+        };
+    }
+    match std::fs::rename(&source, &destination) {
+        Ok(()) => ToolResult {
+            status: ToolStatus::Success,
+            output: format!("Moved '{source_path}' to '{destination_path}'"),
+        },
+        Err(error) => ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Failed to move '{source_path}' to '{destination_path}': {error}"),
+        },
+    }
+}
+
 pub fn write_file_in_roots(
     cwd: &Path,
     additional_roots: &[std::path::PathBuf],
@@ -1091,6 +1226,151 @@ mod tests {
         let r = read_file(&cwd, "hello.txt", None, None);
         assert!(matches!(r.status, ToolStatus::Success));
         assert_eq!(r.output, "world");
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn delete_file_removes_only_regular_files() {
+        let cwd = fresh_tmp_dir("delete-file");
+        std::fs::write(cwd.join("old.txt"), "old").unwrap();
+        std::fs::create_dir(cwd.join("directory")).unwrap();
+
+        let deleted = delete_file(&cwd, "old.txt");
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!cwd.join("old.txt").exists());
+
+        let missing = delete_file(&cwd, "old.txt");
+        assert!(matches!(missing.status, ToolStatus::RequestError));
+
+        let directory = delete_file(&cwd, "directory");
+        assert!(matches!(directory.status, ToolStatus::RequestError));
+        assert!(cwd.join("directory").is_dir());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn move_file_renames_without_overwriting_and_creates_parents() {
+        let cwd = fresh_tmp_dir("move-file");
+        std::fs::write(cwd.join("old.txt"), "old").unwrap();
+
+        let moved = move_file(&cwd, "old.txt", "nested/new.txt");
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(!cwd.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("nested/new.txt")).unwrap(),
+            "old"
+        );
+
+        std::fs::write(cwd.join("another.txt"), "another").unwrap();
+        let collision = move_file(&cwd, "another.txt", "nested/new.txt");
+        assert!(matches!(collision.status, ToolStatus::RequestError));
+        assert!(collision.output.contains("Refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("another.txt")).unwrap(),
+            "another"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("nested/new.txt")).unwrap(),
+            "old"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn delete_and_move_file_enforce_workspace_roots() {
+        let cwd = fresh_tmp_dir("mutate-root-cwd");
+        let outside = fresh_tmp_dir("mutate-root-outside");
+        let outside_file = outside.join("outside.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        std::fs::write(cwd.join("inside.txt"), "inside").unwrap();
+
+        let deleted = delete_file(&cwd, outside_file.to_str().unwrap());
+        assert!(matches!(deleted.status, ToolStatus::RequestError));
+        assert!(outside_file.exists());
+
+        let moved_source = move_file(&cwd, outside_file.to_str().unwrap(), "moved-inside.txt");
+        assert!(matches!(moved_source.status, ToolStatus::RequestError));
+        assert!(outside_file.exists());
+
+        let moved_destination = move_file(
+            &cwd,
+            "inside.txt",
+            outside.join("moved-outside.txt").to_str().unwrap(),
+        );
+        assert!(matches!(moved_destination.status, ToolStatus::RequestError));
+        assert!(cwd.join("inside.txt").exists());
+        assert!(!outside.join("moved-outside.txt").exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn delete_and_move_file_accept_additional_workspace_roots() {
+        let cwd = fresh_tmp_dir("mutate-additional-cwd");
+        let additional = fresh_tmp_dir("mutate-additional-root");
+        let source = additional.join("source.txt");
+        let destination = additional.join("nested/destination.txt");
+        std::fs::write(&source, "content").unwrap();
+
+        let moved = move_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        );
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(!source.exists());
+        assert!(destination.exists());
+
+        let deleted = delete_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            destination.to_str().unwrap(),
+        );
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!destination.exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_and_move_file_refuse_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = fresh_tmp_dir("mutate-symlink");
+        std::fs::write(cwd.join("target.txt"), "target").unwrap();
+        symlink("target.txt", cwd.join("link.txt")).unwrap();
+
+        let deleted = delete_file(&cwd, "link.txt");
+        assert!(matches!(deleted.status, ToolStatus::RequestError));
+        assert!(cwd.join("link.txt").symlink_metadata().is_ok());
+        assert!(cwd.join("target.txt").exists());
+
+        let moved = move_file(&cwd, "link.txt", "moved.txt");
+        assert!(matches!(moved.status, ToolStatus::RequestError));
+        assert!(cwd.join("link.txt").symlink_metadata().is_ok());
+        assert!(!cwd.join("moved.txt").exists());
+        assert!(cwd.join("target.txt").exists());
 
         std::fs::remove_dir_all(&cwd).ok();
     }
