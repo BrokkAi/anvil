@@ -45,3 +45,6 @@ __pycache__/
 
 # npm packaging build output (npm/build-npm-packages.mjs)
 /npm/dist/
+
+# PyPI packaging build output
+/python/dist/

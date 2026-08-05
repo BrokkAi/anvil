@@ -1,0 +1,108 @@
+name: Publish PyPI Package
+
+# Builds the small brokk-anvil launcher package for an existing GitHub release.
+# The package version pins that exact native release; the smoke test exercises
+# the cold-cache download and SHA-256 verification before any registry write.
+# Manual runs default to build-and-validate. Registry writes use PyPI trusted
+# publishing through the pypi-publish environment, with no long-lived token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing GitHub release tag to package (for example v0.24.4)'
+        required: true
+      publish:
+        description: 'Publish to PyPI. Leave unchecked to build and validate only.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  build-and-validate:
+    name: Build and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+
+      - name: Verify the release tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft --jq '.'
+
+      - name: Verify Python, Cargo, and tag versions match
+        env:
+          TAG: ${{ inputs.tag }}
+        run: python python/scripts/check_version.py --tag "$TAG"
+
+      - name: Test the launcher
+        run: PYTHONPATH=python python -m unittest discover -s python/tests -v
+
+      - name: Install pinned packaging tools
+        run: python -m pip install build==1.5.0 twine==6.2.0
+
+      - name: Build and inspect distributions
+        run: |
+          python -m build python --outdir python/dist
+          python -m twine check python/dist/*
+
+      - name: Smoke-test the released native binary through the wheel
+        env:
+          BROKK_ANVIL_CACHE_DIR: ${{ runner.temp }}/brokk-anvil-cache
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/brokk-anvil-venv"
+          "$RUNNER_TEMP/brokk-anvil-venv/bin/pip" install --no-index python/dist/*.whl
+          expected="anvil ${TAG#v}"
+          first=$("$RUNNER_TEMP/brokk-anvil-venv/bin/anvil" --version)
+          second=$("$RUNNER_TEMP/brokk-anvil-venv/bin/anvil" --version)
+          test "$first" = "$expected"
+          test "$second" = "$expected"
+          test -x "$BROKK_ANVIL_CACHE_DIR/${TAG#v}/x86_64-unknown-linux-gnu/anvil"
+
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: pypi-package-${{ inputs.tag }}
+          path: python/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    if: ${{ inputs.publish }}
+    needs: build-and-validate
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-publish
+      url: https://pypi.org/p/brokk-anvil
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: pypi-package-${{ inputs.tag }}
+          path: dist
+
+      - name: Publish with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true
