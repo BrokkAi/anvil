@@ -93,10 +93,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = headless::OutputFormat::Text, requires = "print")]
     output_format: headless::OutputFormat,
 
-    /// Permission policy for --print. `manual` rejects every permission
-    /// request so a run can never hang (the safe default), `auto` accepts
-    /// edit/delete/move requests but rejects shell execution, `yolo` accepts
-    /// everything.
+    /// Permission policy for --print. `manual` allows read/search/fetch and
+    /// safelisted sandboxed read-only shell operations, but rejects every
+    /// permission request so a run can never hang (the safe default); `auto`
+    /// accepts edit/delete/move requests but rejects shell execution; `yolo`
+    /// accepts everything.
     #[arg(long, value_enum, requires = "print")]
     permission_mode: Option<headless::PermissionMode>,
 
