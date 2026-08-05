@@ -310,7 +310,7 @@ fn tool_calls_from_prefix(tool_calls: &[PrefixToolCall]) -> Vec<ToolCall> {
 }
 
 pub(crate) fn p2t_initial_builtin_tools() -> HashSet<String> {
-    ["write_file", "edit"]
+    ["write_file", "edit", "delete_file", "move_file"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -332,11 +332,13 @@ pub(crate) fn prefix_unlocks_shell(steps: &[PrefixStep]) -> bool {
 
 fn prefix_step_has_successful_file_change(step: &PrefixStep) -> bool {
     step.tool_calls.iter().any(|call| {
-        matches!(call.name.as_str(), "edit" | "write_file")
-            && step
-                .results
-                .iter()
-                .any(|result| result.call_id == call.id && !tool_result_failed(&result.content))
+        matches!(
+            call.name.as_str(),
+            "edit" | "write_file" | "delete_file" | "move_file"
+        ) && step
+            .results
+            .iter()
+            .any(|result| result.call_id == call.id && !tool_result_failed(&result.content))
     })
 }
 
@@ -922,6 +924,14 @@ mod tests {
         }];
 
         assert!(prefix_unlocks_shell(&steps));
+    }
+
+    #[test]
+    fn first_class_file_mutations_are_available_before_shell_unlock() {
+        let tools = p2t_initial_builtin_tools();
+        for name in ["write_file", "edit", "delete_file", "move_file"] {
+            assert!(tools.contains(name), "{name} should be available initially");
+        }
     }
 
     #[test]
