@@ -41,6 +41,16 @@ jobs:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
       - name: Update npm (trusted publishing needs npm >= 11.5.1)
         run: |
           npm install -g npm@latest
@@ -74,11 +84,11 @@ jobs:
       - name: Smoke-test the built tarballs (linux-x64)
         run: node npm/test-npm-packages.mjs --dist npm/dist
 
-      - name: Build and test the TypeScript SDK
+      - name: Regenerate all SDKs and build the TypeScript package
         run: |
           npm ci --prefix sdk/typescript
           node scripts/generate-sdks.mjs
-          git diff --exit-code -- sdk/typescript/src/generated
+          git diff --exit-code -- sdk/typescript/src/generated sdk/rust sdk/python
           npm --prefix sdk/typescript test
           mkdir -p npm/dist-sdk
           npm pack ./sdk/typescript --pack-destination "$PWD/npm/dist-sdk"

@@ -1,12 +1,12 @@
 import { defineConfig } from '@hey-api/openapi-ts';
 
 export default defineConfig({
-  input: '../../openapi/anvil.v1.yaml',
+  input: '../.generated/anvil.v1.sdk.json',
   output: {
     path: 'src/generated/openapi',
     clean: true,
     header: [
-      '// Generated from openapi/anvil.v1.yaml (Anvil Agent API contract 1.0.0).',
+      '// Generated from openapi/anvil.v1.yaml and openapi/anvil.v1.events.schema.json.',
       '// Generator: @hey-api/openapi-ts 0.99.0. Do not edit by hand.',
     ],
     module: {

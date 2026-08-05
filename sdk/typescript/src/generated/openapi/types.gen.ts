@@ -1,4 +1,4 @@
-// Generated from openapi/anvil.v1.yaml (Anvil Agent API contract 1.0.0).
+// Generated from openapi/anvil.v1.yaml and openapi/anvil.v1.events.schema.json.
 // Generator: @hey-api/openapi-ts 0.99.0. Do not edit by hand.
 
 export type ClientOptions = {
@@ -275,6 +275,144 @@ export type PermissionRespondResult = {
     resolved: true;
     id: string;
 };
+
+export type EventEnvelope = {
+    type: string;
+    run_id: string;
+    session_id: string;
+    seq: number;
+    ts_ms: number;
+};
+
+export type EventUsage = {
+    input_tokens: number;
+    output_tokens: number;
+    thought_tokens: number;
+    cached_read_tokens: number;
+    cached_write_tokens: number;
+};
+
+export type EventToolCallBase = EventEnvelope & {
+    call_id: string;
+    tool_name: string;
+};
+
+export type EventRunCreated = EventEnvelope & {
+    type?: 'run.created';
+    prompt_chars: number;
+};
+
+export type EventMessageDelta = EventEnvelope & {
+    type?: 'message.delta';
+    text: string;
+};
+
+export type EventThoughtDelta = EventEnvelope & {
+    type?: 'thought.delta';
+    text: string;
+};
+
+export type EventPlanUpdated = EventEnvelope & {
+    type?: 'plan.updated';
+    plan: {
+        explanation?: string | null;
+        plan: Array<{
+            step: string;
+            status: 'pending' | 'in_progress' | 'completed';
+        }>;
+    };
+};
+
+export type EventToolCallStarted = EventToolCallBase & {
+    type?: 'tool_call.started';
+    input: unknown;
+    /**
+     * Present and true when the rendered card would hide the input (adapters use a static title).
+     */
+    oversized?: boolean;
+};
+
+export type EventToolCallBlocked = EventToolCallBase & {
+    type?: 'tool_call.blocked';
+    input: unknown;
+    reason: string;
+};
+
+export type EventToolCallInProgress = EventToolCallBase & {
+    type?: 'tool_call.in_progress';
+};
+
+export type EventToolCallFailed = EventToolCallBase & {
+    type?: 'tool_call.failed';
+    reason: string;
+    permission_notice?: string | null;
+    /**
+     * Present for post-execution failures; null for pre-execution rejections.
+     */
+    input?: unknown;
+};
+
+export type EventToolCallCompleted = EventToolCallBase & {
+    type?: 'tool_call.completed';
+    input: unknown;
+    output: string;
+    diff?: null | {
+        path: string;
+        old_text: string | null;
+        new_text: string;
+    };
+    permission_notice?: string | null;
+};
+
+export type EventPermissionRequested = EventEnvelope & {
+    type?: 'permission.requested';
+    id?: string;
+    permission_id: string;
+    tool_name: string;
+    tool_call_id: string;
+    input?: unknown;
+    permission_notice?: string | null;
+    options: Array<{
+        id: string;
+        label: string;
+        kind: 'allow_once' | 'allow_always' | 'reject_once';
+    }>;
+    created_at_ms?: number;
+};
+
+export type EventPermissionResolved = EventEnvelope & {
+    type?: 'permission.resolved';
+    permission_id: string;
+    tool_call_id?: string;
+    tool_name: string;
+    /**
+     * The selected option id, or `cancelled` / `unsupported`.
+     */
+    decision: string;
+};
+
+export type EventRunTerminal = EventEnvelope & {
+    type?: 'run.completed' | 'run.cancelled' | 'run.failed';
+    stop_reason: 'end_turn' | 'max_turns' | 'time_limit' | 'cancelled' | 'error' | null;
+    error?: string | null;
+    result_text?: string | null;
+    structured_output?: unknown;
+    usage?: EventUsage;
+    cumulative_usage?: EventUsage;
+};
+
+export type EventEventsGap = {
+    type: 'events.gap';
+    run_id: string;
+    missed_through_seq: number;
+};
+
+/**
+ * Anvil run event stream (v1)
+ *
+ * Contract for the JSON payload carried in each Server-Sent Event on GET /v1/runs/{run_id}/events. The SSE `id` field is the decimal `seq`; the SSE `event` field equals `type`. Every event shares the envelope fields and one payload variant selected by `type`. The stream ends after a terminal `run.completed`, `run.cancelled`, or `run.failed` event. The synthetic `events.gap` notice is emitted without an envelope `seq` when a reconnect falls behind the bounded replay buffer.
+ */
+export type AnvilRunEvent = EventRunCreated | EventMessageDelta | EventThoughtDelta | EventPlanUpdated | EventToolCallStarted | EventToolCallBlocked | EventToolCallInProgress | EventToolCallFailed | EventToolCallCompleted | EventPermissionRequested | EventPermissionResolved | EventRunTerminal | EventEventsGap;
 
 export type SessionId = string;
 
@@ -746,9 +884,9 @@ export type StreamRunEventsError = StreamRunEventsErrors[keyof StreamRunEventsEr
 
 export type StreamRunEventsResponses = {
     /**
-     * See anvil.v1.events.schema.json for the payload contract of each event.
+     * SSE stream of run events.
      */
-    200: string;
+    200: AnvilRunEvent;
 };
 
 export type StreamRunEventsResponse = StreamRunEventsResponses[keyof StreamRunEventsResponses];

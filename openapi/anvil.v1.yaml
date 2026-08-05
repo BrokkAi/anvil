@@ -535,7 +535,7 @@ components:
         status: { type: string, const: ok }
         name: { type: string, const: anvil }
         version: { type: string }
-        models_discovered: { type: integer, minimum: 0 }
+        models_discovered: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
 
     ModelsResponse:
@@ -585,7 +585,7 @@ components:
               description: { type: string }
             additionalProperties: false
         supports_images: { type: [boolean, "null"] }
-        context_length: { type: [integer, "null"], minimum: 0 }
+        context_length: { type: [integer, "null"], format: int64, minimum: 0 }
         pricing:
           oneOf:
             - type: "null"
@@ -630,11 +630,11 @@ components:
         - cached_read_tokens
         - cached_write_tokens
       properties:
-        input_tokens: { type: integer, minimum: 0 }
-        output_tokens: { type: integer, minimum: 0 }
-        thought_tokens: { type: integer, minimum: 0 }
-        cached_read_tokens: { type: integer, minimum: 0 }
-        cached_write_tokens: { type: integer, minimum: 0 }
+        input_tokens: { type: integer, format: int64, minimum: 0 }
+        output_tokens: { type: integer, format: int64, minimum: 0 }
+        thought_tokens: { type: integer, format: int64, minimum: 0 }
+        cached_read_tokens: { type: integer, format: int64, minimum: 0 }
+        cached_write_tokens: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
 
     Session:
@@ -669,12 +669,12 @@ components:
         reasoning_effort: { type: [string, "null"] }
         service_tier: { type: [string, "null"] }
         title: { type: [string, "null"] }
-        created_at_ms: { type: integer, minimum: 0 }
-        modified_at_ms: { type: integer, minimum: 0 }
+        created_at_ms: { type: integer, format: int64, minimum: 0 }
+        modified_at_ms: { type: integer, format: int64, minimum: 0 }
         updated_at:
           type: [string, "null"]
           description: RFC 3339 rendering of `modified_at_ms`.
-        history_turns: { type: integer, minimum: 0 }
+        history_turns: { type: integer, format: int64, minimum: 0 }
         usage: { $ref: "#/components/schemas/Usage" }
         usage_cost_usd: { type: [number, "null"] }
         history:
@@ -718,8 +718,8 @@ components:
             properties:
               id: { type: string }
               title: { type: [string, "null"] }
-              created_at_ms: { type: integer, minimum: 0 }
-              modified_at_ms: { type: integer, minimum: 0 }
+              created_at_ms: { type: integer, format: int64, minimum: 0 }
+              modified_at_ms: { type: integer, format: int64, minimum: 0 }
               updated_at: { type: [string, "null"] }
               cwd: { type: [string, "null"] }
               resident: { type: boolean }
@@ -890,9 +890,9 @@ components:
           oneOf:
             - type: "null"
             - { $ref: "#/components/schemas/Usage" }
-        created_at_ms: { type: integer, minimum: 0 }
-        finished_at_ms: { type: [integer, "null"], minimum: 0 }
-        last_seq: { type: integer, minimum: 0 }
+        created_at_ms: { type: integer, format: int64, minimum: 0 }
+        finished_at_ms: { type: [integer, "null"], format: int64, minimum: 0 }
+        last_seq: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
 
     RunListResponse:
@@ -938,7 +938,7 @@ components:
         options:
           type: array
           items: { $ref: "#/components/schemas/PermissionOption" }
-        created_at_ms: { type: integer, minimum: 0 }
+        created_at_ms: { type: integer, format: int64, minimum: 0 }
         status: { type: string, const: pending }
       additionalProperties: false
 
