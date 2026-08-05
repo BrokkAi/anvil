@@ -30,6 +30,18 @@ function versionExists() {
   throw new Error(`npm view failed:\n${result.stderr}`);
 }
 
+function verifyTarballMetadata() {
+  const result = npm(['publish', tarball, '--dry-run', '--json', '--ignore-scripts']);
+  if (result.status !== 0) throw new Error(`npm publish dry run failed:\n${result.stderr}`);
+  const report = JSON.parse(result.stdout);
+  const metadata = report[packageJson.name] ?? report;
+  if (metadata.name !== packageJson.name || metadata.version !== packageJson.version) {
+    throw new Error(
+      `tarball identity mismatch: expected ${packageJson.name}@${packageJson.version}, got ${metadata.name}@${metadata.version}`,
+    );
+  }
+}
+
 async function waitUntilVisible() {
   for (let attempt = 1; attempt <= 20; attempt += 1) {
     if (versionExists()) return;
@@ -38,6 +50,8 @@ async function waitUntilVisible() {
   }
   throw new Error(`${packageJson.name}@${packageJson.version} did not become visible`);
 }
+
+verifyTarballMetadata();
 
 if (versionExists()) {
   process.stdout.write(`${packageJson.name}@${packageJson.version} already published; skipping\n`);
