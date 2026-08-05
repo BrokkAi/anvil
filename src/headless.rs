@@ -49,8 +49,8 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PermissionMode {
-    /// Reject every permission request while still allowing read, search,
-    /// fetch, and safelisted sandboxed read-only shell operations.
+    /// Reject every permission request while honoring agent-side read-only
+    /// auto-approvals and remembered repo-scoped Always allow grants.
     #[value(alias = "default")]
     Manual,
     /// Accept edit/delete/move requests; reject shell execution.
@@ -67,8 +67,9 @@ impl PermissionMode {
     /// classifier decides permissions without ever consulting the client, so
     /// leaving it in place would break the documented headless table.
     ///
-    /// - `manual` → `default`: the agent auto-approves read-only operations;
-    ///   the client-side policy rejects every request that reaches it.
+    /// - `manual` → `default`: the agent honors read-only auto-approvals and
+    ///   remembered Always allow grants; the client-side policy rejects every
+    ///   request that reaches it.
     /// - `auto` → `acceptEdits`: edits are auto-approved agent-side;
     ///   delete/move prompts are approved and shell execution rejected by
     ///   the client-side policy — together exactly "accept edit/delete/move,
