@@ -17,9 +17,9 @@
 //! provider-cache hit; an explicitly separate utility provider receives the
 //! same relevance context without changing the main conversation.
 //!
-//! In ordinary operation, provider and structured-output failures degrade to
-//! deterministic reciprocal-rank fusion. CIM evaluation mode fails closed so a
-//! provider failure cannot silently change the experimental treatment.
+//! Provider failures return a tool error. Invalid structured output gets one
+//! corrective retry, then returns a tool error. A failed reranker must not
+//! silently change the result into a different retrieval treatment.
 //! Bifrost's raw three-list payload is never exposed to the model.
 
 use futures::future::join_all;
@@ -45,6 +45,7 @@ const MAX_CANDIDATE_CONTEXT_BYTES: usize = 8_000;
 const MAX_TOTAL_CONTEXT_BYTES: usize = 120_000;
 const CONTEXT_FETCH_BATCH: usize = 8;
 const MAX_SELECTED_DECLARATIONS: usize = 5;
+const MAX_UTILITY_OUTPUT_ATTEMPTS: usize = 2;
 const RRF_RANK_CONSTANT: f64 = 60.0;
 
 const MAX_LINE_CHARS: usize = 2048;
@@ -132,8 +133,8 @@ struct RankedCandidate<'a> {
 }
 
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
-/// and render a unified, relevance-ordered hit list. Ordinary operation falls
-/// back to deterministic RRF on reranker failure; CIM evaluation fails closed.
+/// and render a unified, relevance-ordered hit list. Reranker failures return
+/// an explicit tool error and never substitute reciprocal-rank fusion.
 pub(crate) async fn rerank_semantic_search(
     llm: &Arc<dyn LlmBackend>,
     model: &str,
@@ -291,12 +292,12 @@ async fn rerank_one_semantic_search(
             signature_locator_count: 0,
             final_with_signature_count: 0,
             declaration_fallback_count: 0,
-            fallback_reason: None,
+            failure_reason: None,
             usage: TokenUsage::default(),
             utility: &utility,
         });
         return RerankOutcome::passthrough(
-            render_unified(query, &[], 0, notes(&raw), false),
+            render_unified(query, &[], 0, notes(&raw)),
             TokenUsage::default(),
         );
     }
@@ -346,238 +347,140 @@ async fn rerank_one_semantic_search(
         started,
         None,
     );
-    let response = stream_chat_no_visible_output_with_retry(
-        llm.as_ref(),
-        "semantic_search rerank",
-        cancel,
-        || StreamChatRequest {
-            model: utility.model.clone(),
-            messages: messages.clone(),
-            tools: None,
-            reasoning_effort: utility.reasoning_effort.clone(),
-            service_tier: None,
-            temperature: None,
-            structured_output: Some(structured.clone()),
-            on_token: Box::new(|_| {}),
-            on_thought: Box::new(|_| {}),
-            cancel: cancel.clone(),
-            idle_timeouts: idle_timeout,
-        },
-    )
-    .await;
+    let mut usage = TokenUsage::default();
+    let mut rejection = String::new();
+    let mut attempts_made = 0;
+    let mut last_selected_count = 0;
+    for attempt in 1..=MAX_UTILITY_OUTPUT_ATTEMPTS {
+        attempts_made = attempt;
+        let response = stream_chat_no_visible_output_with_retry(
+            llm.as_ref(),
+            "semantic_search rerank",
+            cancel,
+            || StreamChatRequest {
+                model: utility.model.clone(),
+                messages: messages.clone(),
+                tools: None,
+                reasoning_effort: utility.reasoning_effort.clone(),
+                service_tier: None,
+                temperature: None,
+                structured_output: Some(structured.clone()),
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: idle_timeout,
+            },
+        )
+        .await;
 
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            trace_phase(
-                "utility_request_error",
-                query,
-                query_index,
-                query_count,
-                &utility,
-                started,
-                Some(&format!("{err:#}")),
-            );
-            if crate::cim::enabled() {
-                return RerankOutcome::error(format!(
-                    "Error: semantic_search reranker failed in CIM mode: {err:#}"
-                ));
-            }
-            tracing::warn!(
-                error = format!("{err:#}"),
-                "semantic_search rerank turn failed; using reciprocal-rank fusion"
-            );
-            let ordered = rrf_fallback(&candidates, final_k);
-            trace_rerank(RerankTrace {
-                query,
-                query_index,
-                query_count,
-                raw: &raw,
-                final_k,
-                base_k,
-                deduplicated_count: candidates.len(),
-                context_bytes,
-                selected_count: 0,
-                final_count: ordered.len(),
-                signature_candidate_count: candidates
-                    .iter()
-                    .filter(|candidate| !candidate.declarations.is_empty())
-                    .count(),
-                signature_locator_count: candidates
-                    .iter()
-                    .map(|candidate| candidate.declarations.len())
-                    .sum(),
-                final_with_signature_count: ordered
-                    .iter()
-                    .filter(|selected| !selected.declarations.is_empty())
-                    .count(),
-                declaration_fallback_count: ordered
-                    .iter()
-                    .filter(|selected| selected.declaration_fallback)
-                    .count(),
-                fallback_reason: Some("provider_failure"),
-                usage: TokenUsage::default(),
-                utility: &utility,
-            });
-            return RerankOutcome::passthrough(
-                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
-                TokenUsage::default(),
-            );
-        }
-    };
-    trace_phase(
-        "utility_request_complete",
-        query,
-        query_index,
-        query_count,
-        &utility,
-        started,
-        None,
-    );
-    let usage = response.usage();
-    let text = match response {
-        LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
-    };
-
-    // 5. A well-formed empty selection is valid and final. Malformed JSON,
-    // unknown candidate ids, and invalid declaration choices invoke the
-    // ordinary fallback or fail closed in CIM mode.
-    let selected = match parse_selections(&text) {
-        Some(selected) => selected,
-        None => {
-            if crate::cim::enabled() {
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
                 trace_phase(
-                    "utility_output_error",
+                    "utility_request_error",
                     query,
                     query_index,
                     query_count,
                     &utility,
                     started,
-                    Some("malformed structured output"),
+                    Some(&format!("{err:#}")),
                 );
-                return RerankOutcome {
-                    output: "Error: semantic_search reranker returned malformed output in CIM mode"
-                        .to_string(),
-                    failed: true,
-                    usage,
-                    usage_model: Some(utility.model.clone()),
-                };
+                rejection = format!("provider request failed: {err:#}");
+                break;
             }
-            tracing::warn!(
-                "semantic_search rerank returned malformed output; using reciprocal-rank fusion"
-            );
-            let ordered = rrf_fallback(&candidates, final_k);
-            trace_rerank(RerankTrace {
-                query,
-                query_index,
-                query_count,
-                raw: &raw,
-                final_k,
-                base_k,
-                deduplicated_count: candidates.len(),
-                context_bytes,
-                selected_count: 0,
-                final_count: ordered.len(),
-                signature_candidate_count: candidates
-                    .iter()
-                    .filter(|candidate| !candidate.declarations.is_empty())
-                    .count(),
-                signature_locator_count: candidates
-                    .iter()
-                    .map(|candidate| candidate.declarations.len())
-                    .sum(),
-                final_with_signature_count: ordered
-                    .iter()
-                    .filter(|selected| !selected.declarations.is_empty())
-                    .count(),
-                declaration_fallback_count: ordered
-                    .iter()
-                    .filter(|selected| selected.declaration_fallback)
-                    .count(),
-                fallback_reason: Some("malformed_output"),
-                usage,
-                utility: &utility,
-            });
-            let mut outcome = RerankOutcome::passthrough(
-                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
-                usage,
-            );
-            outcome.usage_model = Some(utility.model.clone());
-            return outcome;
-        }
-    };
-    let ordered = match order_candidates(&candidates, &selected, final_k) {
-        Ok(ordered) => ordered,
-        Err(error) => {
-            if crate::cim::enabled() {
-                trace_phase(
-                    "utility_output_error",
+        };
+        trace_phase(
+            "utility_request_complete",
+            query,
+            query_index,
+            query_count,
+            &utility,
+            started,
+            None,
+        );
+        usage.add(response.usage());
+        let text = match response {
+            LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
+        };
+
+        let selected = parse_selections(&text);
+        let selected_count = selected.as_ref().map_or(0, Vec::len);
+        last_selected_count = selected_count;
+        let ordered = selected
+            .as_ref()
+            .ok_or_else(|| "malformed structured output".to_string())
+            .and_then(|selected| order_candidates(&candidates, selected, final_k));
+        match ordered {
+            Ok(ordered) => {
+                tracing::debug!(
+                    query = %query,
+                    candidates = candidates.len(),
+                    selected = ordered.len(),
+                    cached_read_tokens = usage.cached_read_tokens,
+                    input_tokens = usage.input_tokens,
+                    attempts = attempt,
+                    "semantic_search reranked"
+                );
+                trace_rerank(RerankTrace {
                     query,
                     query_index,
                     query_count,
-                    &utility,
-                    started,
-                    Some(&error),
-                );
-                return RerankOutcome {
-                    output: format!(
-                        "Error: semantic_search reranker returned invalid selections in CIM mode: {error}"
-                    ),
-                    failed: true,
+                    raw: &raw,
+                    final_k,
+                    base_k,
+                    deduplicated_count: candidates.len(),
+                    context_bytes,
+                    selected_count,
+                    final_count: ordered.len(),
+                    signature_candidate_count: candidates
+                        .iter()
+                        .filter(|candidate| !candidate.declarations.is_empty())
+                        .count(),
+                    signature_locator_count: candidates
+                        .iter()
+                        .map(|candidate| candidate.declarations.len())
+                        .sum(),
+                    final_with_signature_count: ordered
+                        .iter()
+                        .filter(|selected| !selected.declarations.is_empty())
+                        .count(),
+                    declaration_fallback_count: ordered
+                        .iter()
+                        .filter(|selected| selected.declaration_fallback)
+                        .count(),
+                    failure_reason: None,
                     usage,
-                    usage_model: Some(utility.model.clone()),
-                };
+                    utility: &utility,
+                });
+                let output = render_unified(query, &ordered, candidates.len(), notes(&raw));
+                let mut outcome = RerankOutcome::passthrough(output, usage);
+                outcome.usage_model = Some(utility.model.clone());
+                return outcome;
             }
-            tracing::warn!(%error, "semantic_search rerank returned invalid selections; using reciprocal-rank fusion");
-            let ordered = rrf_fallback(&candidates, final_k);
-            trace_rerank(RerankTrace {
-                query,
-                query_index,
-                query_count,
-                raw: &raw,
-                final_k,
-                base_k,
-                deduplicated_count: candidates.len(),
-                context_bytes,
-                selected_count: selected.len(),
-                final_count: ordered.len(),
-                signature_candidate_count: candidates
-                    .iter()
-                    .filter(|candidate| !candidate.declarations.is_empty())
-                    .count(),
-                signature_locator_count: candidates
-                    .iter()
-                    .map(|candidate| candidate.declarations.len())
-                    .sum(),
-                final_with_signature_count: ordered
-                    .iter()
-                    .filter(|selected| !selected.declarations.is_empty())
-                    .count(),
-                declaration_fallback_count: ordered
-                    .iter()
-                    .filter(|selected| selected.declaration_fallback)
-                    .count(),
-                fallback_reason: Some("invalid_selection"),
-                usage,
-                utility: &utility,
-            });
-            let mut outcome = RerankOutcome::passthrough(
-                render_unified(query, &ordered, candidates.len(), notes(&raw), true),
-                usage,
-            );
-            outcome.usage_model = Some(utility.model.clone());
-            return outcome;
+            Err(error) => rejection = error,
         }
-    };
 
-    tracing::debug!(
-            query = %query,
-        candidates = candidates.len(),
-        selected = ordered.len(),
-        cached_read_tokens = usage.cached_read_tokens,
-        input_tokens = usage.input_tokens,
-        "semantic_search reranked"
-    );
+        let will_retry = attempt < MAX_UTILITY_OUTPUT_ATTEMPTS;
+        append_trace_record(json!({
+            "type": "semantic_search_utility_output_rejected",
+            "query": query,
+            "query_index": query_index,
+            "query_count": query_count,
+            "attempt": attempt,
+            "will_retry": will_retry,
+            "reason": rejection,
+            "output": text,
+            "utility_model": utility.model,
+        }));
+        if will_retry {
+            messages.push(ChatMessage::assistant(text));
+            messages.push(ChatMessage::user(format!(
+                "That response was invalid because {rejection}. Return only an object matching \
+                 the requested JSON schema. Use exact candidate and declaration ids."
+            )));
+        }
+    }
+
     trace_rerank(RerankTrace {
         query,
         query_index,
@@ -587,8 +490,8 @@ async fn rerank_one_semantic_search(
         base_k,
         deduplicated_count: candidates.len(),
         context_bytes,
-        selected_count: selected.len(),
-        final_count: ordered.len(),
+        selected_count: last_selected_count,
+        final_count: 0,
         signature_candidate_count: candidates
             .iter()
             .filter(|candidate| !candidate.declarations.is_empty())
@@ -597,22 +500,20 @@ async fn rerank_one_semantic_search(
             .iter()
             .map(|candidate| candidate.declarations.len())
             .sum(),
-        final_with_signature_count: ordered
-            .iter()
-            .filter(|selected| !selected.declarations.is_empty())
-            .count(),
-        declaration_fallback_count: ordered
-            .iter()
-            .filter(|selected| selected.declaration_fallback)
-            .count(),
-        fallback_reason: None,
+        final_with_signature_count: 0,
+        declaration_fallback_count: 0,
+        failure_reason: Some(&rejection),
         usage,
         utility: &utility,
     });
-    let output = render_unified(query, &ordered, candidates.len(), notes(&raw), false);
-    let mut outcome = RerankOutcome::passthrough(output, usage);
-    outcome.usage_model = Some(utility.model.clone());
-    outcome
+    RerankOutcome {
+        output: format!(
+            "Error: semantic_search reranker failed after {attempts_made} attempt(s): {rejection}"
+        ),
+        failed: true,
+        usage,
+        usage_model: Some(utility.model.clone()),
+    }
 }
 
 fn parse_final_k(args: &Value) -> Result<usize, String> {
@@ -1223,22 +1124,6 @@ fn order_candidates<'a>(
     Ok(ordered)
 }
 
-fn rrf_fallback(candidates: &[Candidate], final_k: usize) -> Vec<RankedCandidate<'_>> {
-    candidates
-        .iter()
-        .take(final_k)
-        .map(|candidate| RankedCandidate {
-            candidate,
-            declarations: candidate
-                .declarations
-                .iter()
-                .take(MAX_SELECTED_DECLARATIONS)
-                .collect(),
-            declaration_fallback: !candidate.declarations.is_empty(),
-        })
-        .collect()
-}
-
 struct RerankTrace<'a> {
     query: &'a str,
     query_index: usize,
@@ -1254,7 +1139,7 @@ struct RerankTrace<'a> {
     signature_locator_count: usize,
     final_with_signature_count: usize,
     declaration_fallback_count: usize,
-    fallback_reason: Option<&'a str>,
+    failure_reason: Option<&'a str>,
     usage: TokenUsage,
     utility: &'a crate::utility_model::UtilityModelSelection,
 }
@@ -1316,8 +1201,12 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "structured_signature_locator_count": trace.signature_locator_count,
         "selected_with_signature_count": trace.final_with_signature_count,
         "declaration_selection_fallback_count": trace.declaration_fallback_count,
-        "fallback": trace.fallback_reason.is_some(),
-        "fallback_reason": trace.fallback_reason,
+        // Keep the old fields so trace readers can distinguish this behavior
+        // from old runs that silently used reciprocal-rank fusion.
+        "fallback": false,
+        "fallback_reason": null,
+        "failed": trace.failure_reason.is_some(),
+        "failure_reason": trace.failure_reason,
         "utility_model": trace.utility.model,
         "utility_reasoning_effort": trace.utility.reasoning_effort,
         "utility_model_source": trace.utility.source,
@@ -1342,7 +1231,6 @@ fn render_unified(
     ordered: &[RankedCandidate<'_>],
     candidate_count: usize,
     notes: Option<String>,
-    fallback: bool,
 ) -> String {
     let mut out = format!(
         "Reranked {} relevant result(s) (from {} candidates) for query: \"{}\"\n",
@@ -1353,11 +1241,6 @@ fn render_unified(
     if let Some(notes) = notes {
         out.push_str(&notes);
         out.push('\n');
-    }
-    if fallback {
-        out.push_str(
-            "Reranker fallback: results use reciprocal-rank fusion and Bifrost-order signatures.\n",
-        );
     }
     out.push('\n');
     for (rank, selected) in ordered.iter().enumerate() {
@@ -1694,33 +1577,6 @@ mod tests {
     }
 
     #[test]
-    fn reciprocal_rank_fallback_is_deterministic_and_bounded() {
-        let candidates = parse_candidates(&json!({
-            "vector_ranked": [
-                { "fqfn": "vector_only" },
-                { "fqfn": "both" }
-            ],
-            "bm25_ranked": [
-                { "fqfn": "bm25_only" },
-                { "fqfn": "both" }
-            ],
-            "coedit_ranked": [
-                { "path": "src/file.rs" }
-            ]
-        }));
-        let first: Vec<&str> = rrf_fallback(&candidates, 2)
-            .iter()
-            .map(|candidate| candidate.candidate.name.as_str())
-            .collect();
-        let second: Vec<&str> = rrf_fallback(&candidates, 2)
-            .iter()
-            .map(|candidate| candidate.candidate.name.as_str())
-            .collect();
-        assert_eq!(first, vec!["both", "vector_only"]);
-        assert_eq!(second, first);
-    }
-
-    #[test]
     fn context_budget_is_utf8_safe_and_preserves_all_identities() {
         let context = "α".repeat(5_000);
         let mut candidates: Vec<Candidate> = (0..20)
@@ -1801,7 +1657,7 @@ mod tests {
             declarations: vec!["f1d2".to_string()],
         }];
         let ordered = order_candidates(&candidates, &selected, 20).unwrap();
-        let rendered = render_unified("configuration persistence", &ordered, 1, None, false);
+        let rendered = render_unified("configuration persistence", &ordered, 1, None);
 
         assert!(rendered.contains("fn save(config: &Config)"));
         assert!(!rendered.contains("fn load(path: &Path)"));
