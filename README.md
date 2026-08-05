@@ -43,8 +43,26 @@ custom TUI  --------------------------------------->  tools + sessions
 
 ## Install and Evaluate
 
-Install with Homebrew on macOS (Apple Silicon and Intel) or Linux (x86-64 and
-ARM64 glibc):
+Install the released native binary through [uv](https://docs.astral.sh/uv/),
+with no Rust toolchain required:
+
+```bash
+uv tool install brokk-anvil
+anvil --version
+
+# later
+uv tool upgrade brokk-anvil
+uv tool uninstall brokk-anvil
+```
+
+The Python package version pins the matching GitHub release. On first run it
+downloads the native archive for macOS, Linux glibc, Windows, or
+Android/Termux, verifies the published SHA-256 sidecar, and caches the binary.
+See the [installation guide](https://anvil.brokk.ai/install/#uv) for exact
+version pins, cache paths, and unsupported-platform behavior.
+
+Or install with Homebrew on macOS (Apple Silicon and Intel) or Linux (x86-64
+and ARM64 glibc):
 
 ```bash
 brew install brokkai/tap/anvil

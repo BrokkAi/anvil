@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brokk-anvil"
+dynamic = ["version"]
+description = "Checksum-verified launcher for the native Anvil ACP server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+    { name = "foundev", email = "86598053+foundev@users.noreply.github.com" },
+]
+maintainers = [
+    { name = "foundev", email = "86598053+foundev@users.noreply.github.com" },
+]
+keywords = ["acp", "agent-client-protocol", "anvil", "brokk", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: Android",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://anvil.brokk.ai/"
+Documentation = "https://anvil.brokk.ai/install/"
+Repository = "https://github.com/BrokkAi/anvil"
+Issues = "https://github.com/BrokkAi/anvil/issues"
+
+[project.scripts]
+anvil = "brokk_anvil.launcher:main"
+
+[tool.hatch.version]
+path = "brokk_anvil/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["brokk_anvil"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/brokk_anvil",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
