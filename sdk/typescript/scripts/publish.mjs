@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { versionExists, waitUntilVisible } from '../../../npm/lib/registry.mjs';
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(await readFile(path.join(packageDir, 'package.json'), 'utf8'));
@@ -23,13 +24,6 @@ function npm(command, options = {}) {
   return result;
 }
 
-function versionExists() {
-  const result = npm(['view', `${packageJson.name}@${packageJson.version}`, 'version', '--json']);
-  if (result.status === 0) return JSON.parse(result.stdout.trim()) === packageJson.version;
-  if (/E404/.test(result.stderr)) return false;
-  throw new Error(`npm view failed:\n${result.stderr}`);
-}
-
 function verifyTarballMetadata() {
   const result = npm(['publish', tarball, '--dry-run', '--json', '--ignore-scripts']);
   if (result.status !== 0) throw new Error(`npm publish dry run failed:\n${result.stderr}`);
@@ -42,29 +36,25 @@ function verifyTarballMetadata() {
   }
 }
 
-async function waitUntilVisible() {
-  for (let attempt = 1; attempt <= 20; attempt += 1) {
-    if (versionExists()) return;
-    process.stdout.write(`  waiting for registry visibility (${attempt}/20)\n`);
-    await new Promise((resolve) => setTimeout(resolve, 15_000));
-  }
-  throw new Error(`${packageJson.name}@${packageJson.version} did not become visible`);
+// The existence check comes first: `npm publish --dry-run` also talks to the
+// registry and fails outright with "cannot publish over the previously
+// published versions", so re-running after a successful publication has to
+// take the skip path before the tarball is offered to the registry at all.
+if (versionExists(packageJson.name, packageJson.version)) {
+  process.stdout.write(`${packageJson.name}@${packageJson.version} already published; skipping\n`);
+  process.exit(0);
 }
 
 verifyTarballMetadata();
 
-if (versionExists()) {
-  process.stdout.write(`${packageJson.name}@${packageJson.version} already published; skipping\n`);
-  process.exit(0);
-}
 if (!publish) {
   process.stdout.write(`would publish ${packageJson.name}@${packageJson.version} from ${tarball}\n`);
   process.exit(0);
 }
 
-const published = npm(['publish', tarball, '--access', 'public', '--provenance'], { stdio: 'inherit' });
-if (published.status !== 0) throw new Error('npm publish failed');
-await waitUntilVisible();
+const result = npm(['publish', tarball, '--access', 'public', '--provenance'], { stdio: 'inherit' });
+if (result.status !== 0) throw new Error('npm publish failed');
+await waitUntilVisible(packageJson.name, packageJson.version);
 
 const temporaryDir = mkdtempSync(path.join(os.tmpdir(), 'anvil-sdk-npm-'));
 try {
