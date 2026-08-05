@@ -484,6 +484,7 @@ mod tests {
         crate::session::SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: model.into(),
             history: vec![],

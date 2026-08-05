@@ -760,6 +760,7 @@ fn mcp_tool_input_schema(name: &str, original: serde_json::Value) -> serde_json:
 pub struct ToolRegistry {
     cwd: PathBuf,
     additional_roots: Vec<PathBuf>,
+    analysis_workspaces: Option<Vec<crate::session::AnalysisWorkspace>>,
     mcp_clients: Vec<Arc<McpClient>>,
     mcp_tool_servers: HashMap<String, Arc<McpClient>>,
     advertised_builtin_tools: RwLock<HashSet<String>>,
@@ -797,6 +798,10 @@ impl ToolRegistry {
 
     pub(crate) fn additional_roots(&self) -> &[PathBuf] {
         &self.additional_roots
+    }
+
+    pub(crate) fn analysis_workspaces(&self) -> Option<&[crate::session::AnalysisWorkspace]> {
+        self.analysis_workspaces.as_deref()
     }
 
     /// Replace the cached SkillRegistry. Called by `update_cwd` so the
@@ -852,6 +857,7 @@ impl ToolRegistry {
     pub async fn new(
         cwd: PathBuf,
         additional_roots: Vec<PathBuf>,
+        analysis_workspaces: Option<Vec<crate::session::AnalysisWorkspace>>,
         mcp_servers: Vec<McpServerConfig>,
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
@@ -865,7 +871,9 @@ impl ToolRegistry {
         let mut mcp_clients = Vec::new();
         let mut mcp_tool_servers = HashMap::new();
         for config in mcp_servers.iter().filter(|server| server.enabled) {
-            match McpClient::spawn(config, &cwd).await {
+            match McpClient::spawn_with_workspaces(config, &cwd, analysis_workspaces.as_deref())
+                .await
+            {
                 Ok(client) => {
                     let client = Arc::new(client);
                     for tool in client.tools() {
@@ -912,6 +920,7 @@ impl ToolRegistry {
         Self {
             cwd,
             additional_roots,
+            analysis_workspaces,
             mcp_clients,
             mcp_tool_servers,
             advertised_builtin_tools: RwLock::new(
@@ -2096,6 +2105,7 @@ mod tests {
         ToolRegistry {
             cwd,
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -2119,6 +2129,7 @@ mod tests {
         ToolRegistry {
             cwd,
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -2362,6 +2373,7 @@ mod tests {
         let registry = ToolRegistry {
             cwd: std::env::temp_dir(),
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(

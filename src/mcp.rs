@@ -211,6 +211,7 @@ fn default_enabled() -> bool {
 }
 
 const DEFAULT_BIFROST_TOOLSET: &str = "core";
+const BIFROST_WORKSPACE_ARGS_PLACEHOLDER: &str = "{bifrost_workspace_args}";
 
 fn bifrost_args(flag: &str, toolset: &str) -> Vec<String> {
     vec![
@@ -223,7 +224,61 @@ fn bifrost_args(flag: &str, toolset: &str) -> Vec<String> {
 }
 
 fn default_bifrost_args() -> Vec<String> {
-    bifrost_args("--mcp", DEFAULT_BIFROST_TOOLSET)
+    vec![
+        BIFROST_WORKSPACE_ARGS_PLACEHOLDER.to_string(),
+        "--mcp".to_string(),
+        DEFAULT_BIFROST_TOOLSET.to_string(),
+        "--no-line-numbers".to_string(),
+    ]
+}
+
+pub fn effective_analysis_workspaces(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    explicit: Option<&[crate::session::AnalysisWorkspace]>,
+) -> Option<Vec<crate::session::AnalysisWorkspace>> {
+    if let Some(explicit) = explicit {
+        return Some(explicit.to_vec());
+    }
+    if additional_roots.is_empty() {
+        return None;
+    }
+
+    let mut used = std::collections::HashMap::<String, usize>::new();
+    let mut workspaces = Vec::with_capacity(additional_roots.len() + 1);
+    for path in std::iter::once(cwd).chain(additional_roots.iter().map(PathBuf::as_path)) {
+        let base = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(workspace_slug)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "workspace".to_string());
+        let count = used.entry(base.clone()).or_default();
+        *count += 1;
+        let name = if *count == 1 {
+            base
+        } else {
+            format!("{base}-{count}")
+        };
+        workspaces.push(crate::session::AnalysisWorkspace {
+            name,
+            path: path.to_path_buf(),
+        });
+    }
+    Some(workspaces)
+}
+
+fn workspace_slug(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+        .to_string()
 }
 
 fn managed_bifrost_cache_dir() -> anyhow::Result<PathBuf> {
@@ -559,17 +614,40 @@ impl McpServerConfig {
             url: None,
             headers: Vec::new(),
             args: default_bifrost_args(),
-            env: Vec::new(),
+            env: vec![McpEnvVar {
+                name: "BIFROST_MCP_RMCP".to_string(),
+                value: "on".to_string(),
+            }],
             framing: McpFraming::Line,
             enabled: true,
         }
     }
 
-    pub fn rendered_args(&self, cwd: &Path) -> Vec<String> {
+    pub fn rendered_args(
+        &self,
+        cwd: &Path,
+        analysis_workspaces: Option<&[crate::session::AnalysisWorkspace]>,
+    ) -> Vec<String> {
         let cwd = cwd.display().to_string();
         self.args
             .iter()
-            .map(|arg| arg.replace("{cwd}", &cwd))
+            .flat_map(|arg| {
+                if arg != BIFROST_WORKSPACE_ARGS_PLACEHOLDER {
+                    return vec![arg.replace("{cwd}", &cwd)];
+                }
+                match analysis_workspaces {
+                    Some(workspaces) => workspaces
+                        .iter()
+                        .flat_map(|workspace| {
+                            [
+                                "--workspace".to_string(),
+                                format!("{}={}", workspace.name, workspace.path.display()),
+                            ]
+                        })
+                        .collect(),
+                    None => vec!["--root".to_string(), cwd.clone()],
+                }
+            })
             .collect()
     }
 }
@@ -603,6 +681,7 @@ pub struct McpClient {
     name: String,
     config: McpServerConfig,
     cwd: PathBuf,
+    analysis_workspaces: Option<Vec<crate::session::AnalysisWorkspace>>,
     state: Mutex<McpClientState>,
     next_id: AtomicI64,
     tools: Vec<McpToolDef>,
@@ -637,14 +716,25 @@ struct McpIo {
 }
 
 impl McpClient {
+    #[cfg(test)]
     pub async fn spawn(config: &McpServerConfig, cwd: &Path) -> Result<Self, McpError> {
+        Self::spawn_with_workspaces(config, cwd, None).await
+    }
+
+    pub async fn spawn_with_workspaces(
+        config: &McpServerConfig,
+        cwd: &Path,
+        analysis_workspaces: Option<&[crate::session::AnalysisWorkspace]>,
+    ) -> Result<Self, McpError> {
         let next_id = AtomicI64::new(1);
-        let (state, tools, instructions) = Self::spawn_connected(config, cwd, &next_id).await?;
+        let (state, tools, instructions) =
+            Self::spawn_connected(config, cwd, analysis_workspaces, &next_id).await?;
 
         Ok(Self {
             name: config.name.clone(),
             config: config.clone(),
             cwd: cwd.to_path_buf(),
+            analysis_workspaces: analysis_workspaces.map(<[_]>::to_vec),
             state: Mutex::new(state),
             next_id,
             tools,
@@ -655,6 +745,7 @@ impl McpClient {
     async fn spawn_connected(
         config: &McpServerConfig,
         cwd: &Path,
+        analysis_workspaces: Option<&[crate::session::AnalysisWorkspace]>,
         next_id: &AtomicI64,
     ) -> Result<(McpClientState, Vec<McpToolDef>, Option<String>), McpError> {
         match config.transport {
@@ -663,7 +754,7 @@ impl McpClient {
             McpTransport::Stdio => {}
         }
 
-        let rendered_args = config.rendered_args(cwd);
+        let rendered_args = config.rendered_args(cwd, analysis_workspaces);
         let mut child = Command::new(&config.command)
             .args(&rendered_args)
             .envs(config.env.iter().map(|var| (&var.name, &var.value)))
@@ -936,8 +1027,13 @@ impl McpClient {
         };
 
         if matches!(&*state, McpClientState::Stdio { healthy: false, .. }) {
-            let (new_state, _, new_instructions) =
-                Self::spawn_connected(&self.config, &self.cwd, &self.next_id).await?;
+            let (new_state, _, new_instructions) = Self::spawn_connected(
+                &self.config,
+                &self.cwd,
+                self.analysis_workspaces.as_deref(),
+                &self.next_id,
+            )
+            .await?;
             *state = new_state;
             *self.instructions.write().await = new_instructions;
         }
@@ -2243,6 +2339,60 @@ fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn managed_bifrost_uses_named_workspace_arguments_when_available() {
+        let config = McpServerConfig::bifrost();
+        let workspaces = vec![
+            crate::session::AnalysisWorkspace {
+                name: "api".into(),
+                path: PathBuf::from("/work/api"),
+            },
+            crate::session::AnalysisWorkspace {
+                name: "ui".into(),
+                path: PathBuf::from("/work/ui"),
+            },
+        ];
+
+        assert_eq!(
+            config.rendered_args(Path::new("/work"), Some(&workspaces)),
+            vec![
+                "--workspace",
+                "api=/work/api",
+                "--workspace",
+                "ui=/work/ui",
+                "--mcp",
+                "core",
+                "--no-line-numbers",
+            ]
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|variable| { variable.name == "BIFROST_MCP_RMCP" && variable.value == "on" })
+        );
+    }
+
+    #[test]
+    fn managed_bifrost_keeps_legacy_root_for_one_workspace() {
+        assert_eq!(
+            McpServerConfig::bifrost().rendered_args(Path::new("/work/api"), None),
+            vec!["--root", "/work/api", "--mcp", "core", "--no-line-numbers",]
+        );
+    }
+
+    #[test]
+    fn fallback_workspace_names_are_stable_and_unique() {
+        let workspaces = effective_analysis_workspaces(
+            Path::new("/work/service api"),
+            &[PathBuf::from("/other/service api")],
+            None,
+        )
+        .expect("multiple roots need named workspaces");
+        assert_eq!(workspaces[0].name, "service-api");
+        assert_eq!(workspaces[1].name, "service-api-2");
+    }
 
     /// Pins the interim-fix timeout budgets: `tools/call` gets a generous
     /// 300s (long-running server-side tools like Mjolnir's `code_agent` can

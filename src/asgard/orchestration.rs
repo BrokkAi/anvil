@@ -6454,6 +6454,7 @@ mod tests {
             crate::tools::ToolRegistry::new(
                 cwd.path().to_path_buf(),
                 Vec::new(),
+                None,
                 Vec::new(),
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),
@@ -6564,6 +6565,7 @@ mod tests {
             crate::tools::ToolRegistry::new(
                 cwd.path().to_path_buf(),
                 Vec::new(),
+                None,
                 Vec::new(),
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),
@@ -6690,6 +6692,7 @@ mod tests {
             crate::tools::ToolRegistry::new(
                 cwd.path().to_path_buf(),
                 Vec::new(),
+                None,
                 Vec::new(),
                 Arc::new(crate::skills::SkillRegistry::default()),
                 Arc::new(crate::agents::AgentRegistry::default()),

@@ -153,6 +153,7 @@ pub(crate) async fn rerank_semantic_search(
         Ok(queries) => queries,
         Err(message) => return RerankOutcome::error(message),
     };
+    let workspace = args.get("workspace").and_then(Value::as_str);
     append_trace_record(json!({
         "type": "semantic_search_batch",
         "phase": "start",
@@ -170,6 +171,7 @@ pub(crate) async fn rerank_semantic_search(
             query_index,
             query_count,
             final_k,
+            workspace,
             idle_timeout,
             cancel,
         )
@@ -227,12 +229,13 @@ async fn rerank_one_semantic_search(
     query_index: usize,
     query_count: usize,
     final_k: usize,
+    workspace: Option<&str>,
     idle_timeout: IdleTimeouts,
     cancel: &CancellationToken,
 ) -> RerankOutcome {
     let utility = crate::utility_model::select(model);
     let started = Instant::now();
-    let (bifrost_args, base_k) = prepare_bifrost_args(query, final_k);
+    let (bifrost_args, base_k) = prepare_bifrost_args(query, final_k, workspace);
 
     // 1. Underlying search. A hard failure here is the model's to see.
     trace_phase(
@@ -312,7 +315,7 @@ async fn rerank_one_semantic_search(
         started,
         None,
     );
-    fetch_context(registry, &mut candidates).await;
+    fetch_context(registry, &mut candidates, workspace).await;
     trace_phase(
         "context_fetch_complete",
         query,
@@ -580,9 +583,21 @@ fn parse_queries(args: &Value) -> Result<Vec<String>, String> {
     Ok(queries)
 }
 
-fn prepare_bifrost_args(query: &str, final_k: usize) -> (Value, usize) {
+fn prepare_bifrost_args(query: &str, final_k: usize, workspace: Option<&str>) -> (Value, usize) {
     let base_k = final_k * OVERFETCH_MULTIPLIER;
-    (json!({ "query": query, "k": base_k }), base_k)
+    (
+        bifrost_args_with_workspace(json!({ "query": query, "k": base_k }), workspace),
+        base_k,
+    )
+}
+
+fn bifrost_args_with_workspace(mut args: Value, workspace: Option<&str>) -> Value {
+    if let Some(workspace) = workspace {
+        args.as_object_mut()
+            .expect("Bifrost arguments must be an object")
+            .insert("workspace".to_string(), json!(workspace));
+    }
+    args
 }
 
 /// Parse every realized item from `semantic_search`'s three legs into one
@@ -682,7 +697,11 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
 /// (`get_summaries`) for the candidates and attach truncated context. Partial
 /// or total failure is non-fatal: a candidate without context still appears by
 /// name in the rerank prompt.
-async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
+async fn fetch_context(
+    registry: &ToolRegistry,
+    candidates: &mut [Candidate],
+    workspace: Option<&str>,
+) {
     for start in (0..candidates.len()).step_by(CONTEXT_FETCH_BATCH) {
         let end = (start + CONTEXT_FETCH_BATCH).min(candidates.len());
         let symbols: Vec<String> = candidates[start..end]
@@ -698,9 +717,9 @@ async fn fetch_context(registry: &ToolRegistry, candidates: &mut [Candidate]) {
         let summary_targets: Vec<String> = symbols.iter().chain(&files).cloned().collect();
 
         if available_private_context_bytes(candidates) < MAX_TOTAL_CONTEXT_BYTES {
-            fetch_symbol_context(registry, candidates, &symbols).await;
+            fetch_symbol_context(registry, candidates, &symbols, workspace).await;
         }
-        fetch_summary_context(registry, candidates, &summary_targets).await;
+        fetch_summary_context(registry, candidates, &summary_targets, workspace).await;
     }
 }
 
@@ -708,19 +727,26 @@ async fn fetch_symbol_context(
     registry: &ToolRegistry,
     candidates: &mut [Candidate],
     symbols: &[String],
+    workspace: Option<&str>,
 ) {
     if symbols.is_empty() {
         return;
     }
     match registry
-        .call_bifrost_tool_raw("get_symbol_sources", json!({ "symbols": symbols }))
+        .call_bifrost_tool_raw(
+            "get_symbol_sources",
+            bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
+        )
         .await
     {
         Ok(value) => attach_symbol_sources(candidates, &value),
         Err(_) if symbols.len() > 1 => {
             for symbol in symbols {
                 if let Ok(value) = registry
-                    .call_bifrost_tool_raw("get_symbol_sources", json!({ "symbols": [symbol] }))
+                    .call_bifrost_tool_raw(
+                        "get_symbol_sources",
+                        bifrost_args_with_workspace(json!({ "symbols": [symbol] }), workspace),
+                    )
                     .await
                 {
                     attach_symbol_sources(candidates, &value);
@@ -735,6 +761,7 @@ async fn fetch_summary_context(
     registry: &ToolRegistry,
     candidates: &mut [Candidate],
     targets: &[String],
+    workspace: Option<&str>,
 ) {
     if targets.is_empty() {
         return;
@@ -745,7 +772,10 @@ async fn fetch_summary_context(
     // Keep every request intrinsically small while retaining parallelism within
     // the already bounded candidate batch.
     let summaries = join_all(targets.iter().map(|target| {
-        registry.call_bifrost_tool_raw("get_summaries", json!({ "targets": [target] }))
+        registry.call_bifrost_tool_raw(
+            "get_summaries",
+            bifrost_args_with_workspace(json!({ "targets": [target] }), workspace),
+        )
     }))
     .await;
     for value in summaries.into_iter().flatten() {
@@ -1480,12 +1510,18 @@ mod tests {
     #[test]
     fn bifrost_receives_twice_the_final_k() {
         for final_k in [1, 7, 20] {
-            let (forwarded, base_k) = prepare_bifrost_args("needle", final_k);
+            let (forwarded, base_k) = prepare_bifrost_args("needle", final_k, None);
             assert_eq!(base_k, 2 * final_k);
             assert_eq!(forwarded["k"], 2 * final_k);
             assert_eq!(forwarded["query"], "needle");
             assert!(forwarded.get("queries").is_none());
         }
+    }
+
+    #[test]
+    fn bifrost_receives_the_selected_workspace() {
+        let (forwarded, _) = prepare_bifrost_args("needle", 10, Some("backend"));
+        assert_eq!(forwarded["workspace"], "backend");
     }
 
     #[test]
