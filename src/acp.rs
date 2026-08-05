@@ -1275,20 +1275,33 @@ fn spawn_delayed_session_usage_update(
 /// store's cached model catalog. Background callers queue on the shared
 /// refresh lock instead of skipping work when another refresh is in
 /// flight. Shared by `session/new` and provider login/logout flows.
-/// Process-wide switch for the courtesy chatter session lifecycle handlers
-/// stream into new sessions (the delayed setup notice and model-catalog
-/// refresh progress). The headless `--print` client flips this on before
-/// building the agent: its stdout contract is "the final assistant message",
-/// and interactive guidance would corrupt the pipeable output.
-static SUPPRESS_SESSION_NOTICES: std::sync::atomic::AtomicBool =
+/// Process-wide switch for the interactive chatter the agent streams into
+/// sessions as regular message chunks: the delayed setup notice,
+/// model-catalog refresh progress, and end-of-turn recaps. The headless
+/// `--print` client flips this on before building the agent: its stdout
+/// contract is "the final assistant message", and any of that guidance
+/// would corrupt the pipeable output (and, for recaps, add an extra LLM
+/// summarizer round-trip before exit).
+static SUPPRESS_SESSION_CHATTER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn suppress_session_notices() {
-    SUPPRESS_SESSION_NOTICES.store(true, std::sync::atomic::Ordering::Relaxed);
+pub fn suppress_session_chatter() {
+    SUPPRESS_SESSION_CHATTER.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn session_notices_suppressed() -> bool {
-    SUPPRESS_SESSION_NOTICES.load(std::sync::atomic::Ordering::Relaxed)
+fn session_chatter_suppressed() -> bool {
+    SUPPRESS_SESSION_CHATTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The per-session turn-recap preference, forced off when session chatter is
+/// suppressed (headless `--print`): recaps stream through the same text sink
+/// as the assistant's answer and would be indistinguishable from it.
+async fn effective_turn_recap_enabled(sessions: &SessionStore, session_id: &str) -> bool {
+    !session_chatter_suppressed()
+        && sessions
+            .turn_recap_enabled(session_id)
+            .await
+            .unwrap_or(true)
 }
 
 fn spawn_background_refresh(
@@ -1298,7 +1311,7 @@ fn spawn_background_refresh(
     transcript: Option<(ConnectionTo<Client>, String, &'static str)>,
     initial_delay: Option<Duration>,
 ) {
-    let transcript = if session_notices_suppressed() {
+    let transcript = if session_chatter_suppressed() {
         None
     } else {
         transcript
@@ -1347,7 +1360,7 @@ fn spawn_delayed_setup_notice(
     catalog: Vec<ModelMetadata>,
     sessions: SessionStore,
 ) {
-    if session_notices_suppressed() {
+    if session_chatter_suppressed() {
         return;
     }
     tokio::spawn(async move {
@@ -3056,10 +3069,8 @@ pub fn agent_component(
                     default_idle_timeout_secs,
                     default_stall_timeout_secs,
                 );
-                let turn_recap_enabled_for_loop = sessions_prompt
-                    .turn_recap_enabled(&session_id)
-                    .await
-                    .unwrap_or(true);
+                let turn_recap_enabled_for_loop =
+                    effective_turn_recap_enabled(&sessions_prompt, &session_id).await;
                 // `cancel` is moved into the tool loop below, so keep a clone to
                 // detect after the turn whether the prompt was cancelled.
                 let cancel_status = cancel.clone();
@@ -3916,10 +3927,7 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
-    let turn_recap_enabled = sessions
-        .turn_recap_enabled(session_id)
-        .await
-        .unwrap_or(true);
+    let turn_recap_enabled = effective_turn_recap_enabled(sessions, session_id).await;
     let turn = run_prepared_model_turn(
         cx,
         sessions,
@@ -4201,10 +4209,7 @@ async fn run_goal_loop(
     // exact turn's persisted response makes the recap durable on reload
     // like the per-turn recap.
     if let Some(anchor_fragment_id) = recap_anchor
-        && sessions
-            .turn_recap_enabled(session_id)
-            .await
-            .unwrap_or(true)
+        && effective_turn_recap_enabled(sessions, session_id).await
     {
         let notice = crate::host_notice::render_goal_recap(
             &exit_text.recap_stop_line,

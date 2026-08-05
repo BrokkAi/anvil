@@ -24,12 +24,17 @@ fn start_provider(response_bodies: Vec<String>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind smoke provider");
     let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
     std::thread::spawn(move || {
+        // Keep the listener (and therefore the port) alive for the whole test
+        // process: dropping it after the last body would let the OS hand the
+        // port to a parallel test's provider, and a late retry from this test
+        // could then consume that provider's canned bodies. Connections past
+        // the scripted set are dropped without a response.
         for (idx, stream) in listener.incoming().enumerate() {
             let Ok(mut stream) = stream else {
                 break;
             };
             let Some(response_body) = response_bodies.get(idx) else {
-                break;
+                continue;
             };
             read_provider_request(&mut stream);
             let response = format!(
@@ -41,9 +46,6 @@ fn start_provider(response_bodies: Vec<String>) -> String {
                 .write_all(response.as_bytes())
                 .expect("write provider response");
             stream.flush().expect("flush provider response");
-            if idx + 1 == response_bodies.len() {
-                break;
-            }
         }
     });
     base_url
@@ -270,12 +272,17 @@ fn run_print(
         .env("CODEX_HOME", env.home.join(".codex"))
         .env("BROKK_CONFIG_HOME", &env.config_home)
         .env("ANVIL_TEST_OLLAMA_BASE_URL", provider_url)
-        .env("ANVIL_TEST_DISABLE_TURN_RECAP", "1")
+        // Deliberately NOT setting ANVIL_TEST_DISABLE_TURN_RECAP: headless
+        // mode itself must suppress turn recaps. If that regresses, the
+        // yolo test's file-changing turn emits a recap that both consumes an
+        // extra canned LLM body and pollutes the result text.
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("BEDROCK_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")
         .env_remove("KIMI_API_KEY")
+        .env_remove("ANVIL_TRACE_JSONL")
+        .env_remove("BROKK_SESSION_STORAGE_ROOT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -290,8 +297,8 @@ fn run_print(
     }
 
     let deadline = Instant::now() + Duration::from_secs(120);
-    let stdout = capture_pipe(child.stdout.take().expect("stdout"));
-    let stderr = capture_pipe(child.stderr.take().expect("stderr"));
+    let (stdout, stdout_reader) = capture_pipe(child.stdout.take().expect("stdout"));
+    let (stderr, stderr_reader) = capture_pipe(child.stderr.take().expect("stderr"));
     let status = loop {
         match child.try_wait().expect("wait on anvil") {
             Some(status) => break status,
@@ -307,6 +314,10 @@ fn run_print(
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     };
+    // Join the reader threads before snapshotting: bytes the child wrote just
+    // before exiting can still be in the pipe when try_wait reports exit.
+    stdout_reader.join().expect("join stdout reader");
+    stderr_reader.join().expect("join stderr reader");
     Output {
         status,
         stdout: pipe_text(&stdout).into_bytes(),
@@ -314,10 +325,12 @@ fn run_print(
     }
 }
 
-fn capture_pipe<R: Read + Send + 'static>(mut pipe: R) -> Arc<Mutex<Vec<u8>>> {
+fn capture_pipe<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer = buffer.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut chunk = [0_u8; 4096];
         while let Ok(read) = pipe.read(&mut chunk) {
             if read == 0 {
@@ -326,7 +339,7 @@ fn capture_pipe<R: Read + Send + 'static>(mut pipe: R) -> Arc<Mutex<Vec<u8>>> {
             writer.lock().unwrap().extend_from_slice(&chunk[..read]);
         }
     });
-    buffer
+    (buffer, reader)
 }
 
 fn pipe_text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {

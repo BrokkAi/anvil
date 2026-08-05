@@ -593,9 +593,11 @@ async fn drive(
     Ok(())
 }
 
-/// Run one headless prompt against an in-process Anvil agent. Always emits
-/// the promised output payload (even on failure) before returning; a
-/// non-`Ok` return carries the failure for the exit code and stderr.
+/// Run one headless prompt against an in-process Anvil agent. Once the run
+/// starts, the promised output payload is emitted even on agent/transport
+/// failure; only pre-run validation (empty prompt, unreadable stdin, bad
+/// `--cwd`) exits with just a stderr message. A non-`Ok` return carries the
+/// failure for the exit code and stderr.
 pub async fn run(
     config: RunConfig,
     llm: Arc<MultiBackend>,
@@ -614,9 +616,9 @@ pub async fn run(
     let permission_config = mode.agent_config_value();
 
     // Headless stdout carries the answer (or JSON records); the interactive
-    // setup notices and refresh chatter the agent streams into new sessions
-    // would corrupt it.
-    crate::acp::suppress_session_notices();
+    // chatter the agent streams into sessions (setup notices, catalog-refresh
+    // progress, end-of-turn recaps) would corrupt it.
+    crate::acp::suppress_session_chatter();
 
     let agent = crate::acp::agent_component(
         llm,
@@ -636,6 +638,19 @@ pub async fn run(
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                // Only the one session this client created (or resumed) feeds
+                // the output; anything else would silently mix into the
+                // final text if the agent ever notified across sessions.
+                {
+                    let state = notification_state
+                        .lock()
+                        .expect("headless state lock poisoned");
+                    if let Some(session_id) = state.session_id.as_deref()
+                        && session_id != notification.session_id.to_string()
+                    {
+                        return Ok(());
+                    }
+                }
                 handle_session_update(notification.update, &notification_state, format);
                 Ok(())
             },
@@ -676,6 +691,14 @@ pub async fn run(
         }
         _ = tokio::signal::ctrl_c() => {
             interrupted = true;
+            // Polling ctrl_c() replaced SIGINT's default terminate
+            // disposition for the process lifetime, so restore an escape
+            // hatch: a second Ctrl-C hard-exits even if payload emission or
+            // teardown wedges (e.g. a blocked stdout pipe).
+            tokio::spawn(async {
+                let _ = tokio::signal::ctrl_c().await;
+                std::process::exit(130);
+            });
         }
     }
 
