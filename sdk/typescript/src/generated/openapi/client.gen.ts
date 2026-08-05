@@ -1,4 +1,4 @@
-// Generated from openapi/anvil.v1.yaml (Anvil Agent API contract 1.0.0).
+// Generated from openapi/anvil.v1.yaml and openapi/anvil.v1.events.schema.json.
 // Generator: @hey-api/openapi-ts 0.99.0. Do not edit by hand.
 
 import { type Client, type ClientOptions, type Config, createClient, createConfig } from './client/index.js';

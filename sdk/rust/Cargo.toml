@@ -1,0 +1,24 @@
+[package]
+name = "brokk-anvil-sdk"
+version = "0.24.5"
+authors = ["OpenAPI Generator team and contributors"]
+description = "Versioned REST surface of the Anvil agent runtime (`anvil serve`). This document, together with the companion SSE event schema (`anvil.v1.events.schema.json`), is the authoritative wire contract: official SDK wire layers are generated from these artifacts, and the black-box conformance suite (`tests/http_conformance.rs`) validates a running daemon against them. See COMPATIBILITY.md for the evolution rules that govern what may change within `/v1`. "
+license = "LGPL-3.0-only"
+edition = "2021"
+repository = "https://github.com/BrokkAi/anvil"
+documentation = "https://docs.rs/brokk-anvil-sdk"
+homepage = "https://github.com/BrokkAi/anvil"
+
+[dependencies]
+serde = { version = "^1.0", features = ["derive"] }
+serde_with = { version = "^3.8", default-features = false, features = ["base64", "std", "macros"] }
+serde_json = "^1.0"
+serde_repr = "^0.1"
+serde_path_to_error = "^0.1"
+url = "^2.5"
+reqwest = { version = "^0.13", default-features = false, features = ["json", "multipart", "query", "form"] }
+
+[features]
+default = ["rustls"]
+native-tls = ["reqwest/native-tls"]
+rustls = ["reqwest/rustls"]

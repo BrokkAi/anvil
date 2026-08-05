@@ -26,8 +26,8 @@
         "type": { "type": "string" },
         "run_id": { "type": "string" },
         "session_id": { "type": "string" },
-        "seq": { "type": "integer", "minimum": 1 },
-        "ts_ms": { "type": "integer", "minimum": 0 }
+        "seq": { "type": "integer", "format": "int64", "minimum": 1 },
+        "ts_ms": { "type": "integer", "format": "int64", "minimum": 0 }
       }
     },
     "usage": {
@@ -40,11 +40,11 @@
         "cached_write_tokens"
       ],
       "properties": {
-        "input_tokens": { "type": "integer", "minimum": 0 },
-        "output_tokens": { "type": "integer", "minimum": 0 },
-        "thought_tokens": { "type": "integer", "minimum": 0 },
-        "cached_read_tokens": { "type": "integer", "minimum": 0 },
-        "cached_write_tokens": { "type": "integer", "minimum": 0 }
+        "input_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "output_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "thought_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "cached_read_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "cached_write_tokens": { "type": "integer", "format": "int64", "minimum": 0 }
       },
       "additionalProperties": false
     },
@@ -60,7 +60,7 @@
       "allOf": [{ "$ref": "#/$defs/envelope" }],
       "properties": {
         "type": { "const": "run.created" },
-        "prompt_chars": { "type": "integer", "minimum": 0 }
+        "prompt_chars": { "type": "integer", "format": "int64", "minimum": 0 }
       },
       "required": ["prompt_chars"]
     },
@@ -200,7 +200,7 @@
             "additionalProperties": false
           }
         },
-        "created_at_ms": { "type": "integer", "minimum": 0 }
+        "created_at_ms": { "type": "integer", "format": "int64", "minimum": 0 }
       },
       "required": ["permission_id", "tool_name", "tool_call_id", "options"]
     },
@@ -241,7 +241,7 @@
       "properties": {
         "type": { "const": "events.gap" },
         "run_id": { "type": "string" },
-        "missed_through_seq": { "type": "integer", "minimum": 0 }
+        "missed_through_seq": { "type": "integer", "format": "int64", "minimum": 0 }
       },
       "required": ["type", "run_id", "missed_through_seq"],
       "additionalProperties": false
