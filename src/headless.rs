@@ -49,7 +49,8 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PermissionMode {
-    /// Reject every permission request, so a run can never hang.
+    /// Reject every permission request while honoring agent-side read-only
+    /// auto-approvals and remembered repo-scoped Always allow grants.
     #[value(alias = "default")]
     Manual,
     /// Accept edit/delete/move requests; reject shell execution.
@@ -66,8 +67,9 @@ impl PermissionMode {
     /// classifier decides permissions without ever consulting the client, so
     /// leaving it in place would break the documented headless table.
     ///
-    /// - `manual` → `default`: the agent prompts for everything and the
-    ///   client-side policy rejects it.
+    /// - `manual` → `default`: the agent honors read-only auto-approvals and
+    ///   remembered Always allow grants; the client-side policy rejects every
+    ///   request that reaches it.
     /// - `auto` → `acceptEdits`: edits are auto-approved agent-side;
     ///   delete/move prompts are approved and shell execution rejected by
     ///   the client-side policy — together exactly "accept edit/delete/move,
@@ -815,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_mode_rejects_everything() {
+    fn manual_mode_rejects_every_permission_request() {
         let options = anvil_prompt_options();
         let decision = permission_decision(PermissionMode::Manual, Some(ToolKind::Edit), &options);
         assert_eq!(decision.unwrap().option_id.to_string(), "reject");
