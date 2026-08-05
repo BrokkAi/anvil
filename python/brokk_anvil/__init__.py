@@ -1,3 +1,3 @@
 """Python distribution metadata for the native Anvil launcher."""
 
-__version__ = "0.24.5"
+__version__ = "0.25.0"
