@@ -29,6 +29,34 @@ const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// https://github.com/BrokkAi/anvil/issues/292 for the fuller adaptive-timeout
 /// design this is standing in for.
 const MCP_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+const MCP_TOOL_CALL_TIMEOUT_ENV: &str = "ANVIL_MCP_TOOL_CALL_TIMEOUT_SECS";
+static CONFIGURED_MCP_TOOL_CALL_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+fn ordinary_mcp_tool_call_timeout() -> Duration {
+    *CONFIGURED_MCP_TOOL_CALL_TIMEOUT.get_or_init(|| {
+        let Ok(raw) = std::env::var(MCP_TOOL_CALL_TIMEOUT_ENV) else {
+            return MCP_TOOL_CALL_TIMEOUT;
+        };
+        match parse_mcp_tool_call_timeout(&raw) {
+            Some(timeout) => timeout,
+            None => {
+                tracing::warn!(
+                    value = %raw,
+                    default_seconds = MCP_TOOL_CALL_TIMEOUT.as_secs(),
+                    "ignoring invalid ANVIL_MCP_TOOL_CALL_TIMEOUT_SECS"
+                );
+                MCP_TOOL_CALL_TIMEOUT
+            }
+        }
+    })
+}
+
+fn parse_mcp_tool_call_timeout(raw: &str) -> Option<Duration> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
 
 #[cfg(target_os = "macos")]
 const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
@@ -870,7 +898,8 @@ impl McpClient {
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
-        let timeout = crate::cim::mcp_tool_call_timeout().unwrap_or(MCP_TOOL_CALL_TIMEOUT);
+        let timeout =
+            crate::cim::mcp_tool_call_timeout().unwrap_or_else(ordinary_mcp_tool_call_timeout);
         self.call_tool_with_timeout(name, args, timeout, None).await
     }
 
@@ -880,7 +909,8 @@ impl McpClient {
         args: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value, McpError> {
-        let timeout = crate::cim::mcp_tool_call_timeout().unwrap_or(MCP_TOOL_CALL_TIMEOUT);
+        let timeout =
+            crate::cim::mcp_tool_call_timeout().unwrap_or_else(ordinary_mcp_tool_call_timeout);
         self.call_tool_with_timeout(name, args, timeout, cancel)
             .await
     }
@@ -2224,6 +2254,16 @@ mod tests {
         assert_eq!(MCP_STARTUP_TIMEOUT, Duration::from_secs(60));
         assert_eq!(MCP_TOOL_CALL_TIMEOUT, Duration::from_secs(300));
         assert!(MCP_TOOL_CALL_TIMEOUT > MCP_STARTUP_TIMEOUT);
+    }
+
+    #[test]
+    fn configured_tool_call_timeout_requires_positive_seconds() {
+        assert_eq!(
+            parse_mcp_tool_call_timeout("660"),
+            Some(Duration::from_secs(660))
+        );
+        assert_eq!(parse_mcp_tool_call_timeout("0"), None);
+        assert_eq!(parse_mcp_tool_call_timeout("ten"), None);
     }
 
     /// Callers/tests match on the "timed out after {n}s" message, so it must
