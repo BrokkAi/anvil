@@ -913,7 +913,8 @@ pub(crate) struct ResponsesRequest {
     pub(crate) tools: Option<Vec<ResponsesToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_choice: Option<String>,
-    pub(crate) parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) stream: bool,
     /// Don't ask the server to retain this request; brokk owns its own
     /// session/turn persistence and we don't want a side-channel copy
@@ -1102,6 +1103,7 @@ pub(crate) fn build_responses_request(
             })
             .collect()
     });
+    let parallel_tool_calls = tools.as_ref().map(|_| true);
     let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
     let instructions = if instructions_parts.is_empty() {
@@ -1129,7 +1131,7 @@ pub(crate) fn build_responses_request(
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: true,
+        parallel_tool_calls,
         stream: true,
         store: false,
         reasoning,
@@ -1643,6 +1645,12 @@ mod tests {
         }
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
+        assert!(req.parallel_tool_calls.is_none());
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert!(serialized.get("tools").is_none());
+        assert!(serialized.get("tool_choice").is_none());
+        assert!(serialized.get("parallel_tool_calls").is_none());
+        assert!(serialized.get("max_output_tokens").is_none());
         assert!(!req.store);
         assert!(req.stream);
     }
@@ -1712,6 +1720,7 @@ mod tests {
         assert_eq!(tools[0]["description"], "check liveness");
         assert!(tools[0].get("function").is_none());
         assert_eq!(serialized.get("tool_choice").unwrap(), "auto");
+        assert_eq!(serialized.get("parallel_tool_calls").unwrap(), true);
     }
 
     #[test]

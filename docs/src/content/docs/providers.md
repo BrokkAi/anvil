@@ -20,6 +20,17 @@ Anvil reads `~/.codex/auth.json`, refreshes supported credentials, and can drive
 
 When the selected Codex model advertises a priority service tier, `/fast on` selects it for the current session and `/fast off` clears it. Fast mode can respond sooner but consumes subscription quota more aggressively.
 
+### Tool-free structured inference
+
+Automation that needs one schema-constrained model call without an ACP agent session can use `anvil infer`. It reads one request from stdin and writes one JSON result to stdout:
+
+```bash
+printf '%s' '{"messages":[{"role":"system","content":"Classify the item."},{"role":"user","content":"example"}],"schema_name":"classification","schema":{"type":"object","properties":{"label":{"type":"string"}},"required":["label"],"additionalProperties":false}}' \
+  | anvil infer --model codex::gpt-5.5 --reasoning-effort medium
+```
+
+This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The model prefix selects the backend and is required so no provider fallback can pick a different model: `codex::<model>` drives the Codex-auth backend from `~/.codex/auth.json`, and `kimi::<model>` drives the Kimi Code backend from `KIMI_API_KEY` or the Kimi CLI credentials. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, token `usage`, and effective request settings.
+
 ## Local Models
 
 Anvil probes Ollama at `http://localhost:11434/v1/models`. Start Ollama, then run:

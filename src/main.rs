@@ -21,6 +21,7 @@ mod discovery;
 mod goal;
 mod host_notice;
 mod http_retry;
+mod infer;
 mod installer;
 mod kimi_auth;
 mod llm_client;
@@ -195,6 +196,8 @@ struct Args {
 enum Command {
     /// Install Anvil as an ACP agent in a supported editor.
     Install(installer::InstallArgs),
+    /// Run one tool-free, schema-constrained Codex inference from JSON on stdin.
+    Infer(infer::InferArgs),
 }
 
 impl std::fmt::Debug for Args {
@@ -575,6 +578,9 @@ async fn main() -> Result<()> {
     if let Some(Command::Install(install_args)) = &args.command {
         installer::install(install_args)?;
         return Ok(());
+    }
+    if let Some(Command::Infer(infer_args)) = &args.command {
+        return infer::run(infer_args).await;
     }
 
     // Install the parser sandbox before any code that might load a SKILL.md
