@@ -728,25 +728,50 @@ fn mcp_tool_input_schema(name: &str, original: serde_json::Value) -> serde_json:
     if name != "semantic_search" {
         return original;
     }
-    json!({
-        "type": "object",
-        "properties": {
-            "queries": {
+    let mut properties = serde_json::Map::from_iter([
+        (
+            "queries".to_string(),
+            json!({
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 3,
                 "items": { "type": "string" },
                 "description": "One to three distinct, non-redundant natural-language code-search queries. Each query is retrieved and reranked independently."
-            },
-            "k": {
+            }),
+        ),
+        (
+            "k".to_string(),
+            json!({
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 20,
                 "default": 20,
                 "description": "Maximum number of final relevance-reranked results per query. A reranker may return fewer than k by design when fewer candidates are relevant."
-            }
-        },
-        "required": ["queries"],
+            }),
+        ),
+    ]);
+    let mut required = vec![json!("queries")];
+    if let Some(workspace) = original
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|properties| properties.get("workspace"))
+    {
+        // Bifrost requires this field when Anvil starts a named-workspace
+        // router. Preserve its enum and required contract in the harness
+        // schema instead of silently dropping it during the reranker override.
+        properties.insert("workspace".to_string(), workspace.clone());
+        if original
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|fields| fields.iter().any(|field| field == "workspace"))
+        {
+            required.insert(0, json!("workspace"));
+        }
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
         "additionalProperties": false
     })
 }
@@ -2356,6 +2381,31 @@ mod tests {
         assert_eq!(queries["items"]["type"], "string");
         assert!(schema["properties"].get("query").is_none());
         assert_eq!(schema["required"], json!(["queries"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn semantic_search_preserves_named_workspace_schema() {
+        let schema = mcp_tool_input_schema(
+            "semantic_search",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["api", "ui"]
+                    },
+                    "query": { "type": "string" },
+                    "k": { "type": "integer" }
+                },
+                "required": ["workspace", "query"]
+            }),
+        );
+        assert_eq!(
+            schema["properties"]["workspace"]["enum"],
+            json!(["api", "ui"])
+        );
+        assert_eq!(schema["required"], json!(["workspace", "queries"]));
         assert_eq!(schema["additionalProperties"], false);
     }
 
