@@ -142,26 +142,25 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
         backend.as_ref(),
         "bare structured inference",
         &cancel,
-        || {
-            StreamChatRequest {
-                model: wire_model.clone(),
-                messages: messages.clone(),
-                tools: None,
-                reasoning_effort: args.reasoning_effort.clone(),
-                service_tier: args.service_tier.clone(),
-                temperature: None,
-                structured_output: Some(structured_output.clone()),
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: IdleTimeouts {
-                    first_progress: Duration::from_secs(args.idle_timeout_secs),
-                    inter_chunk: Duration::from_secs(args.stall_timeout_secs),
-                },
-            }
-        })
-        .await
-        .context("running bare structured inference")?;
+        || StreamChatRequest {
+            model: wire_model.clone(),
+            messages: messages.clone(),
+            tools: None,
+            reasoning_effort: args.reasoning_effort.clone(),
+            service_tier: args.service_tier.clone(),
+            temperature: None,
+            structured_output: Some(structured_output.clone()),
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
+            idle_timeouts: IdleTimeouts {
+                first_progress: Duration::from_secs(args.idle_timeout_secs),
+                inter_chunk: Duration::from_secs(args.stall_timeout_secs),
+            },
+        },
+    )
+    .await
+    .context("running bare structured inference")?;
 
     let (text, usage) = match response {
         LlmResponse::Text { text, usage, .. } => (text, usage),

@@ -400,14 +400,12 @@ fn handle_session_update(update: SessionUpdate, state: &Mutex<RunState>, format:
                 state.final_text.push_str(&text);
             }
         }
-        SessionUpdate::AgentThoughtChunk(chunk) => {
-            if stream {
-                let text = content_block_text(&chunk.content);
-                emit_json(&StreamRecord::AgentThought {
-                    actor: PRIMARY_ACTOR,
-                    text: &text,
-                });
-            }
+        SessionUpdate::AgentThoughtChunk(chunk) if stream => {
+            let text = content_block_text(&chunk.content);
+            emit_json(&StreamRecord::AgentThought {
+                actor: PRIMARY_ACTOR,
+                text: &text,
+            });
         }
         SessionUpdate::ToolCall(call) => {
             if stream {
@@ -428,16 +426,14 @@ fn handle_session_update(update: SessionUpdate, state: &Mutex<RunState>, format:
                 .final_text
                 .clear();
         }
-        SessionUpdate::ToolCallUpdate(update) => {
-            if stream {
-                emit_json(&StreamRecord::ToolCallUpdate {
-                    actor: PRIMARY_ACTOR,
-                    id: &update.tool_call_id.to_string(),
-                    title: update.fields.title.as_deref(),
-                    kind: update.fields.kind.map(tool_kind_label),
-                    status: update.fields.status.map(tool_status_label),
-                });
-            }
+        SessionUpdate::ToolCallUpdate(update) if stream => {
+            emit_json(&StreamRecord::ToolCallUpdate {
+                actor: PRIMARY_ACTOR,
+                id: &update.tool_call_id.to_string(),
+                title: update.fields.title.as_deref(),
+                kind: update.fields.kind.map(tool_kind_label),
+                status: update.fields.status.map(tool_status_label),
+            });
         }
         SessionUpdate::Plan(_) => {
             state
