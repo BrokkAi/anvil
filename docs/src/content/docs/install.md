@@ -5,6 +5,46 @@ description: Install a released Anvil binary, use Cargo, or build from source.
 
 Anvil runs as a subprocess launched by an ACP client. Prefer a released binary when evaluating it: this avoids a large Rust and Wasmtime compile.
 
+## uv
+
+Install the checksum-verified native release through
+[uv](https://docs.astral.sh/uv/), with no Rust toolchain required:
+
+```bash
+uv tool install brokk-anvil
+anvil --version
+```
+
+The PyPI distribution is named `brokk-anvil` and exposes the `anvil` command.
+Its version is kept in lockstep with the Anvil release. The first invocation
+downloads that exact GitHub release archive and `.sha256` sidecar, verifies the
+archive, extracts only the expected executable, and stores it in a
+version-and-platform-specific cache. Later invocations work from that cache.
+
+Pin, upgrade, verify, and uninstall with:
+
+```bash
+uv tool install 'brokk-anvil==0.25.0'  # exact release
+uv tool upgrade brokk-anvil           # upgrade package and native release
+anvil --version                       # verify the selected native version
+uv tool uninstall brokk-anvil
+```
+
+`uv tool uninstall` removes the Python tool environment and the `anvil`
+launcher. It deliberately leaves downloaded native binaries available for
+offline reuse. The default cache is `~/Library/Caches/brokk-anvil` on macOS,
+`%LOCALAPPDATA%\\brokk-anvil` on Windows, and
+`${XDG_CACHE_HOME:-~/.cache}/brokk-anvil` on Linux and Android. Set
+`BROKK_ANVIL_CACHE_DIR` to choose another location, or remove the cache
+directory after uninstall when you no longer need it. Upgrades use a new
+versioned cache entry; exact version pins reuse their own entry.
+
+Supported platforms match the native release targets: macOS on Apple Silicon
+or Intel, Linux glibc on x86-64 or ARM64 (including WSL), Windows x86-64, and
+Android ARM64 under Termux. Unsupported systems and architectures fail before
+any download with a plain error. Musl-based Linux such as Alpine is rejected
+explicitly; use [Cargo](#install-with-cargo) there.
+
 ## Homebrew
 
 Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)

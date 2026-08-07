@@ -6,6 +6,10 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities,
+    AuthMethod,
+    AuthMethodAgent,
+    AuthenticateRequest,
+    AuthenticateResponse,
     AvailableCommand,
     AvailableCommandsUpdate,
     CancelNotification,
@@ -78,8 +82,8 @@ use agent_client_protocol::schema::v1::{
     UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
-    on_receive_notification, on_receive_request,
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, Handled, Responder,
+    on_receive_dispatch, on_receive_notification, on_receive_request,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -103,40 +107,38 @@ use crate::session::{
 use crate::slash::{is_slash_command, parse_slash_command, slash_command_args};
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
-    parse_structured_output_request, validate_response,
+    parse_structured_output_request,
 };
 use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::usage_report::{
     attach_bedrock_credits_meta, attach_deepseek_balance_meta, attach_openrouter_balance_meta,
-    estimate_usage_by_model_cost, fetch_codex_credits_for_usage,
-    fetch_openrouter_credits_for_usage, insert_turn_failure_meta, render_usage_report,
-    usage_by_model_meta,
+    fetch_codex_credits_for_usage, fetch_openrouter_credits_for_usage, insert_turn_failure_meta,
+    render_usage_report, usage_by_model_meta,
 };
-use crate::workspace_delta::{WorkspaceDeltaTracker, workspace_delta_for_turn};
 
 /// Stable ids for ACP `SessionConfigOption` selectors. These are live
 /// session inputs from the client, not Anvil setup preferences.
-const PERMISSION_CONFIG_ID: &str = "permission_mode";
-const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
+pub(crate) const PERMISSION_CONFIG_ID: &str = "permission_mode";
+pub(crate) const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
-const MODEL_CONFIG_ID: &str = "model_selection";
+pub(crate) const MODEL_CONFIG_ID: &str = "model_selection";
 /// Per-session reasoning-effort knob.
 /// Empty string in the wire payload clears the user's pick (back to the
 /// model's `default_reasoning_level`). The `off` option explicitly omits
 /// reasoning controls even when the model advertises a default.
-const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+pub(crate) const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
-const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
+pub(crate) const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
 /// Per-session service-tier knob. Codex subscription models currently
 /// advertise `priority`, rendered as Fast, for increased throughput.
-const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
-const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
+pub(crate) const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
+pub(crate) const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
 const CODEX_FAST_SERVICE_TIER_ID: &str = "priority";
 
 fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
@@ -227,41 +229,9 @@ fn validate_additional_directories(
     method: &str,
     directories: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, agent_client_protocol::Error> {
-    for (index, path) in directories.iter().enumerate() {
-        if path.as_os_str().is_empty() {
-            return Err(invalid_additional_directories_error(
-                method,
-                index,
-                path,
-                "non-empty",
-            ));
-        }
-        if !path.is_absolute() {
-            return Err(invalid_additional_directories_error(
-                method, index, path, "absolute",
-            ));
-        }
-        match path.metadata() {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(invalid_additional_directories_error(
-                    method,
-                    index,
-                    path,
-                    "a directory",
-                ));
-            }
-            Err(_) => {
-                return Err(invalid_additional_directories_error(
-                    method,
-                    index,
-                    path,
-                    "an existing directory",
-                ));
-            }
-        }
-    }
-    Ok(directories)
+    crate::session::validate_additional_directories(directories).map_err(|err| {
+        invalid_additional_directories_error(method, err.index, &err.path, err.requirement)
+    })
 }
 
 fn prompt_response_meta(
@@ -630,22 +600,22 @@ const CONFIGURE_KNOWN_KEYS: &[&str] = &[
 /// re-derived option list so the caller can re-emit a `ConfigOptionUpdate`
 /// notification with the spec-required complete state.
 #[derive(Debug)]
-struct ConfigApplyOutcome {
-    updated_options: Vec<SessionConfigOption>,
+pub(crate) struct ConfigApplyOutcome {
+    pub(crate) updated_options: Vec<SessionConfigOption>,
     /// Set only by the `model` arm when the previous reasoning_effort pick
     /// is not in the new model's supported set and the store dropped it.
     /// Both callers surface this to the user.
-    cleared_reasoning: Option<String>,
+    pub(crate) cleared_reasoning: Option<String>,
     /// Set only by the `model` arm when the previous service_tier pick is not
     /// in the new model's supported set and the store dropped it.
-    cleared_service_tier: Option<String>,
+    pub(crate) cleared_service_tier: Option<String>,
 }
 
 /// Validation / dispatch errors from `apply_config_option`. The request
 /// handler maps these into JSON error data; the slash command formats them
 /// into a one-line user message via `human_message`.
 #[derive(Debug)]
-enum ConfigApplyError {
+pub(crate) enum ConfigApplyError {
     UnknownConfigId,
     InvalidValue {
         reason: String,
@@ -655,7 +625,7 @@ enum ConfigApplyError {
 }
 
 impl ConfigApplyError {
-    fn human_message(&self) -> String {
+    pub(crate) fn human_message(&self) -> String {
         match self {
             ConfigApplyError::UnknownConfigId => format!(
                 "unknown config key. Supported: {}",
@@ -746,7 +716,7 @@ fn parse_turn_recap_enabled(value: &str) -> Option<bool> {
     parse_setup_bool(value)
 }
 
-async fn apply_config_option(
+pub(crate) async fn apply_config_option(
     sessions: &SessionStore,
     session_id: &str,
     config_id: &str,
@@ -1305,6 +1275,35 @@ fn spawn_delayed_session_usage_update(
 /// store's cached model catalog. Background callers queue on the shared
 /// refresh lock instead of skipping work when another refresh is in
 /// flight. Shared by `session/new` and provider login/logout flows.
+/// Process-wide switch for the interactive chatter the agent streams into
+/// sessions as regular message chunks: the delayed setup notice,
+/// model-catalog refresh progress, and end-of-turn recaps. The headless
+/// `--print` client flips this on before building the agent: its stdout
+/// contract is "the final assistant message", and any of that guidance
+/// would corrupt the pipeable output (and, for recaps, add an extra LLM
+/// summarizer round-trip before exit).
+static SUPPRESS_SESSION_CHATTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn suppress_session_chatter() {
+    SUPPRESS_SESSION_CHATTER.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn session_chatter_suppressed() -> bool {
+    SUPPRESS_SESSION_CHATTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The per-session turn-recap preference, forced off when session chatter is
+/// suppressed (headless `--print`): recaps stream through the same text sink
+/// as the assistant's answer and would be indistinguishable from it.
+async fn effective_turn_recap_enabled(sessions: &SessionStore, session_id: &str) -> bool {
+    !session_chatter_suppressed()
+        && sessions
+            .turn_recap_enabled(session_id)
+            .await
+            .unwrap_or(true)
+}
+
 fn spawn_background_refresh(
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     llm: Arc<MultiBackend>,
@@ -1312,6 +1311,11 @@ fn spawn_background_refresh(
     transcript: Option<(ConnectionTo<Client>, String, &'static str)>,
     initial_delay: Option<Duration>,
 ) {
+    let transcript = if session_chatter_suppressed() {
+        None
+    } else {
+        transcript
+    };
     tokio::spawn(async move {
         if let Some(delay) = initial_delay {
             tokio::time::sleep(delay).await;
@@ -1356,6 +1360,9 @@ fn spawn_delayed_setup_notice(
     catalog: Vec<ModelMetadata>,
     sessions: SessionStore,
 ) {
+    if session_chatter_suppressed() {
+        return;
+    }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let state = sessions.setup_state_snapshot();
@@ -1418,7 +1425,10 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     })
 }
 
-async fn seed_default_model_if_empty(sessions: &SessionStore, catalog: &[ModelMetadata]) {
+pub(crate) async fn seed_default_model_if_empty(
+    sessions: &SessionStore,
+    catalog: &[ModelMetadata],
+) {
     if sessions.default_model().await.trim().is_empty()
         && let Some(model) = preferred_model(catalog)
     {
@@ -1523,6 +1533,30 @@ pub async fn run_agent(
     default_idle_timeout_secs: u64,
     default_stall_timeout_secs: u64,
 ) -> agent_client_protocol::Result<()> {
+    agent_component(
+        llm,
+        sessions,
+        max_turns,
+        default_idle_timeout_secs,
+        default_stall_timeout_secs,
+    )
+    .connect_to(ByteStreams::new(
+        tokio::io::stdout().compat_write(),
+        tokio::io::stdin().compat(),
+    ))
+    .await
+}
+
+/// Build the ACP agent as a transport-agnostic component. `run_agent` wires it
+/// to stdio; the headless `--print` client connects it in-process to a
+/// one-shot ACP client instead, so both paths share one agent implementation.
+pub fn agent_component(
+    llm: Arc<MultiBackend>,
+    sessions: SessionStore,
+    max_turns: usize,
+    default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
+) -> impl ConnectTo<Client> {
     let llm_init = llm.clone();
     let sessions_init = sessions.clone();
 
@@ -1610,10 +1644,45 @@ pub async fn run_agent(
                             ),
                     );
 
+                // Anvil requires no login of its own, but the ACP registry
+                // (AUTHENTICATION.md) rejects agents whose initialize response
+                // advertises no auth methods, so declare an explicit no-auth
+                // method rather than an empty list.
+                let auth_methods = vec![AuthMethod::Agent(
+                    AuthMethodAgent::new("none", "No authentication required").description(
+                        "Anvil needs no login; model providers are configured per \
+                         session (/setup) or through environment variables.",
+                    ),
+                )];
+
                 let protocol_version = negotiate_protocol_version(req.protocol_version);
                 responder.respond(
-                    InitializeResponse::new(protocol_version).agent_capabilities(capabilities),
+                    InitializeResponse::new(protocol_version)
+                        .agent_capabilities(capabilities)
+                        .auth_methods(auth_methods),
                 )
+            },
+            on_receive_request!(),
+        )
+        // Handle authenticate: clients may call it with any advertised method
+        // id, and the only advertised method ("none") needs no action.
+        .on_receive_request(
+            async move |req: AuthenticateRequest,
+                        responder: Responder<AuthenticateResponse>,
+                        _cx: ConnectionTo<Client>| {
+                tracing::info!("ACP authenticate, methodId={}", req.method_id.0);
+                if req.method_id.0.as_ref() == "none" {
+                    responder.respond(AuthenticateResponse::new())
+                } else {
+                    responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!(
+                                "unknown authMethod id {:?}; Anvil advertises only \"none\"",
+                                req.method_id.0
+                            ),
+                        })),
+                    )
+                }
             },
             on_receive_request!(),
         )
@@ -3000,10 +3069,8 @@ pub async fn run_agent(
                     default_idle_timeout_secs,
                     default_stall_timeout_secs,
                 );
-                let turn_recap_enabled_for_loop = sessions_prompt
-                    .turn_recap_enabled(&session_id)
-                    .await
-                    .unwrap_or(true);
+                let turn_recap_enabled_for_loop =
+                    effective_turn_recap_enabled(&sessions_prompt, &session_id).await;
                 // `cancel` is moved into the tool loop below, so keep a clone to
                 // detect after the turn whether the prompt was cancelled.
                 let cancel_status = cancel.clone();
@@ -3328,14 +3395,9 @@ pub async fn run_agent(
             },
             on_receive_dispatch!(),
         )
-        .connect_to(ByteStreams::new(
-            tokio::io::stdout().compat_write(),
-            tokio::io::stdin().compat(),
-        ))
-        .await
 }
 
-fn resolve_idle_timeouts(
+pub(crate) fn resolve_idle_timeouts(
     session_override_secs: Option<u64>,
     default_first_progress_secs: u64,
     default_inter_chunk_secs: u64,
@@ -3865,10 +3927,7 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
-    let turn_recap_enabled = sessions
-        .turn_recap_enabled(session_id)
-        .await
-        .unwrap_or(true);
+    let turn_recap_enabled = effective_turn_recap_enabled(sessions, session_id).await;
     let turn = run_prepared_model_turn(
         cx,
         sessions,
@@ -4150,10 +4209,7 @@ async fn run_goal_loop(
     // exact turn's persisted response makes the recap durable on reload
     // like the per-turn recap.
     if let Some(anchor_fragment_id) = recap_anchor
-        && sessions
-            .turn_recap_enabled(session_id)
-            .await
-            .unwrap_or(true)
+        && effective_turn_recap_enabled(sessions, session_id).await
     {
         let notice = crate::host_notice::render_goal_recap(
             &exit_text.recap_stop_line,
@@ -4221,18 +4277,18 @@ fn build_prompt_messages_with_parts(
     build_prompt_messages_with_mode_and_parts(snap, snap.mode, new_prompt_text, new_prompt_parts)
 }
 
-struct PreparedPrompt {
-    messages: Vec<ChatMessage>,
-    compaction_usage: crate::llm_client::TokenUsage,
-    prefix_len: usize,
-    current_plan: Option<crate::plan::UpdatePlanArgs>,
+pub(crate) struct PreparedPrompt {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) compaction_usage: crate::llm_client::TokenUsage,
+    pub(crate) prefix_len: usize,
+    pub(crate) current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
 /// Build a prompt and, when necessary, replace all completed model history
 /// with one cumulative checkpoint. The canonical prefix and incoming user
 /// prompt are never summarized.
 #[allow(clippy::too_many_arguments)]
-async fn build_prompt_messages_with_compression(
+pub(crate) async fn build_prompt_messages_with_compression(
     snap: &mut SessionSnapshot,
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
@@ -4518,47 +4574,10 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
     }
 }
 
-/// Below this many characters of visible answer, a turn with no tool calls
-/// is treated as trivial chat and skips the extra recap-summary LLM call --
-/// the short answer already speaks for itself right above the recap.
-const RECAP_SUMMARY_MIN_CHARS: usize = 280;
-
-/// Best-effort, user-facing summary of the work done this turn, for the
-/// recap. Returns `None` when there is nothing worth summarizing or the
-/// summarizer call fails or is cancelled; the recap then renders only its
-/// deterministic stat lines. Failures are intentionally swallowed -- a recap
-/// is a convenience, never a reason to fail the turn.
-async fn recap_work_summary(
-    llm: &dyn crate::llm_client::LlmBackend,
-    model: &str,
-    turn: &ConversationTurn,
-    context_length: Option<u32>,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Option<String> {
-    let visible = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
-    if turn.tool_exchanges.is_empty() && visible.trim().chars().count() < RECAP_SUMMARY_MIN_CHARS {
-        return None;
-    }
-    match crate::context_manager::summarize_turn_for_recap(
-        llm,
-        model,
-        turn,
-        context_length,
-        idle_timeout,
-        cancel,
-    )
-    .await
-    {
-        Ok(summary) if !summary.trim().is_empty() => Some(summary),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::debug!(model, "turn recap summary failed: {e:#}");
-            None
-        }
-    }
-}
-
+/// ACP wrapper around the shared transport-neutral turn pipeline
+/// ([`crate::turn_runner::run_prompt_turn`]): adapts the connection into
+/// text/thought sinks and the `SpawnedCx` event-sink/permission-broker pair,
+/// then reports the post-turn `session/usage_update`.
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -4571,7 +4590,7 @@ async fn run_model_turn_in_spawn(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
-    mut messages: Vec<ChatMessage>,
+    messages: Vec<ChatMessage>,
     initial_usage: crate::llm_client::TokenUsage,
     context_length: Option<u32>,
     context_prefix_len: usize,
@@ -4582,13 +4601,6 @@ async fn run_model_turn_in_spawn(
     turn_recap_enabled: bool,
     prompt_text_for_turn: String,
 ) -> Result<ModelTurnResult, LoopIterationError> {
-    use futures::FutureExt;
-    use std::panic::AssertUnwindSafe;
-
-    if let Some(instructions) = registry.mcp_instructions().await {
-        append_mcp_instructions_to_system_prompt(&mut messages, &instructions);
-    }
-
     let cx_text = cx.clone();
     let sid_text = session_id.to_string();
     let cx_thought = cx.clone();
@@ -4603,198 +4615,54 @@ async fn run_model_turn_in_spawn(
             send_thought(&cx_thought, &sid_thought, token);
         }));
 
-    let cancel_status = cancel.clone();
-    let workspace_delta_tracker = if turn_recap_enabled {
-        Some(WorkspaceDeltaTracker::snapshot(fallback_cwd).await)
-    } else {
-        None
-    };
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
-    let loop_future = async {
-        let outcome = crate::tool_loop::run(
-            llm,
-            registry,
-            model,
-            reasoning_effort,
-            service_tier,
-            structured_output_request,
-            messages,
-            max_turns,
-            idle_timeout,
-            cancel,
-            text_sink,
-            thought_sink,
-            &spawned_cx,
-            &spawned_cx,
-            session_id.to_string(),
-            sessions.clone(),
-            prompt_text_for_turn.clone(),
-            crate::tool_loop::NotificationMode::Live,
-            0,
-            None,
-            None,
-            false,
-            None,
-            None,
-            context_length,
-            context_prefix_len,
-            initial_plan,
-        )
-        .await;
-        let usage_by_model: Option<BTreeMap<String, crate::llm_client::TokenUsage>> = None;
-        (outcome, usage_by_model)
-    };
-    let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
-    let (mut outcome, mut usage_by_model) = match loop_result {
-        Ok(result) => result,
-        Err(panic) => {
-            tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
-            // A panic is treated as fatal (non-retryable): retrying a
-            // deterministic crash would just spin, so an autonomous driver
-            // should stop and surface it rather than back off and retry.
-            (
-                crate::tool_loop::LoopOutcome {
-                    response: "Error: agent loop panicked. See server logs.".to_string(),
-                    tool_exchanges: Vec::new(),
-                    replay_events: Vec::new(),
-                    usage: crate::llm_client::TokenUsage::default(),
-                    stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
-                        retryable: false,
-                        message: "agent loop panicked".to_string(),
-                    }),
-                    current_plan: None,
-                    compaction_checkpoint: None,
-                },
-                None,
-            )
-        }
-    };
-    outcome.usage.add(initial_usage);
-    if let Some(usage_by_model) = usage_by_model.as_mut() {
-        usage_by_model
-            .entry(model.to_string())
-            .or_default()
-            .add(initial_usage);
-    }
-    let crate::tool_loop::LoopOutcome {
-        response: response_text,
-        tool_exchanges,
-        replay_events,
-        usage: turn_usage,
-        stop,
-        current_plan,
-        compaction_checkpoint,
-    } = outcome;
-
-    let model_metadata = sessions.available_model_metadata().await;
-    let model_meta = model_metadata.iter().find(|meta| meta.id == model);
-    let cost_delta_usd = match usage_by_model.as_ref() {
-        Some(usage_by_model) => estimate_usage_by_model_cost(&model_metadata, usage_by_model),
-        None => model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage)),
-    };
-    let context_length = model_meta.and_then(|meta| meta.context_length);
-    let cumulative_usage = sessions
-        .record_usage(session_id, turn_usage, cost_delta_usd)
-        .await
-        .unwrap_or(turn_usage);
-    let structured_output_result =
-        structured_output_request.map(|request| validate_response(request, &response_text));
-
-    // Build the turn up front so the recap summarizer can read it without
-    // cloning the tool exchanges. `agent_response` holds the raw model text for
-    // now (the summarizer strips host notices itself) and is replaced with the
-    // recap-augmented text below before the turn is persisted.
-    let mut turn = ConversationTurn {
-        user_prompt: prompt_text_for_turn,
-        agent_response: response_text.clone(),
-        replay_events: sanitize_replay_events(&replay_events),
-        tool_exchanges,
-        structured_output: structured_output_result.clone(),
-        summary: None,
-        current_plan,
-        compaction_checkpoint,
-        fragment_id: None,
-    };
-
-    let workspace_delta = if let Some(tracker) = workspace_delta_tracker {
-        workspace_delta_for_turn(fallback_cwd, tracker).await
-    } else {
-        crate::host_notice::WorkspaceDelta::default()
-    };
-    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges)
-        .with_workspace_delta(&workspace_delta);
-    let visible_response =
-        if turn_recap_enabled && !cancel_status.is_cancelled() && tool_stats.has_changed_files() {
-            let summary = recap_work_summary(
-                llm.as_ref(),
-                model,
-                &turn,
-                context_length,
-                idle_timeout,
-                cancel_status.clone(),
-            )
-            .await;
-            let recap = crate::host_notice::render_turn_recap(
-                summary.as_deref(),
-                &turn.tool_exchanges,
-                Some(&workspace_delta),
-                &stop,
-            );
-            send_message(cx, session_id, &recap);
-            format!("{response_text}{recap}")
-        } else {
-            response_text.clone()
-        };
-    turn.agent_response = visible_response;
-
-    let persisted_fragment_id = match sessions.add_turn(session_id, turn).await {
-        Ok(fragment_id) => fragment_id,
-        Err(e) => {
-            send_message(
-                cx,
-                session_id,
-                &format!(
-                    "\n**Warning:** failed to save this conversation turn to disk; \
-                     it will not survive a session reload: {e}\n"
-                ),
-            );
-            None
-        }
-    };
+    let outcome = crate::turn_runner::run_prompt_turn(crate::turn_runner::PromptTurnRequest {
+        sessions,
+        session_id,
+        fallback_cwd,
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        service_tier,
+        structured_output_request,
+        messages,
+        initial_usage,
+        context_length,
+        context_prefix_len,
+        initial_plan,
+        max_turns,
+        idle_timeout,
+        cancel,
+        turn_recap_enabled,
+        prompt_text_for_turn,
+        text_sink,
+        thought_sink,
+        event_sink: &spawned_cx,
+        permission_broker: &spawned_cx,
+    })
+    .await;
 
     send_session_usage_update_with_breakdown(
         cx,
         sessions,
         session_id,
         fallback_cwd,
-        usage_by_model.as_ref(),
-        match &stop {
-            crate::tool_loop::LoopStop::Failed(failure) => Some(failure),
-            _ => None,
-        },
+        None,
+        outcome.turn_failure(),
     )
     .await;
-    Ok(ModelTurnResult {
-        structured_output: structured_output_result,
-        cumulative_usage,
-        response: response_text,
-        stop,
-        tool_stats,
-        persisted_fragment_id,
-    })
-}
 
-fn append_mcp_instructions_to_system_prompt(messages: &mut [ChatMessage], instructions: &str) {
-    let Some(system) = messages.iter_mut().find(|message| message.role == "system") else {
-        return;
-    };
-    let Some(crate::llm_client::ChatContentPart::Text { text }) = system.content.first_mut() else {
-        return;
-    };
-    text.push_str("\n\n");
-    text.push_str(instructions);
+    Ok(ModelTurnResult {
+        structured_output: outcome.structured_output,
+        cumulative_usage: outcome.cumulative_usage,
+        response: outcome.response,
+        stop: outcome.stop,
+        tool_stats: outcome.tool_stats,
+        persisted_fragment_id: outcome.persisted_fragment_id,
+    })
 }
 
 /// Shared "run one model turn" pipeline behind both `/loop` and `/goal`:
@@ -4962,6 +4830,11 @@ fn build_system_prompt(
 /// short imperative rules better than long constitutions, and this string
 /// rides on every request.
 ///
+/// The AGENTS.md section is the prompt half of `crate::agents_md`, which only
+/// loads the project-root-to-cwd chain. Nothing eagerly reads the files nested
+/// below cwd, so the model is told their scoping rule and asked to fetch those
+/// itself when it works under the directories that own them.
+///
 /// Tool-preference language is conditioned on what is ADVERTISED because the
 /// active toolset varies by session (bifrost may be absent; P2T gates tools):
 /// an unconditional "use read_file, not cat" invites calls to tools that are
@@ -4995,6 +4868,13 @@ handling, no unrequested features. Prefer editing existing files over creating n
 not revert changes that are not yours.
 - Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
 narrate what code does or address the user in comments.
+
+# AGENTS.md
+
+- An AGENTS.md (or CLAUDE.md) governs the whole tree under its directory. Obey every one \
+covering a file you touch; on conflict the most deeply nested wins.
+- Those from the project root down to the working directory are already supplied. Ones below \
+it are not: check for them before editing under a subdirectory.
 
 # Verification
 
@@ -9763,7 +9643,7 @@ mod tests {
             ChatMessage::user(original_user),
         ];
 
-        append_mcp_instructions_to_system_prompt(
+        crate::turn_runner::append_mcp_instructions_to_system_prompt(
             &mut messages,
             "<mcp_instructions>\n  <server name=\"council\">\nCoordinate persistently.\n  </server>\n</mcp_instructions>",
         );
@@ -10736,6 +10616,35 @@ mod tests {
                 !prompt.contains("create a task list"),
                 "system prompt for {mode:?} must not revive the task-list invitation (anvil has \
                  no todo tool; it induces prose plans instead of tool calls), got: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_system_prompt_explains_nested_agents_md_scope() {
+        // `agents_md::discover` only walks the git-root-to-cwd chain, so
+        // an AGENTS.md nested below cwd reaches the model only if the
+        // prompt tells it to go read one.
+        let cwd = std::path::Path::new("/tmp/some-cwd");
+        for mode in [SessionMode::Lutz, SessionMode::Plan] {
+            let prompt = build_system_prompt(&mode, cwd, &[]);
+            assert!(
+                prompt.contains("governs the whole tree under its directory"),
+                "system prompt for {mode:?} must state the AGENTS.md scoping rule, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("the most deeply nested wins"),
+                "system prompt for {mode:?} must state nested-wins precedence, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("are already supplied"),
+                "system prompt for {mode:?} must stop the model re-reading the supplied \
+                 root-to-cwd chain, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("before editing under a subdirectory"),
+                "system prompt for {mode:?} must ask the model to fetch AGENTS.md nested \
+                 below cwd, got: {prompt}"
             );
         }
     }

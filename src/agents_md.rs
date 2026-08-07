@@ -11,6 +11,12 @@
 //! ancestor `.git` cannot accidentally pick up a stray AGENTS.md from
 //! `~`, `/tmp`, or `/`.
 //!
+//! Discovery is deliberately ancestors-only: files nested *below* cwd are
+//! not eagerly read, since a large repo can hold many and most are
+//! irrelevant to any one task. The system prompt carries their scoping
+//! rule instead (see `CORE_GUIDANCE` in `crate::acp`) and asks the model
+//! to read them when it works under the directories that own them.
+//!
 //! Pure module; no LLM/session deps. Re-runs are cheap and idempotent --
 //! callers may invoke `discover` again whenever a session's cwd changes.
 

@@ -36,7 +36,25 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt
           targets: wasm32-wasip2
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Regenerate every SDK from the wire contract
+        run: |
+          npm ci --prefix sdk/typescript
+          node scripts/generate-sdks.mjs
+          git diff --exit-code -- sdk/typescript/src/generated sdk/rust sdk/python
 
       - name: Cache cargo registry and build
         uses: actions/cache@v5
@@ -63,11 +81,40 @@ jobs:
           fi
           echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
 
-      # Multi-package dry-run resolves brokk-anvil-minimizer from the local
-      # workspace, so this gate works even before the minimizer version exists
-      # on crates.io.
-      - name: Verify packages
-        run: cargo publish --dry-run -p brokk-anvil-minimizer -p brokk-anvil --locked
+      # brokk-anvil-minimizer is versioned in lockstep with brokk-anvil so the
+      # published minimizer always corresponds to the release tag and can never
+      # silently drift from the workspace sources.
+      - name: Verify workspace version lockstep
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          MINI=$(grep -m1 '^version = ' crates/anvil-minimizer/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          SDK=$(grep -m1 '^version = ' sdk/rust/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          REQ=$(grep -m1 '^anvil-minimizer = ' Cargo.toml | sed -E 's/.*version = "([^"]*)".*/\1/')
+          if [ "$ROOT" != "$MINI" ] || [ "$ROOT" != "$SDK" ] || [ "$ROOT" != "$REQ" ]; then
+            echo "::error::Version lockstep violated: brokk-anvil=$ROOT, brokk-anvil-minimizer=$MINI, brokk-anvil-sdk=$SDK, dependency requirement=$REQ."
+            exit 1
+          fi
+          echo "Workspace and generated SDK versions in lockstep: $ROOT"
+
+      - name: Verify generated Rust SDK package
+        run: cargo publish --dry-run -p brokk-anvil-sdk --locked
+
+      - name: Verify minimizer package
+        run: cargo publish --dry-run -p brokk-anvil-minimizer --locked
+
+      # brokk-anvil's verification build resolves brokk-anvil-minimizer from
+      # crates.io (the root build.rs runs a nested `cargo metadata`, which
+      # cannot see the local workspace once the package is assembled). Under
+      # lockstep versioning the minimizer version is new on every release, so
+      # the full verification build is only possible after the minimizer is
+      # uploaded: `cargo publish` performs it before the actual upload in the
+      # publish step below. Here we verify everything that does not need the
+      # registry: packaging, manifest validity, and dependency resolution
+      # (both packages are listed so cargo overlays the local minimizer).
+      - name: Verify brokk-anvil package (no build)
+        run: cargo publish --dry-run --no-verify -p brokk-anvil-minimizer -p brokk-anvil --locked
 
       - name: Authenticate with crates.io
         if: github.event_name == 'push' || github.event.inputs.publish == 'true'
@@ -76,9 +123,10 @@ jobs:
 
       # Publish the minimizer before brokk-anvil (which depends on it), and
       # skip any version that is already on crates.io so a partially failed
-      # run can be retried safely. `cargo publish` blocks until the uploaded
-      # crate has propagated to the index, so the second publish can resolve
-      # the first.
+      # run can be retried safely. `cargo publish` runs the full verification
+      # build before each upload and blocks until the uploaded crate has
+      # propagated to the index, so brokk-anvil's verification can resolve the
+      # just-published minimizer.
       - name: Publish crates
         if: github.event_name == 'push' || github.event.inputs.publish == 'true'
         shell: bash
@@ -100,5 +148,6 @@ jobs:
               cargo publish -p "$crate" --locked
             fi
           }
+          publish_if_missing brokk-anvil-sdk sdk/rust/Cargo.toml
           publish_if_missing brokk-anvil-minimizer crates/anvil-minimizer/Cargo.toml
           publish_if_missing brokk-anvil Cargo.toml

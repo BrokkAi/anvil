@@ -22,6 +22,7 @@ become `@brokkai/anvil`'s `latest`.
 | `launcher/anvil.js` | The root package's bin entry. Picks the installed platform package, execs the native binary, forwards args/stdio/signals/exit status. |
 | `launcher/README.md` | README published with `@brokkai/anvil` (shown on npmjs.com). |
 | `lib/common.mjs` | Shared target table and helpers. |
+| `lib/registry.mjs` | Registry visibility checks shared with the TypeScript SDK publisher. Reads with `--prefer-online` and waits past npmjs' five-minute packument cache, so a just-published version is never mistaken for a failed publish. |
 | `build-npm-packages.mjs` | Downloads (or reuses) release assets, verifies checksums, stages and packs all six tarballs, validates them, writes `dist/manifest.json`. |
 | `test-npm-packages.mjs` | Installs the built tarballs into a throwaway global prefix with a cold cache and smoke-tests the real binary (version, arg forwarding, exit status, signal forwarding, one-shot `npm exec`). |
 | `publish-npm-packages.mjs` | Publishes platform packages first, waits until all are publicly visible, then publishes the root. Dry run unless `--yes-publish`. Retry-safe. |

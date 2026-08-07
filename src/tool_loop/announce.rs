@@ -303,7 +303,7 @@ pub(crate) fn update_failed_with_input(
     ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
 }
 
-/// Terminal `Completed` update. Pass `Some(diff)` for `write_file` to
+/// Terminal `Completed` update. Pass `Some(diff)` for a file mutation to
 /// render an inline diff; otherwise the `output` is shown as text.
 pub(crate) fn update_completed(
     tool_call_id: &str,
@@ -375,6 +375,8 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     let display = ToolRegistry::display_name(tool_name);
     let path = raw_input.get("path").and_then(Value::as_str);
     let file_path = raw_input.get("file_path").and_then(Value::as_str);
+    let source_path = raw_input.get("source_path").and_then(Value::as_str);
+    let destination_path = raw_input.get("destination_path").and_then(Value::as_str);
     let pattern = raw_input.get("pattern").and_then(Value::as_str);
     let query = raw_input.get("query").and_then(Value::as_str);
     let command = raw_input.get("command").and_then(Value::as_str);
@@ -387,6 +389,15 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
         "write_file" => file_path
             .map(|p| format!("Write `{p}`"))
             .unwrap_or_else(|| display.to_string()),
+        "delete_file" => file_path
+            .map(|p| format!("Delete `{p}`"))
+            .unwrap_or_else(|| display.to_string()),
+        "move_file" => match (source_path, destination_path) {
+            (Some(source), Some(destination)) => {
+                format!("Move `{source}` to `{destination}`")
+            }
+            _ => display.to_string(),
+        },
         "edit" => file_path
             .map(|p| format!("Edit `{p}`"))
             .unwrap_or_else(|| display.to_string()),
@@ -448,13 +459,22 @@ pub(super) fn permission_prompt_title(tool_name: &str, raw_input: &Value) -> Str
 }
 
 /// File locations affected by this call, used by clients for follow-along.
-/// v1: only the obvious `path` arg on filesystem tools. Bifrost JSON
+/// Built-in filesystem tools expose their input paths directly. Bifrost JSON
 /// outputs may carry locations, but parsing them is out of scope here.
 pub(super) fn tool_locations(tool_name: &str, raw_input: &Value) -> Vec<ToolCallLocation> {
-    if matches!(tool_name, "read_file" | "write_file" | "edit")
-        && let Some(path) = raw_input.get("file_path").and_then(Value::as_str)
+    if matches!(
+        tool_name,
+        "read_file" | "write_file" | "delete_file" | "edit"
+    ) && let Some(path) = raw_input.get("file_path").and_then(Value::as_str)
     {
         return vec![ToolCallLocation::new(PathBuf::from(path))];
+    }
+    if tool_name == "move_file" {
+        return ["source_path", "destination_path"]
+            .into_iter()
+            .filter_map(|key| raw_input.get(key).and_then(Value::as_str))
+            .map(|path| ToolCallLocation::new(PathBuf::from(path)))
+            .collect();
     }
     if matches!(tool_name, "list_directory")
         && let Some(path) = raw_input.get("path").and_then(Value::as_str)
@@ -565,6 +585,21 @@ mod tests {
             &json!({"file_path": "a/b.txt", "content": "x"}),
         );
         assert_eq!(title, "Write `a/b.txt`");
+    }
+
+    #[test]
+    fn delete_file_title_shows_path() {
+        let title = tool_title("delete_file", &json!({"file_path": "a/b.txt"}));
+        assert_eq!(title, "Delete `a/b.txt`");
+    }
+
+    #[test]
+    fn move_file_title_shows_both_paths() {
+        let title = tool_title(
+            "move_file",
+            &json!({"source_path": "a.txt", "destination_path": "b.txt"}),
+        );
+        assert_eq!(title, "Move `a.txt` to `b.txt`");
     }
 
     #[test]
@@ -799,6 +834,18 @@ mod tests {
         let locs = tool_locations("write_file", &json!({"file_path": "a.txt", "content": ""}));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, PathBuf::from("a.txt"));
+
+        let locs = tool_locations("delete_file", &json!({"file_path": "old.txt"}));
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, PathBuf::from("old.txt"));
+
+        let locs = tool_locations(
+            "move_file",
+            &json!({"source_path": "old.txt", "destination_path": "new.txt"}),
+        );
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].path, PathBuf::from("old.txt"));
+        assert_eq!(locs[1].path, PathBuf::from("new.txt"));
 
         let locs = tool_locations(
             "edit",

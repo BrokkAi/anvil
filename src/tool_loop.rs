@@ -24,8 +24,9 @@ use crate::llm_client::{
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::runtime::{
-    PermissionBroker, PermissionDecision, PermissionOption as RuntimePermissionOption,
-    PermissionOptionKind as RuntimePermissionOptionKind, PermissionPrompt,
+    EventSink, PermissionBroker, PermissionDecision, PermissionOption as RuntimePermissionOption,
+    PermissionOptionKind as RuntimePermissionOptionKind, PermissionPrompt, RuntimeEvent,
+    ToolCallPhase,
 };
 
 use crate::semantic_rerank;
@@ -337,14 +338,6 @@ fn record_tool_result(
 ) {
     replay_events.push(TurnReplayEvent::ToolResult(exchange.clone()));
     tool_exchanges.push(exchange);
-}
-
-fn tool_exchange_diff_from_acp(diff: &Diff) -> ToolExchangeDiff {
-    ToolExchangeDiff {
-        path: diff.path.clone(),
-        old_text: diff.old_text.clone(),
-        new_text: diff.new_text.clone(),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1859,7 +1852,7 @@ pub(crate) async fn run(
     cancel: CancellationToken,
     on_text: TextSink,
     on_thought: TextSink,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
     permission_broker: &dyn PermissionBroker,
     session_id: String,
     sessions: SessionStore,
@@ -2124,7 +2117,7 @@ pub(crate) async fn run(
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                spawned_cx,
+                event_sink,
                 permission_broker,
                 &session_id,
                 &sessions,
@@ -2556,7 +2549,7 @@ pub(crate) async fn run(
                     max_turns,
                     idle_timeout,
                     cancel.clone(),
-                    spawned_cx,
+                    event_sink,
                     permission_broker,
                     &session_id,
                     &sessions,
@@ -2960,7 +2953,7 @@ async fn execute_step_tool_calls(
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
     permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
@@ -3002,7 +2995,7 @@ async fn execute_step_tool_calls(
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                spawned_cx,
+                event_sink,
                 permission_broker,
                 session_id,
                 sessions,
@@ -3044,26 +3037,31 @@ async fn execute_step_tool_calls(
                         "Error: tool arguments are not valid JSON ({e}). \
                      Please retry with a valid JSON object matching the tool schema."
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCall(announce::initial_tool_call(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &Value::String(call.function.arguments.clone()),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Started {
+                                input: Value::String(call.function.arguments.clone()),
+                            },
+                        },
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCallUpdate(announce::update_failed(
-                            &call.id,
-                            &reason,
-                            Some(Value::String(reason.clone())),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Failed {
+                                reason: reason.clone(),
+                                permission_notice: None,
+                                input: None,
+                            },
+                        },
                     );
                     messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
                     step_results.push(p2t::PrefixToolResult {
@@ -3106,26 +3104,31 @@ async fn execute_step_tool_calls(
                     .count(),
                 "rejecting tool call: rendered permission card would hide input",
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
-                    &call.id,
-                    &tool_name,
-                    kind,
-                    &parsed_input,
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::StartedOversized {
+                        input: parsed_input.clone(),
+                    },
+                },
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &reason,
-                    Some(Value::String(reason.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: reason.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
             step_results.push(p2t::PrefixToolResult {
@@ -3168,19 +3171,18 @@ async fn execute_step_tool_calls(
                     "denied outside-sandbox escalation request (preflight)"
                 );
             }
-            let (blocked_call, failed_update) =
-                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(blocked_call),
-            );
-            maybe_send_session_update(
-                notifications,
-                spawned_cx.cx(),
-                session_id,
-                SessionUpdate::ToolCallUpdate(failed_update),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Blocked {
+                        input: parsed_input.clone(),
+                        reason: message.clone(),
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
             step_results.push(p2t::PrefixToolResult {
@@ -3203,29 +3205,34 @@ async fn execute_step_tool_calls(
             continue;
         }
 
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCall(announce::initial_tool_call(
-                &call.id,
-                &tool_name,
-                kind,
-                &parsed_input,
-            )),
+            RuntimeEvent::ToolCall {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                phase: ToolCallPhase::Started {
+                    input: parsed_input.clone(),
+                },
+            },
         );
 
         if !advertised_this_request.contains(tool_name.as_str()) {
             let message = tool_unavailable_message(&tool_name);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &message,
-                    Some(Value::String(message.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: message.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
             step_results.push(p2t::PrefixToolResult {
@@ -3286,16 +3293,19 @@ async fn execute_step_tool_calls(
                         "denied outside-sandbox escalation request"
                     );
                 }
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
-                        &call.id,
-                        &message,
-                        permission_notice.as_deref(),
-                        Some(Value::String(message.clone())),
-                    )),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::Failed {
+                            reason: message.clone(),
+                            permission_notice: permission_notice.clone(),
+                            input: None,
+                        },
+                    },
                 );
                 (message, ToolExchangeStatus::Failed, None, permission_notice)
             }
@@ -3305,15 +3315,19 @@ async fn execute_step_tool_calls(
                 shell_sandboxed,
                 permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::InProgress,
+                    },
                 );
 
                 let pre_write: Option<Option<String>> =
-                    if matches!(tool_name.as_str(), "write_file" | "edit") {
+                    if matches!(tool_name.as_str(), "write_file" | "edit" | "delete_file") {
                         capture_pre_write_text(
                             registry.cwd(),
                             registry.additional_roots(),
@@ -3383,7 +3397,7 @@ async fn execute_step_tool_calls(
                             max_turns,
                             idle_timeout,
                             cancel.clone(),
-                            spawned_cx,
+                            event_sink,
                             permission_broker,
                             session_id,
                             sessions,
@@ -3413,11 +3427,11 @@ async fn execute_step_tool_calls(
                                 }
                             }
                             Ok(plan) => {
-                                maybe_send_session_update(
+                                maybe_emit_runtime_event(
                                     notifications,
-                                    spawned_cx.cx(),
+                                    event_sink,
                                     session_id,
-                                    SessionUpdate::Plan(plan.to_acp()),
+                                    RuntimeEvent::Plan(plan.clone()),
                                 );
                                 *current_plan = Some(plan);
                                 ToolExecution {
@@ -3468,42 +3482,40 @@ async fn execute_step_tool_calls(
                     exec
                 };
 
-                let (update, status, replay_diff) = if exec.failed {
+                let (phase, status, replay_diff) = if exec.failed {
                     let clean = strip_sandbox_escalation_hint(&exec.output);
                     (
-                        announce::update_failed_with_input(
-                            &call.id,
-                            &tool_name,
-                            &parsed_input,
-                            clean,
-                            permission_notice.as_deref(),
-                            Some(Value::String(clean.to_string())),
-                        ),
+                        ToolCallPhase::Failed {
+                            reason: clean.to_string(),
+                            permission_notice: permission_notice.clone(),
+                            input: Some(parsed_input.clone()),
+                        },
                         ToolExchangeStatus::Failed,
                         None,
                     )
                 } else {
                     let diff = pre_write
                         .and_then(|prior| build_editing_diff(&tool_name, &parsed_input, prior));
-                    let replay_diff = diff.as_ref().map(tool_exchange_diff_from_acp);
                     (
-                        announce::update_completed(
-                            &call.id,
-                            &tool_name,
-                            &parsed_input,
-                            &exec.output,
-                            diff,
-                            permission_notice.as_deref(),
-                        ),
+                        ToolCallPhase::Completed {
+                            input: parsed_input.clone(),
+                            output: exec.output.clone(),
+                            diff: diff.clone(),
+                            permission_notice: permission_notice.clone(),
+                        },
                         ToolExchangeStatus::Completed,
-                        replay_diff,
+                        diff,
                     )
                 };
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(update),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase,
+                    },
                 );
                 (exec.output, status, replay_diff, permission_notice)
             }
@@ -3569,7 +3581,7 @@ async fn execute_parallel_safe_calls(
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
     permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
@@ -3604,26 +3616,31 @@ async fn execute_parallel_safe_calls(
                         "Error: tool arguments are not valid JSON ({e}). \
                      Please retry with a valid JSON object matching the tool schema."
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCall(announce::initial_tool_call(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &Value::String(call.function.arguments.clone()),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Started {
+                                input: Value::String(call.function.arguments.clone()),
+                            },
+                        },
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCallUpdate(announce::update_failed(
-                            &call.id,
-                            &reason,
-                            Some(Value::String(reason.clone())),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Failed {
+                                reason: reason.clone(),
+                                permission_notice: None,
+                                input: None,
+                            },
+                        },
                     );
                     records.push(Some(ToolCallRecord {
                         call_id: call.id.clone(),
@@ -3651,26 +3668,31 @@ async fn execute_parallel_safe_calls(
                     .count(),
                 "rejecting parallel safe-tool call: rendered permission card would hide input",
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
-                    &call.id,
-                    &tool_name,
-                    kind,
-                    &parsed_input,
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::StartedOversized {
+                        input: parsed_input.clone(),
+                    },
+                },
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &reason,
-                    Some(Value::String(reason.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: reason.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3695,19 +3717,18 @@ async fn execute_parallel_safe_calls(
         )
         .await
         {
-            let (blocked_call, failed_update) =
-                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(blocked_call),
-            );
-            maybe_send_session_update(
-                notifications,
-                spawned_cx.cx(),
-                session_id,
-                SessionUpdate::ToolCallUpdate(failed_update),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Blocked {
+                        input: parsed_input.clone(),
+                        reason: message.clone(),
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3721,29 +3742,34 @@ async fn execute_parallel_safe_calls(
             continue;
         }
 
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCall(announce::initial_tool_call(
-                &call.id,
-                &tool_name,
-                kind,
-                &parsed_input,
-            )),
+            RuntimeEvent::ToolCall {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                phase: ToolCallPhase::Started {
+                    input: parsed_input.clone(),
+                },
+            },
         );
 
         if !advertised_this_request.contains(tool_name.as_str()) {
             let message = tool_unavailable_message(&tool_name);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &message,
-                    Some(Value::String(message.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: message.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3785,16 +3811,19 @@ async fn execute_parallel_safe_calls(
                 message,
                 permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
-                        &call.id,
-                        &message,
-                        permission_notice.as_deref(),
-                        Some(Value::String(message.clone())),
-                    )),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::Failed {
+                            reason: message.clone(),
+                            permission_notice: permission_notice.clone(),
+                            input: None,
+                        },
+                    },
                 );
                 records.push(Some(ToolCallRecord {
                     call_id: call.id.clone(),
@@ -3812,11 +3841,15 @@ async fn execute_parallel_safe_calls(
                 shell_sandboxed,
                 permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::InProgress,
+                    },
                 );
                 tracing::info!(
                     "executing concurrency-safe tool {} with args: {} (parallel_batch=true)",
@@ -3865,7 +3898,7 @@ async fn execute_parallel_safe_calls(
                         max_turns,
                         idle_timeout,
                         cancel,
-                        spawned_cx,
+                        event_sink,
                         permission_broker,
                         session_id,
                         sessions,
@@ -3943,37 +3976,36 @@ async fn execute_parallel_safe_calls(
 
     for (slot_index, ready, exec, nested_usage) in completed {
         turn_usage.add(nested_usage);
-        let (update, status) = if exec.failed {
+        let (phase, status) = if exec.failed {
             let clean = strip_sandbox_escalation_hint(&exec.output);
             (
-                announce::update_failed_with_input(
-                    &ready.call_id,
-                    &ready.tool_name,
-                    &ready.parsed_input,
-                    clean,
-                    ready.permission_notice.as_deref(),
-                    Some(Value::String(clean.to_string())),
-                ),
+                ToolCallPhase::Failed {
+                    reason: clean.to_string(),
+                    permission_notice: ready.permission_notice.clone(),
+                    input: Some(ready.parsed_input.clone()),
+                },
                 ToolExchangeStatus::Failed,
             )
         } else {
             (
-                announce::update_completed(
-                    &ready.call_id,
-                    &ready.tool_name,
-                    &ready.parsed_input,
-                    &exec.output,
-                    None,
-                    ready.permission_notice.as_deref(),
-                ),
+                ToolCallPhase::Completed {
+                    input: ready.parsed_input.clone(),
+                    output: exec.output.clone(),
+                    diff: None,
+                    permission_notice: ready.permission_notice.clone(),
+                },
                 ToolExchangeStatus::Completed,
             )
         };
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCallUpdate(update),
+            RuntimeEvent::ToolCall {
+                call_id: ready.call_id.clone(),
+                tool_name: ready.tool_name.clone(),
+                phase,
+            },
         );
         records[slot_index] = Some(ToolCallRecord {
             call_id: ready.call_id,
@@ -4002,23 +4034,6 @@ async fn execute_parallel_safe_calls(
         results: step_results,
         cancelled: cancel.is_cancelled(),
     }
-}
-
-fn blocked_tool_call_updates(
-    tool_call_id: &str,
-    tool_name: &str,
-    kind: ToolKind,
-    raw_input: &Value,
-    reason: &str,
-) -> (agent_client_protocol::schema::v1::ToolCall, ToolCallUpdate) {
-    (
-        announce::blocked_tool_call(tool_call_id, tool_name, kind, raw_input, reason),
-        announce::update_failed(
-            tool_call_id,
-            reason,
-            Some(Value::String(reason.to_string())),
-        ),
-    )
 }
 
 struct PureGateEvaluation {
@@ -5156,8 +5171,10 @@ fn trajectory_window_time_limit_notice(
 
 fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     tool_exchanges.iter().any(|exchange| {
-        matches!(exchange.tool_name.as_str(), "edit" | "write_file")
-            && !tool_result_failed(&exchange.result)
+        matches!(
+            exchange.tool_name.as_str(),
+            "edit" | "write_file" | "delete_file" | "move_file"
+        ) && !tool_result_failed(&exchange.result)
     })
 }
 
@@ -5169,20 +5186,25 @@ fn has_successful_training_file_change(
         if tool_result_failed(&exchange.result) {
             return false;
         }
-        let Some(path) = file_change_target_path(exchange) else {
-            return false;
-        };
-        packet.files.iter().any(|file| file.path == path)
+        file_change_target_paths(exchange)
+            .iter()
+            .any(|path| packet.files.iter().any(|file| file.path == *path))
     })
 }
 
-fn file_change_target_path(exchange: &ToolExchange) -> Option<String> {
-    if !matches!(exchange.tool_name.as_str(), "edit" | "write_file") {
-        return None;
-    }
-    let args = serde_json::from_str::<Value>(&exchange.arguments).ok()?;
-    let path = args.get("file_path")?.as_str()?;
-    normalize_tool_path(path)
+fn file_change_target_paths(exchange: &ToolExchange) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<Value>(&exchange.arguments) else {
+        return Vec::new();
+    };
+    let keys: &[&str] = match exchange.tool_name.as_str() {
+        "edit" | "write_file" | "delete_file" => &["file_path"],
+        "move_file" => &["source_path", "destination_path"],
+        _ => return Vec::new(),
+    };
+    keys.iter()
+        .filter_map(|key| args.get(*key).and_then(Value::as_str))
+        .filter_map(normalize_tool_path)
+        .collect()
 }
 
 fn normalize_tool_path(path: &str) -> Option<String> {
@@ -5679,7 +5701,7 @@ async fn execute_subagent(
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
     permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
@@ -5793,7 +5815,7 @@ async fn execute_subagent(
         cancel,
         noop_text,
         noop_thought,
-        spawned_cx,
+        event_sink,
         permission_broker,
         session_id.to_string(),
         sessions.clone(),
@@ -5877,18 +5899,18 @@ fn subagent_failure_message(subagent_name: &str, stop: &LoopStop) -> Option<Stri
 
 /// Send a `SessionNotification` and log on failure -- there is nothing
 /// useful we can do if the channel to the client is broken.
-/// Emit a `SessionUpdate` notification only when `mode == Live`. Used so
-/// subagent runs (`mode == Silent`) don't push their internal tool-call
-/// progress cards back to the ACP client -- the parent only sees the
-/// subagent's final answer as the `task` tool's result.
-fn maybe_send_session_update(
+/// Emit a runtime event only when `mode == Live`. Used so subagent runs
+/// (`mode == Silent`) don't push their internal tool-call progress back to
+/// the client -- the parent only sees the subagent's final answer as the
+/// `task` tool's result.
+fn maybe_emit_runtime_event(
     mode: NotificationMode,
-    cx: &ConnectionTo<Client>,
+    sink: &dyn EventSink,
     session_id: &str,
-    update: SessionUpdate,
+    event: RuntimeEvent,
 ) {
     if mode == NotificationMode::Live {
-        send_session_update(cx, session_id, update);
+        sink.emit(session_id, event);
     }
 }
 
@@ -5896,6 +5918,95 @@ fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: Sess
     let notification = SessionNotification::new(session_id.to_string(), update);
     if let Err(e) = cx.send_notification(notification) {
         tracing::warn!("failed to send session update: {e}");
+    }
+}
+
+/// Render a transport-neutral runtime event into the ACP `SessionUpdate`
+/// sequence the connected client expects. This is the ACP boundary for
+/// tool-loop progress: the loop emits `RuntimeEvent`s and this adapter
+/// (via `announce`) decides how they appear on the wire.
+fn acp_updates_for_event(event: RuntimeEvent) -> Vec<SessionUpdate> {
+    match event {
+        RuntimeEvent::Plan(plan) => vec![SessionUpdate::Plan(plan.to_acp())],
+        RuntimeEvent::ToolCall {
+            call_id,
+            tool_name,
+            phase,
+        } => {
+            let kind = ToolRegistry::tool_kind(&tool_name);
+            match phase {
+                ToolCallPhase::Started { input } => vec![SessionUpdate::ToolCall(
+                    announce::initial_tool_call(&call_id, &tool_name, kind, &input),
+                )],
+                ToolCallPhase::StartedOversized { input } => vec![SessionUpdate::ToolCall(
+                    announce::rejected_initial_tool_call(&call_id, &tool_name, kind, &input),
+                )],
+                ToolCallPhase::Blocked { input, reason } => vec![
+                    SessionUpdate::ToolCall(announce::blocked_tool_call(
+                        &call_id, &tool_name, kind, &input, &reason,
+                    )),
+                    SessionUpdate::ToolCallUpdate(announce::update_failed(
+                        &call_id,
+                        &reason,
+                        Some(Value::String(reason.clone())),
+                    )),
+                ],
+                ToolCallPhase::InProgress => vec![SessionUpdate::ToolCallUpdate(
+                    announce::update_in_progress(&call_id),
+                )],
+                ToolCallPhase::Failed {
+                    reason,
+                    permission_notice,
+                    input,
+                } => {
+                    let raw_output = Some(Value::String(reason.clone()));
+                    let update = match input {
+                        Some(input) => announce::update_failed_with_input(
+                            &call_id,
+                            &tool_name,
+                            &input,
+                            &reason,
+                            permission_notice.as_deref(),
+                            raw_output,
+                        ),
+                        None => announce::update_failed_with_notice(
+                            &call_id,
+                            &reason,
+                            permission_notice.as_deref(),
+                            raw_output,
+                        ),
+                    };
+                    vec![SessionUpdate::ToolCallUpdate(update)]
+                }
+                ToolCallPhase::Completed {
+                    input,
+                    output,
+                    diff,
+                    permission_notice,
+                } => vec![SessionUpdate::ToolCallUpdate(announce::update_completed(
+                    &call_id,
+                    &tool_name,
+                    &input,
+                    &output,
+                    diff.map(acp_diff_from_exchange_diff),
+                    permission_notice.as_deref(),
+                ))],
+            }
+        }
+    }
+}
+
+fn acp_diff_from_exchange_diff(diff: ToolExchangeDiff) -> Diff {
+    let mut acp = Diff::new(diff.path, diff.new_text);
+    acp.old_text = diff.old_text;
+    acp
+}
+
+impl EventSink for SpawnedCx<'_> {
+    fn emit(&self, session_id: &str, event: RuntimeEvent) {
+        for update in acp_updates_for_event(event) {
+            send_session_update(self.cx(), session_id, update);
+        }
     }
 }
 
@@ -5927,14 +6038,14 @@ fn capture_pre_write_text(
     }
 }
 
-/// Assemble a `Diff` block for a successful write/edit call from the parsed
+/// Assemble a `Diff` block for a successful write/edit/delete call from the parsed
 /// args plus the captured prior content. Returns `None` if we couldn't
 /// pull the path/content (in which case the caller falls back to text).
 fn build_editing_diff(
     tool_name: &str,
     parsed_input: &Value,
     prior: Option<String>,
-) -> Option<Diff> {
+) -> Option<ToolExchangeDiff> {
     let path = parsed_input
         .get("file_path")
         .or_else(|| parsed_input.get("path"))
@@ -5949,11 +6060,14 @@ fn build_editing_diff(
             let prior_text = prior.as_ref()?;
             apply_edit_args_for_diff(prior_text, parsed_input)?
         }
+        "delete_file" => String::new(),
         _ => return None,
     };
-    let mut diff = Diff::new(PathBuf::from(path), new_text);
-    diff.old_text = prior;
-    Some(diff)
+    Some(ToolExchangeDiff {
+        path: PathBuf::from(path),
+        old_text: prior,
+        new_text,
+    })
 }
 
 fn apply_edit_args_for_diff(prior_text: &str, parsed_input: &Value) -> Option<String> {
@@ -8034,6 +8148,36 @@ mod tests {
     }
 
     #[test]
+    fn file_change_tracking_counts_delete_and_both_move_paths() {
+        let deleted = file_exchange_for_test("delete_file", "src/lib.rs");
+        let moved = ToolExchange {
+            call_id: "call-move_file".to_string(),
+            tool_name: "move_file".to_string(),
+            arguments: serde_json::json!({
+                "source_path": "src/old.rs",
+                "destination_path": "src/new.rs"
+            })
+            .to_string(),
+            result: "Moved 'src/old.rs' to 'src/new.rs'".to_string(),
+            ..ToolExchange::default()
+        };
+
+        assert!(has_successful_file_change(std::slice::from_ref(&deleted)));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&deleted),
+            &training_packet_for_test("src/lib.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/old.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/new.rs")
+        ));
+    }
+
+    #[test]
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
         let packet = training_packet_for_test("src/lib.rs");
@@ -8318,6 +8462,16 @@ mod tests {
                 "edit",
                 ToolRegistry::tool_kind("edit"),
                 serde_json::json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
+            ),
+            (
+                "delete_file",
+                ToolRegistry::tool_kind("delete_file"),
+                serde_json::json!({"file_path": "app.js"}),
+            ),
+            (
+                "move_file",
+                ToolRegistry::tool_kind("move_file"),
+                serde_json::json!({"source_path": "app.js", "destination_path": "moved.js"}),
             ),
             (
                 "run_shell_command",
@@ -8754,13 +8908,25 @@ mod tests {
     #[test]
     fn blocked_tool_call_sequence_has_failed_card_and_terminal_update() {
         let reason = "Tool use denied: read-only mode forbids edits";
-        let (card, update) = blocked_tool_call_updates(
-            "call-write",
-            "write_file",
-            ToolRegistry::tool_kind("write_file"),
-            &serde_json::json!({"file_path": "app.js", "content": "x"}),
-            reason,
+        let updates = acp_updates_for_event(RuntimeEvent::ToolCall {
+            call_id: "call-write".to_string(),
+            tool_name: "write_file".to_string(),
+            phase: ToolCallPhase::Blocked {
+                input: serde_json::json!({"file_path": "app.js", "content": "x"}),
+                reason: reason.to_string(),
+            },
+        });
+        assert_eq!(
+            updates.len(),
+            2,
+            "blocked call renders card + terminal update"
         );
+        let SessionUpdate::ToolCall(card) = &updates[0] else {
+            panic!("expected a ToolCall card first");
+        };
+        let SessionUpdate::ToolCallUpdate(update) = &updates[1] else {
+            panic!("expected a ToolCallUpdate second");
+        };
 
         assert_eq!(card.tool_call_id.0.as_ref(), "call-write");
         assert_eq!(card.title, "Blocked Writing file");
@@ -8838,6 +9004,20 @@ mod tests {
             ),
             PureGateDecision::Prompt
         );
+    }
+
+    #[test]
+    fn accept_edits_sends_delete_and_move_to_the_client_permission_policy() {
+        for (kind, name) in [
+            (ToolKind::Delete, "delete_file"),
+            (ToolKind::Move, "move_file"),
+        ] {
+            assert_eq!(
+                decide(PermissionMode::AcceptEdits, kind, name, false, false),
+                PureGateDecision::Prompt,
+                "{name} must reach the client so headless auto can approve it"
+            );
+        }
     }
 
     #[test]

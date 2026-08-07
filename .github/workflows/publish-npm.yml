@@ -1,8 +1,9 @@
 name: Publish npm Packages
 
-# Manual workflow that packages an existing GitHub release as the six
-# @brokkai npm packages. It defaults to build-and-validate only; writing to
-# the npm registry requires explicitly checking the `publish` input.
+# Packages an existing GitHub release as the seven @brokkai npm packages. Version
+# tags dispatch this workflow only after CI, docs, crates.io, and release-asset
+# checks pass. Manual runs default to build-and-validate; registry writes require
+# the `publish` input and the npm-publish environment.
 #
 # Publishing uses npm trusted publishing (OIDC) — no long-lived npm token is
 # stored in the repository. The workflow is safe to re-run after a partial
@@ -29,8 +30,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
-    name: Build, validate${{ inputs.publish && ', and publish' || '' }}
+  build-and-validate:
+    name: Build and validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -39,6 +40,16 @@ jobs:
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Update npm (trusted publishing needs npm >= 11.5.1)
         run: |
@@ -73,6 +84,15 @@ jobs:
       - name: Smoke-test the built tarballs (linux-x64)
         run: node npm/test-npm-packages.mjs --dist npm/dist
 
+      - name: Regenerate all SDKs and build the TypeScript package
+        run: |
+          npm ci --prefix sdk/typescript
+          node scripts/generate-sdks.mjs
+          git diff --exit-code -- sdk/typescript/src/generated sdk/rust sdk/python
+          npm --prefix sdk/typescript test
+          mkdir -p npm/dist-sdk
+          npm pack ./sdk/typescript --pack-destination "$PWD/npm/dist-sdk"
+
       - name: Upload tarballs as workflow artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -85,6 +105,49 @@ jobs:
       - name: Show publication plan (dry run)
         run: node npm/publish-npm-packages.mjs --dist npm/dist
 
-      - name: Publish to npm
-        if: ${{ inputs.publish }}
+      - name: Upload the TypeScript SDK tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-sdk-${{ inputs.tag }}
+          path: npm/dist-sdk/*.tgz
+          if-no-files-found: error
+
+      - name: Show TypeScript SDK publication plan (dry run)
+        run: node sdk/typescript/scripts/publish.mjs --tarball npm/dist-sdk/*.tgz
+
+  publish:
+    name: Publish to npm
+    if: ${{ inputs.publish }}
+    needs: build-and-validate
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm (trusted publishing needs npm >= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Download validated npm packages
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-packages-${{ inputs.tag }}
+          path: npm/dist
+
+      - name: Download the validated TypeScript SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: typescript-sdk-${{ inputs.tag }}
+          path: npm/dist-sdk
+
+      - name: Publish and verify npm packages
         run: node npm/publish-npm-packages.mjs --dist npm/dist --yes-publish
+
+      - name: Publish and verify the TypeScript SDK
+        run: node sdk/typescript/scripts/publish.mjs --tarball npm/dist-sdk/*.tgz --yes-publish

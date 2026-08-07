@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.19";
+const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.21";
 
 struct SmokeCase {
     name: &'static str,
@@ -585,6 +585,26 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], true,
         "{}: should advertise mcpCapabilities.sse=true: {initialize}",
         case.name
+    );
+    // The ACP registry requires at least one advertised auth method; Anvil
+    // declares an explicit no-auth method instead of an empty list.
+    assert_eq!(
+        initialize["result"]["authMethods"][0]["id"], "none",
+        "{}: should advertise the no-auth authMethod: {initialize}",
+        case.name
+    );
+
+    // Clients may authenticate with any advertised method id, so "none" must
+    // succeed as a no-op while unknown ids are rejected.
+    let authenticate = client.request("authenticate", json!({ "methodId": "none" }));
+    assert_response_ok(&case, "authenticate", &authenticate, &client);
+    let bad_authenticate = client.request("authenticate", json!({ "methodId": "oauth" }));
+    assert_response_invalid_params_contains(
+        &case,
+        "authenticate",
+        &bad_authenticate,
+        "unknown authMethod id",
+        &client,
     );
 
     let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
