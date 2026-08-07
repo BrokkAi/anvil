@@ -1,19 +1,19 @@
 use anyhow::Context;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -69,7 +69,10 @@ const BIFROST_BINARY_NAME: &str = "bifrost";
 static PREPARED_BIFROST_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PREPARE_BIFROST_LOCK: Mutex<()> = Mutex::const_new(());
 
-#[derive(Debug)]
+/// `Clone` so a single terminal transport failure (the stdio reader task
+/// stopping) can be delivered to every caller that was waiting on that
+/// connection.
+#[derive(Debug, Clone)]
 pub enum McpError {
     Spawn(String),
     Io(String),
@@ -563,14 +566,20 @@ pub struct McpToolAnnotations {
     pub read_only_hint: Option<bool>,
 }
 
-/// JSON-RPC client for a long-lived stdio MCP subprocess.
+/// JSON-RPC client for a long-lived MCP server connection.
 ///
-/// Holds the child process for the lifetime of the client; the process is
-/// killed when the client is dropped (`kill_on_drop(true)`).
+/// For the stdio transport the client holds the subprocess for its own
+/// lifetime; the process is killed when the client is dropped
+/// (`kill_on_drop(true)`). The stdio protocol carries JSON-RPC messages either
+/// `Content-Length`-framed or line-delimited (see [`McpFraming`]).
 ///
-/// The MCP stdio protocol uses `Content-Length` framed JSON-RPC messages.
-/// Reads and writes are serialized through a single mutex because the existing
-/// tool loop dispatches tool calls sequentially within a session.
+/// `state` is the *connection identity*: which subprocess or HTTP session this
+/// client currently talks to. It is taken only to check liveness, to respawn a
+/// dead stdio subprocess, and to pick up the connection handle. It is **not**
+/// held across a request/response round trip on the stdio path -- see
+/// [`StdioConn`], whose reader task demultiplexes responses so that the
+/// parallel tool batches issued by `execute_parallel_safe_calls` overlap
+/// instead of queueing behind each other.
 pub struct McpClient {
     name: String,
     config: McpServerConfig,
@@ -582,11 +591,7 @@ pub struct McpClient {
 }
 
 enum McpClientState {
-    Stdio {
-        child: Box<Child>,
-        io: McpIo,
-        healthy: bool,
-    },
+    Stdio(Arc<StdioConn>),
     Http {
         client: reqwest::Client,
         url: String,
@@ -602,10 +607,211 @@ enum McpClientState {
     },
 }
 
-struct McpIo {
+/// One live stdio MCP subprocess, shared by every in-flight call to it.
+///
+/// A single JSON-RPC stream is multiplexed: a caller takes `writer` only for
+/// as long as it takes to serialize and flush one message, and then awaits a
+/// per-request oneshot registered in `shared.pending`. The dedicated reader
+/// task spawned by [`StdioConn::new`] is the only reader of the subprocess's
+/// stdout and routes each response to its caller by JSON-RPC id.
+struct StdioConn {
+    /// Only taken to kill the subprocess when the connection is retired.
+    child: Mutex<Child>,
+    writer: Mutex<StdioWriter>,
+    shared: Arc<StdioShared>,
+    /// Stops the reader task when this connection is dropped (on respawn, or
+    /// when the client goes away).
+    _reader: AbortOnDrop,
+}
+
+/// The part of a [`StdioConn`] that the reader task shares with the callers it
+/// serves. Separate from `StdioConn` so the task holds no reference to the
+/// subprocess it is reading from and cannot keep it alive.
+struct StdioShared {
+    /// Cleared by the first error that leaves the transport unusable, and by
+    /// the reader task when it stops. The next `tools/call` respawns the
+    /// subprocess.
+    healthy: AtomicBool,
+    pending: StdMutex<PendingResponses>,
+}
+
+/// Callers waiting for a stdio response, keyed by the JSON-RPC id of their
+/// request.
+enum PendingResponses {
+    Open(HashMap<i64, oneshot::Sender<Result<Value, McpError>>>),
+    /// The reader task has stopped, so nothing further can ever arrive on this
+    /// connection. Registering fails immediately with the error that killed
+    /// the reader instead of leaving the caller to wait out its own timeout.
+    Closed(McpError),
+}
+
+struct StdioWriter {
     writer: ChildStdin,
-    reader: BufReader<ChildStdout>,
     framing: McpFraming,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl StdioConn {
+    /// Take ownership of a subprocess whose handshake has already completed on
+    /// `reader`/`writer`, and start demultiplexing everything that follows.
+    fn new(
+        child: Child,
+        writer: StdioWriter,
+        reader: BufReader<ChildStdout>,
+        framing: McpFraming,
+        server: String,
+    ) -> Self {
+        let shared = Arc::new(StdioShared {
+            healthy: AtomicBool::new(true),
+            pending: StdMutex::new(PendingResponses::Open(HashMap::new())),
+        });
+        let task = tokio::spawn(stdio_reader_loop(
+            reader,
+            framing,
+            Arc::clone(&shared),
+            server,
+        ));
+        Self {
+            child: Mutex::new(child),
+            writer: Mutex::new(writer),
+            shared,
+            _reader: AbortOnDrop(task),
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.shared.healthy.load(Ordering::SeqCst)
+    }
+
+    /// Register a waiter for `id`. Must happen before the request is written:
+    /// otherwise a fast server could answer before the reader task has anyone
+    /// to hand the response to.
+    fn register(&self, id: i64) -> Result<oneshot::Receiver<Result<Value, McpError>>, McpError> {
+        let (sender, receiver) = oneshot::channel();
+        match &mut *self.pending() {
+            PendingResponses::Open(waiters) => {
+                let displaced = waiters.insert(id, sender);
+                debug_assert!(
+                    displaced.is_none(),
+                    "duplicate in-flight MCP request id {id}"
+                );
+                Ok(receiver)
+            }
+            PendingResponses::Closed(err) => Err(err.clone()),
+        }
+    }
+
+    /// Drop the waiter for `id` after abandoning the request (timeout or
+    /// cancellation), so a late response is discarded rather than routed.
+    fn deregister(&self, id: i64) {
+        if let PendingResponses::Open(waiters) = &mut *self.pending() {
+            waiters.remove(&id);
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, PendingResponses> {
+        self.shared
+            .pending
+            .lock()
+            .expect("mcp pending-response map poisoned")
+    }
+
+    async fn write_request(&self, id: i64, method: &str, params: Value) -> Result<(), McpError> {
+        write_request(&mut *self.writer.lock().await, id, method, params).await
+    }
+
+    async fn write_notification(&self, method: &str, params: Value) -> Result<(), McpError> {
+        write_notification(&mut *self.writer.lock().await, method, params).await
+    }
+
+    /// Retire the whole connection when one call fails in a way that leaves
+    /// the transport unusable: kill the subprocess so the next `tools/call`
+    /// respawns it.
+    async fn mark_unhealthy(&self, err: &McpError) {
+        if !err.leaves_client_unhealthy() {
+            return;
+        }
+        self.shared.healthy.store(false, Ordering::SeqCst);
+        let _ = self.child.lock().await.kill().await;
+    }
+}
+
+/// Sole reader of a stdio MCP server's stdout.
+///
+/// Routes each JSON-RPC response to the caller registered under its id. On
+/// stream error or EOF it fails every pending caller with that error, so a
+/// server that dies mid-flight does not leave a batch of calls waiting out
+/// their individual timeouts.
+async fn stdio_reader_loop(
+    mut reader: BufReader<ChildStdout>,
+    framing: McpFraming,
+    shared: Arc<StdioShared>,
+    server: String,
+) {
+    loop {
+        let message = match read_message(&mut reader, framing).await {
+            Ok(message) => message,
+            Err(err) => {
+                let waiters = {
+                    let mut pending = shared
+                        .pending
+                        .lock()
+                        .expect("mcp pending-response map poisoned");
+                    match std::mem::replace(&mut *pending, PendingResponses::Closed(err.clone())) {
+                        PendingResponses::Open(waiters) => waiters,
+                        PendingResponses::Closed(_) => return,
+                    }
+                };
+                shared.healthy.store(false, Ordering::SeqCst);
+                tracing::debug!(
+                    server = %server,
+                    %err,
+                    pending = waiters.len(),
+                    "mcp stdio reader stopped; failing pending calls"
+                );
+                for (_, waiter) in waiters {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+                return;
+            }
+        };
+        // Server-initiated requests and notifications carry `method`. Any id
+        // on them belongs to the server's own id space and must never be
+        // matched against our pending requests. We advertise no client
+        // capabilities, so there is nothing here to answer.
+        if message.get("method").is_some() {
+            tracing::debug!(server = %server, ?message, "ignoring server-initiated mcp message");
+            continue;
+        }
+        let Some(id) = message.get("id").and_then(Value::as_i64) else {
+            tracing::debug!(server = %server, ?message, "ignoring mcp message without a request id");
+            continue;
+        };
+        let waiter = {
+            let mut pending = shared
+                .pending
+                .lock()
+                .expect("mcp pending-response map poisoned");
+            match &mut *pending {
+                PendingResponses::Open(waiters) => waiters.remove(&id),
+                PendingResponses::Closed(_) => return,
+            }
+        };
+        match waiter {
+            Some(waiter) => {
+                let _ = waiter.send(jsonrpc_result(message));
+            }
+            // Abandoned by a timed-out or cancelled caller.
+            None => tracing::debug!(server = %server, id, "no waiter for mcp response"),
+        }
+    }
 }
 
 impl McpClient {
@@ -650,22 +856,23 @@ impl McpClient {
             .stdin
             .take()
             .ok_or_else(|| McpError::Spawn("missing stdin pipe".into()))?;
-        let reader = BufReader::new(
+        let mut reader = BufReader::new(
             child
                 .stdout
                 .take()
                 .ok_or_else(|| McpError::Spawn("missing stdout pipe".into()))?,
         );
 
-        let mut io = McpIo {
+        let mut writer = StdioWriter {
             writer,
-            reader,
             framing: config.framing,
         };
 
+        // The handshake is inherently sequential, so it reads the stream
+        // directly; the demultiplexing reader task takes over once it is done.
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
         write_request(
-            &mut io,
+            &mut writer,
             init_id,
             "initialize",
             json!({
@@ -678,14 +885,14 @@ impl McpClient {
             }),
         )
         .await?;
-        let init = read_response(&mut io, init_id).await?;
+        let init = read_response(&mut reader, config.framing, init_id).await?;
         let instructions = parse_server_instructions(&init);
 
-        write_notification(&mut io, "notifications/initialized", json!({})).await?;
+        write_notification(&mut writer, "notifications/initialized", json!({})).await?;
 
         let list_id = next_id.fetch_add(1, Ordering::SeqCst);
-        write_request(&mut io, list_id, "tools/list", json!({})).await?;
-        let list = read_response(&mut io, list_id).await?;
+        write_request(&mut writer, list_id, "tools/list", json!({})).await?;
+        let list = read_response(&mut reader, config.framing, list_id).await?;
         let tools = parse_tool_list(list, Some(config.name.as_str()))?;
         let read_only_hint_count = tools
             .iter()
@@ -704,11 +911,13 @@ impl McpClient {
         );
 
         Ok((
-            McpClientState::Stdio {
-                child: Box::new(child),
-                io,
-                healthy: true,
-            },
+            McpClientState::Stdio(Arc::new(StdioConn::new(
+                child,
+                writer,
+                reader,
+                config.framing,
+                config.name.clone(),
+            ))),
             tools,
             instructions,
         ))
@@ -863,7 +1072,9 @@ impl McpClient {
     /// next tool call reconnects it successfully.
     pub async fn instructions(&self) -> Option<String> {
         let state = self.state.lock().await;
-        if matches!(&*state, McpClientState::Stdio { healthy: false, .. }) {
+        if let McpClientState::Stdio(conn) = &*state
+            && !conn.healthy()
+        {
             return None;
         }
         self.instructions.read().await.clone()
@@ -904,7 +1115,7 @@ impl McpClient {
             None => self.state.lock().await,
         };
 
-        if matches!(&*state, McpClientState::Stdio { healthy: false, .. }) {
+        if matches!(&*state, McpClientState::Stdio(conn) if !conn.healthy()) {
             let (new_state, _, new_instructions) =
                 Self::spawn_connected(&self.config, &self.cwd, &self.next_id).await?;
             *state = new_state;
@@ -1021,46 +1232,60 @@ impl McpClient {
             return parse_tool_result(result);
         }
 
-        let McpClientState::Stdio { io, .. } = &mut *state else {
+        let McpClientState::Stdio(conn) = &*state else {
             unreachable!()
         };
-        if let Err(err) = write_request(
-            io,
-            id,
-            "tools/call",
-            json!({ "name": name, "arguments": args }),
-        )
-        .await
+        // Everything below runs *without* the state lock. Holding it across
+        // the response wait is what made a parallel tool batch serialize
+        // client-side; the reader task inside `conn` is what makes releasing
+        // it safe, because it -- not this caller -- owns the read half.
+        let conn = Arc::clone(conn);
+        drop(state);
+
+        let response = match conn.register(id) {
+            Ok(response) => response,
+            Err(err) => {
+                conn.mark_unhealthy(&err).await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = conn
+            .write_request(id, "tools/call", json!({ "name": name, "arguments": args }))
+            .await
         {
-            mark_unhealthy(&mut state, &err).await;
+            conn.deregister(id);
+            conn.mark_unhealthy(&err).await;
             return Err(err);
         }
 
-        let McpClientState::Stdio { io, .. } = &mut *state else {
-            unreachable!()
+        let response = async {
+            response.await.unwrap_or_else(|_| {
+                Err(McpError::Io(
+                    "mcp reader dropped the response channel".into(),
+                ))
+            })
         };
-        let read = read_response(io, id);
         let outcome = match cancel {
             Some(cancel) => {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
-                    result = tokio::time::timeout(timeout, read) => ToolCallOutcome::from(result),
+                    result = tokio::time::timeout(timeout, response) => ToolCallOutcome::from(result),
                 }
             }
-            None => ToolCallOutcome::from(tokio::time::timeout(timeout, read).await),
+            None => ToolCallOutcome::from(tokio::time::timeout(timeout, response).await),
         };
         let result = match outcome {
             ToolCallOutcome::Done(result) => result,
-            ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
-                tool: name.to_string(),
-            }),
+            ToolCallOutcome::Cancelled => {
+                conn.deregister(id);
+                Err(McpError::Cancelled {
+                    tool: name.to_string(),
+                })
+            }
             ToolCallOutcome::TimedOut => {
-                let McpClientState::Stdio { io, .. } = &mut *state else {
-                    unreachable!()
-                };
-                notify_cancelled_best_effort(write_notification(
-                    io,
+                conn.deregister(id);
+                notify_cancelled_best_effort(conn.write_notification(
                     "notifications/cancelled",
                     cancelled_notification_params(id),
                 ))
@@ -1074,7 +1299,7 @@ impl McpClient {
         let result = match result {
             Ok(result) => result,
             Err(err) => {
-                mark_unhealthy(&mut state, &err).await;
+                conn.mark_unhealthy(&err).await;
                 return Err(err);
             }
         };
@@ -1165,15 +1390,6 @@ fn parse_server_instructions(initialize_result: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|instructions| !instructions.is_empty())
         .map(str::to_string)
-}
-
-async fn mark_unhealthy(state: &mut McpClientState, err: &McpError) {
-    if err.leaves_client_unhealthy()
-        && let McpClientState::Stdio { child, healthy, .. } = state
-    {
-        *healthy = false;
-        let _ = child.kill().await;
-    }
 }
 
 fn build_http_headers(headers: &[McpEnvVar]) -> Result<reqwest::header::HeaderMap, McpError> {
@@ -1538,6 +1754,12 @@ fn parse_jsonrpc_response(value: Value, expected_id: i64) -> Result<Value, McpEr
     if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
         return Err(McpError::Protocol("HTTP response has unexpected id".into()));
     }
+    jsonrpc_result(value)
+}
+
+/// Split an already-id-matched JSON-RPC response object into its `result` or
+/// its `error`.
+fn jsonrpc_result(value: Value) -> Result<Value, McpError> {
     if let Some(error) = value.get("error") {
         return Err(McpError::JsonRpc {
             code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
@@ -1941,7 +2163,7 @@ mod http_tests {
 }
 
 async fn write_request(
-    io: &mut McpIo,
+    io: &mut StdioWriter,
     id: i64,
     method: &str,
     params: Value,
@@ -1958,7 +2180,11 @@ async fn write_request(
     .await
 }
 
-async fn write_notification(io: &mut McpIo, method: &str, params: Value) -> Result<(), McpError> {
+async fn write_notification(
+    io: &mut StdioWriter,
+    method: &str,
+    params: Value,
+) -> Result<(), McpError> {
     write_message(
         io,
         &json!({
@@ -1970,7 +2196,7 @@ async fn write_notification(io: &mut McpIo, method: &str, params: Value) -> Resu
     .await
 }
 
-async fn write_message(io: &mut McpIo, msg: &Value) -> Result<(), McpError> {
+async fn write_message(io: &mut StdioWriter, msg: &Value) -> Result<(), McpError> {
     let bytes = serde_json::to_vec(msg).map_err(|e| McpError::Io(format!("serialize: {e}")))?;
     match io.framing {
         McpFraming::ContentLength => {
@@ -2002,39 +2228,36 @@ async fn write_message(io: &mut McpIo, msg: &Value) -> Result<(), McpError> {
     Ok(())
 }
 
-async fn read_response(io: &mut McpIo, expected_id: i64) -> Result<Value, McpError> {
+/// Read the response to `expected_id` straight off the stream. Only valid
+/// before a [`StdioConn`] takes ownership of the reader -- that is, during the
+/// initialize/`tools/list` handshake, which has no concurrency to demultiplex.
+async fn read_response(
+    reader: &mut BufReader<ChildStdout>,
+    framing: McpFraming,
+    expected_id: i64,
+) -> Result<Value, McpError> {
     loop {
-        let value = read_message(io).await?;
+        let value = read_message(reader, framing).await?;
         if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
             tracing::debug!(?value, "skipping mcp message with unexpected id");
             continue;
         }
-        if let Some(error) = value.get("error") {
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            return Err(McpError::JsonRpc { code, message });
-        }
-        return value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| McpError::Protocol("response missing result".into()));
+        return jsonrpc_result(value);
     }
 }
 
-async fn read_message(io: &mut McpIo) -> Result<Value, McpError> {
-    if io.framing == McpFraming::Line {
-        return read_line_message(io).await;
+async fn read_message(
+    reader: &mut BufReader<ChildStdout>,
+    framing: McpFraming,
+) -> Result<Value, McpError> {
+    if framing == McpFraming::Line {
+        return read_line_message(reader).await;
     }
 
     let mut content_length = None;
     loop {
         let mut line = String::new();
-        let n = io
-            .reader
+        let n = reader
             .read_line(&mut line)
             .await
             .map_err(|e| McpError::Io(format!("read header: {e}")))?;
@@ -2059,17 +2282,16 @@ async fn read_message(io: &mut McpIo) -> Result<Value, McpError> {
     let len =
         content_length.ok_or_else(|| McpError::Protocol("missing Content-Length header".into()))?;
     let mut body = vec![0; len];
-    io.reader
+    reader
         .read_exact(&mut body)
         .await
         .map_err(|e| McpError::Io(format!("read body: {e}")))?;
     serde_json::from_slice(&body).map_err(|e| McpError::Protocol(format!("parse body: {e}")))
 }
 
-async fn read_line_message(io: &mut McpIo) -> Result<Value, McpError> {
+async fn read_line_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, McpError> {
     let mut line = String::new();
-    let n = io
-        .reader
+    let n = reader
         .read_line(&mut line)
         .await
         .map_err(|e| McpError::Io(format!("read line: {e}")))?;
@@ -2591,8 +2813,9 @@ mod tests {
         }
 
         // Round-trip two distinct tool calls so we exercise back-to-back use
-        // of the JSON-RPC reader/writer mutex (id correlation, sequential
-        // dispatch, response-shape branching) -- not just one-shot dispatch.
+        // of the demultiplexed JSON-RPC transport (id correlation, waiter
+        // registration, response-shape branching) -- not just one-shot
+        // dispatch.
         let result = client
             .call_tool("search_symbols", json!({ "patterns": ["McpClient"] }))
             .await
@@ -2991,5 +3214,173 @@ done
             .await
             .expect("next call should respawn and succeed");
         assert_eq!(value, json!("ok"));
+    }
+
+    /// Two `tools/call` requests issued concurrently must overlap on the
+    /// server instead of queueing client-side.
+    ///
+    /// Regression guard for the head-of-line block that
+    /// `call_tool_with_timeout` used to have: it held the client-state mutex
+    /// across both the request write *and* the response read, so a parallel
+    /// safe-tool batch (`execute_parallel_safe_calls`) serialized inside the
+    /// MCP client. Measured on the CodeScaleBench grep-hard symbols arm
+    /// (2026-08-07): 8029s of client-observed latency against 4158s of
+    /// server-side execution across 378 aligned calls.
+    ///
+    /// The fake server answers every call from a background subshell after
+    /// `SERVER_DELAY`, so two overlapping calls cost one delay and two
+    /// serialized calls cost two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_tool_calls_overlap_instead_of_serializing() {
+        const SERVER_DELAY: Duration = Duration::from_secs(2);
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let script = fake_mcp_script(
+            r#"      ( sleep 2
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}"
+      ) &"#,
+        );
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        let started = std::time::Instant::now();
+        let (first, second) = tokio::join!(
+            client.call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(60), None),
+            client.call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(60), None),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(first.expect("first call should succeed"), json!("ok"));
+        assert_eq!(second.expect("second call should succeed"), json!("ok"));
+        assert!(
+            elapsed >= SERVER_DELAY,
+            "sanity: the fake server should have delayed both calls, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < SERVER_DELAY + SERVER_DELAY / 2,
+            "two concurrent MCP calls of {SERVER_DELAY:?} each took {elapsed:?}; \
+             they are serializing client-side instead of overlapping"
+        );
+    }
+
+    /// Responses that come back out of order are routed by JSON-RPC id, not by
+    /// arrival order: the slow call keeps waiting and each caller gets its own
+    /// result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn out_of_order_responses_route_to_their_own_callers() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        // Echo the requested tool name back in the result so a mis-routed
+        // response is visible to the caller, and answer `slow_tool` late so
+        // the second request's response overtakes the first's.
+        let script = fake_mcp_script(
+            r#"      tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
+      case "$tool" in
+        slow_tool )
+          ( sleep 2
+            printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$tool\"}]}}"
+          ) &
+          ;;
+        * )
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$tool\"}]}}"
+          ;;
+      esac"#,
+        );
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        let started = std::time::Instant::now();
+        let slow = async {
+            let value = client
+                .call_tool_with_timeout("slow_tool", json!({}), Duration::from_secs(60), None)
+                .await
+                .expect("slow call should succeed");
+            (value, started.elapsed())
+        };
+        let fast = async {
+            // Give the slow request a head start so its id is issued first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let value = client
+                .call_tool_with_timeout("fast_tool", json!({}), Duration::from_secs(60), None)
+                .await
+                .expect("fast call should succeed");
+            (value, started.elapsed())
+        };
+        let ((slow_value, slow_at), (fast_value, fast_at)) = tokio::join!(slow, fast);
+
+        assert_eq!(slow_value, json!("slow_tool"));
+        assert_eq!(fast_value, json!("fast_tool"));
+        assert!(
+            fast_at < slow_at,
+            "the later request's response arrived first, so it must also \
+             complete first: fast at {fast_at:?}, slow at {slow_at:?}"
+        );
+    }
+
+    /// When the server closes its stdout while requests are in flight, every
+    /// pending caller fails immediately with the transport error instead of
+    /// waiting out its own timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_death_fails_all_pending_calls_promptly() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let pending_marker = tmp.path().join("pending");
+        let script = fake_mcp_script(&format!(
+            r#"      case "$line" in
+        *hang_tool* )
+          : > '{marker}'
+          ;;
+        * )
+          exit 0
+          ;;
+      esac"#,
+            marker = pending_marker.display()
+        ));
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        // `hang_tool` is accepted and never answered; `kill_tool` then makes
+        // the server exit, closing the stream with one call still pending.
+        let hanging = async {
+            client
+                .call_tool_with_timeout("hang_tool", json!({}), Duration::from_secs(120), None)
+                .await
+        };
+        let killing = async {
+            wait_for_path(&pending_marker).await;
+            client
+                .call_tool_with_timeout("kill_tool", json!({}), Duration::from_secs(120), None)
+                .await
+        };
+
+        let (hanging, killing) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(hanging, killing)
+        })
+        .await
+        .expect("pending MCP calls must fail when the server closes the stream");
+
+        let hanging = hanging.expect_err("the unanswered call must fail");
+        assert!(
+            matches!(hanging, McpError::Io(_)),
+            "expected an io error for the pending call, got {hanging}"
+        );
+        let killing = killing.expect_err("the call that killed the server must fail");
+        assert!(
+            matches!(killing, McpError::Io(_)),
+            "expected an io error for the second call, got {killing}"
+        );
     }
 }
