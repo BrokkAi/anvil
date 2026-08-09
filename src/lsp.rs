@@ -717,15 +717,28 @@ fn language_id(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Root for an absolute path in platform-appropriate form: a drive
+    /// letter on Windows (`C:`), `/` elsewhere. `Url::from_file_path` only
+    /// accepts truly absolute paths, so the cases must not use `/tmp` on
+    /// Windows.
+    fn test_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\tmp")
+        } else {
+            PathBuf::from("/tmp")
+        }
+    }
+
     #[test]
     fn file_uri_round_trips_through_encoding() {
+        let root = test_root();
         let cases = [
-            PathBuf::from("/tmp/plain.rs"),
-            PathBuf::from("/tmp/with space.rs"),
-            PathBuf::from("/tmp/with#hash.rs"),
-            PathBuf::from("/tmp/with%percent.rs"),
-            PathBuf::from("/tmp/caf\u{e9}.rs"),
-            PathBuf::from("/tmp/日本語/ログ.rs"),
+            root.join("plain.rs"),
+            root.join("with space.rs"),
+            root.join("with#hash.rs"),
+            root.join("with%percent.rs"),
+            root.join("caf\u{e9}.rs"),
+            root.join("日本語/ログ.rs"),
         ];
         for path in cases {
             let uri = file_uri(&path);
@@ -740,18 +753,41 @@ mod tests {
 
     #[test]
     fn path_from_file_uri_decodes_inbound_percent_encoding() {
-        assert_eq!(
-            path_from_file_uri("file:///tmp/my%20file.rs"),
-            Some(PathBuf::from("/tmp/my file.rs"))
-        );
-        assert_eq!(
-            path_from_file_uri("file:///tmp/with%23hash.rs"),
-            Some(PathBuf::from("/tmp/with#hash.rs"))
-        );
-        assert_eq!(
-            path_from_file_uri("file:///tmp/caf%C3%A9.rs"),
-            Some(PathBuf::from("/tmp/caf\u{e9}.rs"))
-        );
+        let (uri, expected) = if cfg!(windows) {
+            (
+                "file:///C:/tmp/my%20file.rs",
+                PathBuf::from("C:\\tmp\\my file.rs"),
+            )
+        } else {
+            ("file:///tmp/my%20file.rs", PathBuf::from("/tmp/my file.rs"))
+        };
+        assert_eq!(path_from_file_uri(uri), Some(expected));
+
+        let (uri, expected) = if cfg!(windows) {
+            (
+                "file:///C:/tmp/with%23hash.rs",
+                PathBuf::from("C:\\tmp\\with#hash.rs"),
+            )
+        } else {
+            (
+                "file:///tmp/with%23hash.rs",
+                PathBuf::from("/tmp/with#hash.rs"),
+            )
+        };
+        assert_eq!(path_from_file_uri(uri), Some(expected));
+
+        let (uri, expected) = if cfg!(windows) {
+            (
+                "file:///C:/tmp/caf%C3%A9.rs",
+                PathBuf::from("C:\\tmp\\caf\u{e9}.rs"),
+            )
+        } else {
+            (
+                "file:///tmp/caf%C3%A9.rs",
+                PathBuf::from("/tmp/caf\u{e9}.rs"),
+            )
+        };
+        assert_eq!(path_from_file_uri(uri), Some(expected));
     }
 
     #[test]
