@@ -77,6 +77,8 @@ pub struct SetupState {
     pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<crate::lsp::LspSettings>,
     /// Optional install-wide allowlist for the model-facing tool catalog.
     /// Absent means unrestricted; an explicitly empty list hides every tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +209,10 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
 
 pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
     update(|state| state.mcp_servers = Some(servers))
+}
+
+pub fn remember_lsp_settings(settings: crate::lsp::LspSettings) -> Result<()> {
+    update(|state| state.lsp = Some(settings))
 }
 
 pub fn read_allowed_tools() -> Option<Vec<String>> {

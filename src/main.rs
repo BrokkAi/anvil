@@ -28,6 +28,7 @@ mod infer;
 mod installer;
 mod kimi_auth;
 mod llm_client;
+mod lsp;
 mod mcp;
 mod multi_backend;
 mod openai_providers;

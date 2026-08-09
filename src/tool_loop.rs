@@ -6350,7 +6350,10 @@ mod tests {
             Arc::new(crate::skills::SkillRegistry::default()),
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
-            false,
+            crate::tools::ToolRegistryOptions {
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
         )
         .await;
         (cwd, registry)
@@ -8579,7 +8582,10 @@ mod tests {
                 command: command.to_string(),
                 timeout: Duration::from_secs(5),
             }],
-            false,
+            crate::tools::ToolRegistryOptions {
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
         )
         .await;
         (cwd, registry)
