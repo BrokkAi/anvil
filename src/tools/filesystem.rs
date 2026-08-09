@@ -107,6 +107,14 @@ pub fn edit_file(
     edit_file_in_roots(cwd, &[], path, old_string, new_string, replace_all)
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct EditFileEntry {
+    pub old_string: String,
+    pub new_string: String,
+    pub replace_all: bool,
+}
+
+#[cfg(test)]
 pub fn edit_file_in_roots(
     cwd: &Path,
     additional_roots: &[std::path::PathBuf],
@@ -115,10 +123,56 @@ pub fn edit_file_in_roots(
     new_string: &str,
     replace_all: bool,
 ) -> ToolResult {
-    if old_string.is_empty() {
+    edit_file_entries_in_roots(
+        cwd,
+        additional_roots,
+        path,
+        &[EditFileEntry {
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            replace_all,
+        }],
+    )
+}
+
+/// Recovery instructions appended to a multi-entry `edit` failure.
+///
+/// A batch stops at the first failing entry and keeps every earlier entry
+/// applied, so the file is left in a state that neither the original request
+/// nor a naive retry describes: re-sending the whole batch would fail again
+/// on entries whose `old_string` is already gone. Spelling out what landed,
+/// what was never attempted, and what to send next turns that partial state
+/// into a mechanical next step instead of a guess.
+///
+/// `failed_index` is the 0-based index reported as `edits[{failed_index}]`;
+/// the entry numbers here are 1-based, matching how the caller counts the
+/// list it wrote.
+fn batch_recovery_script(failed_index: usize, total: usize) -> String {
+    let applied_clause = match failed_index {
+        0 => "No entries were applied.".to_string(),
+        1 => "Entry 1 was already applied.".to_string(),
+        applied => format!("Entries 1-{applied} were already applied."),
+    };
+    let unapplied_clause = match total.saturating_sub(failed_index + 1) {
+        0 => String::new(),
+        1 => format!("Entry {total} was NOT applied. "),
+        _ => format!("Entries {}-{total} were NOT applied. ", failed_index + 2),
+    };
+    format!(
+        "{applied_clause} {unapplied_clause}Re-read the file and re-issue only the failed and unapplied entries."
+    )
+}
+
+pub fn edit_file_entries_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+    edits: &[EditFileEntry],
+) -> ToolResult {
+    if edits.is_empty() {
         return ToolResult {
             status: ToolStatus::RequestError,
-            output: "`old_string` must not be empty".to_string(),
+            output: "`edits` must contain at least one entry".to_string(),
         };
     }
 
@@ -131,7 +185,7 @@ pub fn edit_file_in_roots(
             };
         }
     };
-    let content = match read_bounded_text(crate::sandbox_backend::global(), &resolved) {
+    let mut content = match read_bounded_text(crate::sandbox_backend::global(), &resolved) {
         Ok(Some(content)) => content,
         Ok(None) => {
             return ToolResult {
@@ -147,54 +201,502 @@ pub fn edit_file_in_roots(
         }
     };
 
-    let matches = content.matches(old_string).count();
-    if matches == 0 {
-        return ToolResult {
-            status: ToolStatus::RequestError,
-            output: format!("No occurrences of `old_string` found in '{path}'"),
+    let single_entry = edits.len() == 1;
+    let mut applied_entries = 0usize;
+    let mut total_replacements = 0usize;
+    let mut used_whitespace_match = false;
+    for (index, edit) in edits.iter().enumerate() {
+        let result = match apply_edit_to_content(path, &content, edit) {
+            Ok(result) => result,
+            Err(mut result) => {
+                if !single_entry {
+                    result.output = format!(
+                        "Applied {applied_entries} edit entr{} before failure at edits[{index}]: {}\n\n{}",
+                        if applied_entries == 1 { "y" } else { "ies" },
+                        result.output,
+                        batch_recovery_script(index, edits.len())
+                    );
+                }
+                return result;
+            }
         };
-    }
-    if !replace_all && matches > 1 {
-        return ToolResult {
-            status: ToolStatus::RequestError,
-            output: format!(
-                "`old_string` occurs {matches} times in '{path}'. Provide more context or set `replace_all` to true."
-            ),
-        };
+        let updated = result.updated;
+        match atomic_write(&resolved, updated.as_bytes()) {
+            Ok(()) => {
+                content = updated;
+                applied_entries += 1;
+                total_replacements += result.replacements;
+                used_whitespace_match |= result.used_whitespace_match;
+            }
+            Err(e) => {
+                return ToolResult {
+                    status: ToolStatus::RequestError,
+                    output: format!("Failed to edit '{}': {}", path, e),
+                };
+            }
+        }
     }
 
-    let updated = if replace_all {
-        content.replace(old_string, new_string)
+    let whitespace_note = if used_whitespace_match {
+        " (matched ignoring whitespace differences)"
     } else {
-        content.replacen(old_string, new_string, 1)
+        ""
     };
+    ToolResult {
+        status: ToolStatus::Success,
+        output: if single_entry {
+            format!(
+                "Edited '{path}' ({total_replacements} replacement{}){whitespace_note}",
+                if total_replacements == 1 { "" } else { "s" },
+            )
+        } else {
+            format!(
+                "Edited '{path}' ({total_replacements} replacement{} across {applied_entries} edit entries){whitespace_note}",
+                if total_replacements == 1 { "" } else { "s" },
+            )
+        },
+    }
+}
+
+struct EditApplyResult {
+    updated: String,
+    replacements: usize,
+    used_whitespace_match: bool,
+}
+
+fn apply_edit_to_content(
+    path: &str,
+    content: &str,
+    edit: &EditFileEntry,
+) -> Result<EditApplyResult, ToolResult> {
+    if edit.old_string.is_empty() {
+        return Err(ToolResult {
+            status: ToolStatus::RequestError,
+            output: "`old_string` must not be empty".to_string(),
+        });
+    }
+
+    let matches = content.matches(&edit.old_string).count();
+    if matches > 0 {
+        if !edit.replace_all && matches > 1 {
+            return Err(ToolResult {
+                status: ToolStatus::RequestError,
+                output: format!(
+                    "`old_string` occurs {matches} times in '{path}'. Provide more context or set `replace_all` to true."
+                ),
+            });
+        }
+
+        let updated = if edit.replace_all {
+            content.replace(&edit.old_string, &edit.new_string)
+        } else {
+            content.replacen(&edit.old_string, &edit.new_string, 1)
+        };
+        ensure_edit_size(path, &updated)?;
+        return Ok(EditApplyResult {
+            updated,
+            replacements: matches,
+            used_whitespace_match: false,
+        });
+    }
+
+    if let Some(result) = apply_line_run_edit(
+        content,
+        &edit.old_string,
+        &edit.new_string,
+        edit.replace_all,
+        WhitespaceMode::TrimTrailing,
+    )? {
+        ensure_edit_size(path, &result.updated)?;
+        return Ok(result);
+    }
+
+    if let Some(result) = apply_line_run_edit(
+        content,
+        &edit.old_string,
+        &edit.new_string,
+        edit.replace_all,
+        WhitespaceMode::TrimBoth,
+    )? {
+        ensure_edit_size(path, &result.updated)?;
+        return Ok(result);
+    }
+
+    Err(ToolResult {
+        status: ToolStatus::RequestError,
+        output: format!("No occurrences of `old_string` found in '{path}'"),
+    })
+}
+
+fn ensure_edit_size(path: &str, updated: &str) -> Result<(), ToolResult> {
     if updated.len() > WRITE_MAX_BYTES {
-        return ToolResult {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: format!(
                 "Edited content for '{path}' is {} bytes, exceeds cap of {WRITE_MAX_BYTES}",
                 updated.len()
             ),
-        };
+        });
     }
-    match atomic_write(&resolved, updated.as_bytes()) {
-        Ok(()) => ToolResult {
-            status: ToolStatus::Success,
-            output: format!(
-                "Edited '{path}' ({matches} replacement{})",
-                if matches == 1 { "" } else { "s" }
-            ),
-        },
-        Err(e) => ToolResult {
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WhitespaceMode {
+    TrimTrailing,
+    TrimBoth,
+}
+
+struct LogicalLine<'a> {
+    text: &'a str,
+    start: usize,
+    end_with_terminator: usize,
+    terminator: &'a str,
+}
+
+fn split_logical_lines(content: &str) -> Vec<LogicalLine<'_>> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            let (text_end, terminator_start) =
+                if idx > start && content.as_bytes()[idx - 1] == b'\r' {
+                    (idx - 1, idx - 1)
+                } else {
+                    (idx, idx)
+                };
+            lines.push(LogicalLine {
+                text: &content[start..text_end],
+                start,
+                end_with_terminator: idx + 1,
+                terminator: &content[terminator_start..idx + 1],
+            });
+            start = idx + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(LogicalLine {
+            text: &content[start..],
+            start,
+            end_with_terminator: content.len(),
+            terminator: "",
+        });
+    }
+    lines
+}
+
+fn apply_line_run_edit(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    mode: WhitespaceMode,
+) -> Result<Option<EditApplyResult>, ToolResult> {
+    let content_lines = split_logical_lines(content);
+    let old_lines = split_logical_lines(old_string);
+    if old_lines.is_empty() || old_lines.len() > content_lines.len() {
+        return Ok(None);
+    }
+
+    let mut matches = Vec::new();
+    let mut start = 0usize;
+    while start + old_lines.len() <= content_lines.len() {
+        if line_run_matches(
+            &content_lines[start..start + old_lines.len()],
+            &old_lines,
+            mode,
+        ) {
+            matches.push(start);
+            start += old_lines.len();
+        } else {
+            start += 1;
+        }
+    }
+
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if !replace_all && matches.len() > 1 {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
-            output: format!("Failed to edit '{}': {}", path, e),
-        },
+            output: format!(
+                "Whitespace-insensitive matching found {} candidates for `old_string`. Provide more context or set `replace_all` to true.",
+                matches.len()
+            ),
+        });
     }
+
+    let new_lines = split_logical_lines(new_string);
+    let mut updated = String::with_capacity(content.len() + new_string.len());
+    let mut last_byte = 0usize;
+    for match_start in matches.iter().copied() {
+        let first_line = &content_lines[match_start];
+        let last_line = &content_lines[match_start + old_lines.len() - 1];
+        updated.push_str(&content[last_byte..first_line.start]);
+        let replacement = match mode {
+            WhitespaceMode::TrimTrailing => build_replacement_block(
+                &new_lines,
+                first_line.terminator,
+                !last_line.terminator.is_empty(),
+                None,
+            ),
+            WhitespaceMode::TrimBoth => {
+                let delta = indent_delta(first_line.text, old_lines[0].text);
+                build_replacement_block(
+                    &new_lines,
+                    first_line.terminator,
+                    !last_line.terminator.is_empty(),
+                    Some(delta),
+                )
+            }
+        };
+        updated.push_str(&replacement);
+        last_byte = last_line.end_with_terminator;
+    }
+    updated.push_str(&content[last_byte..]);
+
+    Ok(Some(EditApplyResult {
+        updated,
+        replacements: matches.len(),
+        used_whitespace_match: true,
+    }))
+}
+
+fn line_run_matches(
+    content_lines: &[LogicalLine<'_>],
+    old_lines: &[LogicalLine<'_>],
+    mode: WhitespaceMode,
+) -> bool {
+    content_lines
+        .iter()
+        .zip(old_lines.iter())
+        .all(|(content_line, old_line)| match mode {
+            WhitespaceMode::TrimTrailing => {
+                trim_trailing_horizontal(content_line.text)
+                    == trim_trailing_horizontal(old_line.text)
+            }
+            WhitespaceMode::TrimBoth => {
+                trim_horizontal(content_line.text) == trim_horizontal(old_line.text)
+            }
+        })
+}
+
+fn build_replacement_block(
+    new_lines: &[LogicalLine<'_>],
+    fallback_terminator: &str,
+    terminate_last: bool,
+    indent_delta: Option<IndentDelta<'_>>,
+) -> String {
+    if new_lines.is_empty() {
+        return String::new();
+    }
+
+    let line_terminator = if fallback_terminator.is_empty() {
+        "\n"
+    } else {
+        fallback_terminator
+    };
+    let mut replacement = String::new();
+    for (index, line) in new_lines.iter().enumerate() {
+        if let Some(delta) = indent_delta {
+            replacement.push_str(&apply_indent_delta(line.text, delta));
+        } else {
+            replacement.push_str(line.text);
+        }
+        if index + 1 < new_lines.len() || terminate_last {
+            replacement.push_str(line_terminator);
+        }
+    }
+    replacement
+}
+
+#[derive(Clone, Copy)]
+enum IndentDelta<'a> {
+    Add(&'a str),
+    Remove(usize),
+}
+
+fn indent_delta<'a>(file_line: &'a str, old_line: &'a str) -> IndentDelta<'a> {
+    let file_indent = leading_horizontal_whitespace(file_line);
+    let old_indent = leading_horizontal_whitespace(old_line);
+    if file_indent.len() >= old_indent.len() {
+        IndentDelta::Add(&file_indent[old_indent.len()..])
+    } else {
+        IndentDelta::Remove(old_indent.len() - file_indent.len())
+    }
+}
+
+fn apply_indent_delta(line: &str, delta: IndentDelta<'_>) -> String {
+    match delta {
+        IndentDelta::Add(prefix) => {
+            let mut adjusted = String::with_capacity(prefix.len() + line.len());
+            adjusted.push_str(prefix);
+            adjusted.push_str(line);
+            adjusted
+        }
+        IndentDelta::Remove(bytes_to_remove) => {
+            let removable = leading_horizontal_whitespace(line)
+                .len()
+                .min(bytes_to_remove);
+            line[removable..].to_string()
+        }
+    }
+}
+
+fn trim_horizontal(line: &str) -> &str {
+    trim_trailing_horizontal(line.trim_start_matches([' ', '\t']))
+}
+
+fn trim_trailing_horizontal(line: &str) -> &str {
+    line.trim_end_matches([' ', '\t'])
+}
+
+fn leading_horizontal_whitespace(line: &str) -> &str {
+    let prefix_len = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    &line[..prefix_len]
 }
 
 #[cfg(test)]
 pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
     write_file_in_roots(cwd, &[], path, content)
+}
+
+fn requested_path(cwd: &Path, path: &str) -> std::path::PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn leaf_is_symlink(cwd: &Path, path: &str) -> bool {
+    std::fs::symlink_metadata(requested_path(cwd, path))
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub fn delete_file(cwd: &Path, path: &str) -> ToolResult {
+    delete_file_in_roots(cwd, &[], path)
+}
+
+pub fn delete_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+) -> ToolResult {
+    let resolved = match super::safe_resolve_in_roots(cwd, additional_roots, path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: error,
+            };
+        }
+    };
+    if leaf_is_symlink(cwd, path) {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to delete symlink '{path}'"),
+        };
+    }
+    if !resolved.is_file() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to delete '{path}': not a regular file"),
+        };
+    }
+    match std::fs::remove_file(&resolved) {
+        Ok(()) => ToolResult {
+            status: ToolStatus::Success,
+            output: format!("Deleted '{path}'"),
+        },
+        Err(error) => ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Failed to delete '{path}': {error}"),
+        },
+    }
+}
+
+#[cfg(test)]
+pub fn move_file(cwd: &Path, source_path: &str, destination_path: &str) -> ToolResult {
+    move_file_in_roots(cwd, &[], source_path, destination_path)
+}
+
+pub fn move_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    source_path: &str,
+    destination_path: &str,
+) -> ToolResult {
+    let source = match super::safe_resolve_in_roots(cwd, additional_roots, source_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: error,
+            };
+        }
+    };
+    if leaf_is_symlink(cwd, source_path) {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to move symlink '{source_path}'"),
+        };
+    }
+    if !source.is_file() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to move '{source_path}': not a regular file"),
+        };
+    }
+
+    let destination =
+        match super::safe_resolve_for_write_in_roots(cwd, additional_roots, destination_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return ToolResult {
+                    status: ToolStatus::RequestError,
+                    output: error,
+                };
+            }
+        };
+    if source == destination {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: "Source and destination refer to the same file".to_string(),
+        };
+    }
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Refusing to overwrite existing destination '{destination_path}'"),
+        };
+    }
+    if let Some(parent) = destination.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return ToolResult {
+            status: ToolStatus::InternalError,
+            output: format!(
+                "Failed to create directories for destination '{destination_path}': {error}"
+            ),
+        };
+    }
+    match std::fs::rename(&source, &destination) {
+        Ok(()) => ToolResult {
+            status: ToolStatus::Success,
+            output: format!("Moved '{source_path}' to '{destination_path}'"),
+        },
+        Err(error) => ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Failed to move '{source_path}' to '{destination_path}': {error}"),
+        },
+    }
 }
 
 pub fn write_file_in_roots(
@@ -728,6 +1230,151 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    #[test]
+    fn delete_file_removes_only_regular_files() {
+        let cwd = fresh_tmp_dir("delete-file");
+        std::fs::write(cwd.join("old.txt"), "old").unwrap();
+        std::fs::create_dir(cwd.join("directory")).unwrap();
+
+        let deleted = delete_file(&cwd, "old.txt");
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!cwd.join("old.txt").exists());
+
+        let missing = delete_file(&cwd, "old.txt");
+        assert!(matches!(missing.status, ToolStatus::RequestError));
+
+        let directory = delete_file(&cwd, "directory");
+        assert!(matches!(directory.status, ToolStatus::RequestError));
+        assert!(cwd.join("directory").is_dir());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn move_file_renames_without_overwriting_and_creates_parents() {
+        let cwd = fresh_tmp_dir("move-file");
+        std::fs::write(cwd.join("old.txt"), "old").unwrap();
+
+        let moved = move_file(&cwd, "old.txt", "nested/new.txt");
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(!cwd.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("nested/new.txt")).unwrap(),
+            "old"
+        );
+
+        std::fs::write(cwd.join("another.txt"), "another").unwrap();
+        let collision = move_file(&cwd, "another.txt", "nested/new.txt");
+        assert!(matches!(collision.status, ToolStatus::RequestError));
+        assert!(collision.output.contains("Refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("another.txt")).unwrap(),
+            "another"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("nested/new.txt")).unwrap(),
+            "old"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn delete_and_move_file_enforce_workspace_roots() {
+        let cwd = fresh_tmp_dir("mutate-root-cwd");
+        let outside = fresh_tmp_dir("mutate-root-outside");
+        let outside_file = outside.join("outside.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        std::fs::write(cwd.join("inside.txt"), "inside").unwrap();
+
+        let deleted = delete_file(&cwd, outside_file.to_str().unwrap());
+        assert!(matches!(deleted.status, ToolStatus::RequestError));
+        assert!(outside_file.exists());
+
+        let moved_source = move_file(&cwd, outside_file.to_str().unwrap(), "moved-inside.txt");
+        assert!(matches!(moved_source.status, ToolStatus::RequestError));
+        assert!(outside_file.exists());
+
+        let moved_destination = move_file(
+            &cwd,
+            "inside.txt",
+            outside.join("moved-outside.txt").to_str().unwrap(),
+        );
+        assert!(matches!(moved_destination.status, ToolStatus::RequestError));
+        assert!(cwd.join("inside.txt").exists());
+        assert!(!outside.join("moved-outside.txt").exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn delete_and_move_file_accept_additional_workspace_roots() {
+        let cwd = fresh_tmp_dir("mutate-additional-cwd");
+        let additional = fresh_tmp_dir("mutate-additional-root");
+        let source = additional.join("source.txt");
+        let destination = additional.join("nested/destination.txt");
+        std::fs::write(&source, "content").unwrap();
+
+        let moved = move_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        );
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(!source.exists());
+        assert!(destination.exists());
+
+        let deleted = delete_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            destination.to_str().unwrap(),
+        );
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!destination.exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_and_move_file_refuse_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = fresh_tmp_dir("mutate-symlink");
+        std::fs::write(cwd.join("target.txt"), "target").unwrap();
+        symlink("target.txt", cwd.join("link.txt")).unwrap();
+
+        let deleted = delete_file(&cwd, "link.txt");
+        assert!(matches!(deleted.status, ToolStatus::RequestError));
+        assert!(cwd.join("link.txt").symlink_metadata().is_ok());
+        assert!(cwd.join("target.txt").exists());
+
+        let moved = move_file(&cwd, "link.txt", "moved.txt");
+        assert!(matches!(moved.status, ToolStatus::RequestError));
+        assert!(cwd.join("link.txt").symlink_metadata().is_ok());
+        assert!(!cwd.join("moved.txt").exists());
+        assert!(cwd.join("target.txt").exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
     /// `write_file` creates intermediate directories that don't exist yet
     /// (mkdir -p semantics) -- otherwise the LLM would have to chain a
     /// `run_shell_command mkdir` for every nested write.
@@ -1079,6 +1726,443 @@ mod tests {
 
         let r = edit_file(&cwd, "a.txt", "x", "z", true);
         assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "z y z\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_exact_match_takes_precedence_over_whitespace_candidates() {
+        let cwd = fresh_tmp_dir("edit-exact-precedence");
+        std::fs::write(cwd.join("a.txt"), "call()\ncall()  \ncall()\t\n").unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "call()\n", "done()\n", false);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(r.output, "Edited 'a.txt' (1 replacement)");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "done()\ncall()  \ncall()\t\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_matches_line_run_ignoring_trailing_whitespace() {
+        let cwd = fresh_tmp_dir("edit-trailing-whitespace");
+        std::fs::write(cwd.join("a.txt"), "alpha  \nbeta\n").unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "alpha\n", "ALPHA\n", false);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            r.output,
+            "Edited 'a.txt' (1 replacement) (matched ignoring whitespace differences)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "ALPHA\nbeta\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_reindents_replacement_for_trimmed_line_run_match() {
+        let cwd = fresh_tmp_dir("edit-reindent");
+        std::fs::write(
+            cwd.join("a.txt"),
+            "def outer():\n    if ready:\n        old()\n",
+        )
+        .unwrap();
+
+        let r = edit_file(
+            &cwd,
+            "a.txt",
+            "if ready:\n    old()",
+            "if done:\n    newer()",
+            false,
+        );
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            r.output,
+            "Edited 'a.txt' (1 replacement) (matched ignoring whitespace differences)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "def outer():\n    if done:\n        newer()\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_reindent_removal_clamps_to_line_indent() {
+        let cwd = fresh_tmp_dir("edit-reindent-clamp");
+        std::fs::write(cwd.join("a.txt"), "if ready:\n  old()\n").unwrap();
+
+        let r = edit_file(
+            &cwd,
+            "a.txt",
+            "    if ready:\n      old()",
+            "  done()\n next()",
+            false,
+        );
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "done()\nnext()\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_rejects_ambiguous_trailing_whitespace_line_run_match() {
+        let cwd = fresh_tmp_dir("edit-trailing-ambiguous");
+        std::fs::write(cwd.join("a.txt"), "target  \nend\ntarget\t\nend\n").unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "target\nend", "replacement", false);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Whitespace-insensitive matching found 2 candidates for `old_string`. Provide more context or set `replace_all` to true."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "target  \nend\ntarget\t\nend\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_replace_all_reindents_each_trimmed_line_run_match() {
+        let cwd = fresh_tmp_dir("edit-reindent-all");
+        std::fs::write(
+            cwd.join("a.txt"),
+            "if x:\n  old()\n\n    if x:\n      old()\n",
+        )
+        .unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "if x:\n    old()", "if y:\n    new()", true);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            r.output,
+            "Edited 'a.txt' (2 replacements) (matched ignoring whitespace differences)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "if y:\n    new()\n\n    if y:\n        new()\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_mid_line_fragment_keeps_not_found_error() {
+        let cwd = fresh_tmp_dir("edit-mid-line-missing");
+        std::fs::write(cwd.join("a.txt"), "alpha beta\n").unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "beta  ", "BETA", false);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(r.output, "No occurrences of `old_string` found in 'a.txt'");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha beta\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_whitespace_line_run_preserves_matched_crlf_terminator() {
+        let cwd = fresh_tmp_dir("edit-crlf");
+        std::fs::write(cwd.join("a.txt"), "alpha  \r\nbeta\r\n").unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "alpha\n", "ALPHA\n", false);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "ALPHA\r\nbeta\r\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_entries_apply_sequentially_to_created_text() {
+        let cwd = fresh_tmp_dir("edit-batch-sequential");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "BETA\ngamma".to_string(),
+                new_string: "delta\ngamma".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(
+            r.output,
+            "Edited 'a.txt' (2 replacements across 2 edit entries)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\ndelta\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_entries_stop_on_failure_and_keep_prior_changes() {
+        let cwd = fresh_tmp_dir("edit-batch-fail");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "gamma".to_string(),
+                new_string: "GAMMA".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 1 edit entry before failure at edits[1]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entry 1 was already applied. Entry 3 was NOT applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_entries_whitespace_ladder_preserves_batch_recovery_script() {
+        let cwd = fresh_tmp_dir("edit-batch-whitespace-fail");
+        std::fs::write(cwd.join("a.txt"), "alpha  \nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "alpha\n".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 1 edit entry before failure at edits[1]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entry 1 was already applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "ALPHA\nbeta\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Failure at the first entry: nothing landed, so the recovery script must
+    /// not invite the model to skip entries it never applied.
+    #[test]
+    fn edit_file_entries_recovery_script_when_first_entry_fails() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-first");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "gamma".to_string(),
+                new_string: "GAMMA".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 0 edit entries before failure at edits[0]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             No entries were applied. Entries 2-3 were NOT applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Failure at the last entry: everything before it landed and nothing is
+    /// left unattempted, so the script says so instead of naming an empty
+    /// range.
+    #[test]
+    fn edit_file_entries_recovery_script_when_last_entry_fails() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-last");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 2 edit entries before failure at edits[2]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entries 1-2 were already applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "ALPHA\nBETA\ngamma\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A two-entry batch failing at entry 2 exercises the singular
+    /// already-applied phrasing with nothing left unapplied.
+    #[test]
+    fn edit_file_entries_recovery_script_singular_applied_entry() {
+        let cwd = fresh_tmp_dir("edit-batch-fail-pair");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\n").unwrap();
+
+        let edits = vec![
+            EditFileEntry {
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: false,
+            },
+            EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "MISSING".to_string(),
+                replace_all: false,
+            },
+        ];
+        let r = edit_file_entries_in_roots(&cwd, &[], "a.txt", &edits);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert_eq!(
+            r.output,
+            "Applied 1 edit entry before failure at edits[1]: \
+             No occurrences of `old_string` found in 'a.txt'\n\n\
+             Entry 1 was already applied. \
+             Re-read the file and re-issue only the failed and unapplied entries."
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn edit_file_single_entry_batch_matches_flat_behavior() {
+        let cwd = fresh_tmp_dir("edit-batch-single");
+        std::fs::write(cwd.join("a.txt"), "x y x\n").unwrap();
+
+        let ambiguous = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "x".to_string(),
+                new_string: "z".to_string(),
+                replace_all: false,
+            }],
+        );
+        assert!(matches!(ambiguous.status, ToolStatus::RequestError));
+        assert_eq!(
+            ambiguous.output,
+            "`old_string` occurs 2 times in 'a.txt'. Provide more context or set `replace_all` to true."
+        );
+
+        let missing = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "missing".to_string(),
+                new_string: "z".to_string(),
+                replace_all: false,
+            }],
+        );
+        assert!(matches!(missing.status, ToolStatus::RequestError));
+        assert_eq!(
+            missing.output,
+            "No occurrences of `old_string` found in 'a.txt'"
+        );
+
+        let replaced = edit_file_entries_in_roots(
+            &cwd,
+            &[],
+            "a.txt",
+            &[EditFileEntry {
+                old_string: "x".to_string(),
+                new_string: "z".to_string(),
+                replace_all: true,
+            }],
+        );
+        assert!(
+            matches!(replaced.status, ToolStatus::Success),
+            "{}",
+            replaced.output
+        );
+        assert_eq!(replaced.output, "Edited 'a.txt' (2 replacements)");
         assert_eq!(
             std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
             "z y z\n"

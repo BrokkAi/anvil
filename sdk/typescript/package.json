@@ -1,0 +1,56 @@
+{
+  "name": "@brokkai/anvil-sdk",
+  "version": "0.25.0",
+  "description": "Official TypeScript SDK for the Anvil Agent HTTP API",
+  "type": "module",
+  "license": "LGPL-3.0-only",
+  "homepage": "https://github.com/BrokkAi/anvil#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrokkAi/anvil.git",
+    "directory": "sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/BrokkAi/anvil/issues"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/generated/openapi/index.d.ts",
+      "import": "./dist/generated/openapi/index.js"
+    },
+    "./client": {
+      "types": "./dist/generated/openapi/client/index.d.ts",
+      "import": "./dist/generated/openapi/client/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/generated/openapi/index.d.ts",
+  "module": "./dist/generated/openapi/index.js",
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/copy-license.mjs",
+    "check:version": "node scripts/check-version.mjs",
+    "prepack": "npm run check:version && npm run build",
+    "test": "npm run check:version && npm run build && node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.99.0",
+    "@openapitools/openapi-generator-cli": "2.40.1",
+    "typescript": "6.0.3",
+    "yaml": "2.9.0"
+  },
+  "overrides": {
+    "js-yaml": "4.3.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

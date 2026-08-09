@@ -1,27 +1,41 @@
 use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
+use std::borrow::Cow;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
-pub(super) const MAX_TIMEOUT_SECONDS: u64 = 600;
-#[cfg(not(target_os = "windows"))]
-const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
-#[cfg(not(target_os = "windows"))]
-const ANVIL_RTK_PROXY_PREFIX_ENV: &str = "ANVIL_RTK_PROXY_PREFIX";
-#[cfg(not(target_os = "windows"))]
-const RTK_HOSTED_ENV: &str = "RTK_HOSTED";
-#[cfg(not(target_os = "windows"))]
-const RTK_TELEMETRY_DISABLED_ENV: &str = "RTK_TELEMETRY_DISABLED";
-#[cfg(not(target_os = "windows"))]
-const RTK_TRACKING_DISABLED_ENV: &str = "RTK_TRACKING_DISABLED";
-#[cfg(not(target_os = "windows"))]
-const ANVIL_RTK_SUBCOMMAND: &str = "__rtk";
+/// Wall-clock budget for one `run_shell_command` call when the model names
+/// neither `timeout_seconds` nor the legacy millisecond `timeout`.
+pub(super) const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+/// Floor for a model-supplied `timeout_seconds`. A model that asks for a
+/// couple of seconds is almost always confusing units or guessing; killing
+/// its command at the requested value teaches it that verification is
+/// impossible here, so we raise the budget and say so in the output.
+/// Deliberately NOT applied to the legacy millisecond field, whose exact
+/// semantics replayed traces depend on.
+pub(super) const MIN_TIMEOUT_SECONDS: u64 = 10;
+/// Ceiling for every timeout, whichever field requested it. Deployments can
+/// lower it via `ANVIL_SHELL_TIMEOUT_CAP_SECONDS`; the model is never told
+/// about that override, it just sees the clamp notice if one fires.
+pub(super) const MAX_TIMEOUT_SECONDS: u64 = 3600;
+/// Deployment-level override for [`MAX_TIMEOUT_SECONDS`]. Read from the
+/// agent's own environment (not the sandboxed child's), so a command cannot
+/// widen its own budget by exporting this.
+const TIMEOUT_CAP_ENV: &str = "ANVIL_SHELL_TIMEOUT_CAP_SECONDS";
+
+/// Where raw captures land when the minimizer rewrites a command's output,
+/// relative to the session cwd. Must stay under the session cwd so the
+/// reference spliced into tool results resolves through
+/// `safe_resolve_in_roots` when the model passes it back to `read_file`.
+const SPILL_DIR_RELATIVE: &str = ".brokk/shell-output";
+const STALE_SPILL_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
     "Notice: this command was explicitly approved to run outside the OS sandbox once.";
 
@@ -329,29 +343,38 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_shell_tool_result(
     stdout: &str,
     stderr: &str,
+    minimized: Option<String>,
     exit_code: i32,
     success: bool,
     outside_sandbox_once: bool,
     bypass_warning: bool,
     timeout_clamp_notice: Option<&str>,
 ) -> ToolResult {
-    let mut combined = String::new();
-    if let Some(notice) = timeout_clamp_notice {
-        combined.push_str(notice);
-        combined.push_str("\n\n");
-    }
-    if !stdout.is_empty() {
-        combined.push_str(stdout);
-    }
-
-    if !stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push_str("\n--- stderr ---\n");
+    // The body is truncated middle-out (head + tail kept) BEFORE the exit-code
+    // line and notices are attached: build/test failures cluster at the tail,
+    // and the exit code must survive truncation unconditionally.
+    let mut combined = minimized.unwrap_or_else(|| {
+        let mut body = String::new();
+        if !stdout.is_empty() {
+            body.push_str(stdout);
         }
-        combined.push_str(stderr);
+        if !stderr.is_empty() {
+            if !body.is_empty() {
+                body.push_str("\n--- stderr ---\n");
+            }
+            body.push_str(stderr);
+        }
+        body
+    });
+
+    if combined.len() > MAX_OUTPUT_BYTES {
+        combined = crate::text::truncate_middle_utf8(&combined, MAX_OUTPUT_BYTES, |elided| {
+            format!("\n[... {elided} bytes elided ...]\n")
+        });
     }
 
     if !success {
@@ -366,13 +389,12 @@ fn format_shell_tool_result(
         combined = format!("Command completed with exit code {exit_code}");
     }
 
-    if outside_sandbox_once {
-        combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
+    if let Some(notice) = timeout_clamp_notice {
+        combined = format!("{notice}\n\n{combined}");
     }
 
-    if combined.len() > MAX_OUTPUT_BYTES {
-        combined.truncate(MAX_OUTPUT_BYTES);
-        combined.push_str("\n... output truncated");
+    if outside_sandbox_once {
+        combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
     }
 
     if bypass_warning {
@@ -390,94 +412,252 @@ fn format_shell_tool_result(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn env_var_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| env_value_truthy(&value))
+/// Post-capture output minimizer for one session's `run_shell_command`.
+///
+/// Wraps the vendored oh-my-pi minimizer (`anvil_minimizer`): after the child
+/// exits, output of well-known commands (git, cargo, pytest, npm, ...) is
+/// condensed with the exit code as an input, and the raw capture is preserved
+/// under [`SPILL_DIR_RELATIVE`] so minimization never loses information. The
+/// engine refuses pipes, compound commands, and captures over its size cap,
+/// and converts filter panics to passthrough, so it can only ever shrink
+/// well-understood output.
+pub(crate) struct ShellMinimizer {
+    config: anvil_minimizer::MinimizerConfig,
+    /// `<session cwd>/.brokk/shell-output`. Rooted at the session cwd, not a
+    /// per-command `directory` override -- see [`SPILL_DIR_RELATIVE`].
+    spill_dir: PathBuf,
 }
 
-#[cfg(not(target_os = "windows"))]
-fn rtk_disabled_in_command_prefix(command: &str) -> bool {
-    for token in command.split_whitespace() {
-        if token.contains('=') && !token.starts_with('-') {
-            if let Some(value) = token.strip_prefix("RTK_DISABLED=") {
-                return env_value_truthy(value);
+impl ShellMinimizer {
+    pub(crate) fn new(session_cwd: &Path) -> Self {
+        Self {
+            config: anvil_minimizer::MinimizerConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            spill_dir: session_cwd.join(SPILL_DIR_RELATIVE),
+        }
+    }
+
+    /// Condense the capture when a filter recognizes the command. Returns the
+    /// minimized body -- with a trailing `[raw output: ...]` reference when
+    /// the original was spilled -- or `None` to keep the verbatim output.
+    fn minimize(
+        &self,
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        exit_code: i32,
+    ) -> Option<String> {
+        // Feed one merged buffer, mirroring upstream's capture: filters for
+        // compilers/test runners expect diagnostics and results interleaved,
+        // and a divider line would confuse their line-oriented parsers.
+        let captured: Cow<'_, str> = if stderr.is_empty() {
+            Cow::Borrowed(stdout)
+        } else if stdout.is_empty() {
+            Cow::Borrowed(stderr)
+        } else {
+            Cow::Owned(format!("{stdout}\n{stderr}"))
+        };
+        let out = anvil_minimizer::apply(command, &captured, exit_code, &self.config);
+        if !out.changed {
+            return None;
+        }
+        // `original_text` is Some exactly when the filter rewrote the output
+        // (upstream contract); without it we cannot offer recovery, so keep
+        // the verbatim capture.
+        let original = out.original_text?;
+        let mut text = out.text;
+        if let Some(reference) = spill_original(&self.spill_dir, &original) {
+            if !text.ends_with('\n') {
+                text.push('\n');
             }
+            text.push_str(&format!("[raw output: {reference}]"));
+        }
+        Some(text)
+    }
+}
+
+/// Write `original` under the spill dir, creating it (with a self-ignoring
+/// `.gitignore`) on first use. Returns the session-relative reference path,
+/// or `None` on any error: spilling must never fail the tool call, the
+/// result is merely shown without a recovery reference.
+fn spill_original(spill_dir: &Path, original: &str) -> Option<String> {
+    if let Err(e) = std::fs::create_dir_all(spill_dir) {
+        tracing::debug!("could not create shell-output spill dir: {e}");
+        return None;
+    }
+    let gitignore = spill_dir.join(".gitignore");
+    if !gitignore.exists()
+        && let Err(e) = std::fs::write(&gitignore, "*\n")
+    {
+        tracing::debug!("could not write shell-output .gitignore: {e}");
+    }
+    let name = next_spill_file_name();
+    let path = spill_dir.join(&name);
+    match std::fs::write(&path, original) {
+        Ok(()) => Some(format!("{SPILL_DIR_RELATIVE}/{name}")),
+        Err(e) => {
+            tracing::debug!("could not write shell-output spill file: {e}");
+            None
+        }
+    }
+}
+
+/// `{unix_secs}-{pid}-{seq}`: `seq` disambiguates within a process, `pid`
+/// across concurrent anvil processes sharing a workspace, and the timestamp
+/// guards pid reuse across restarts while keeping age-based GC legible.
+fn next_spill_file_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}-{}-{seq}.txt", std::process::id())
+}
+
+/// Age-based GC for spill files, mirroring
+/// `sandbox::cleanup_stale_policy_files`: runs at registry construction so
+/// captures from crashed or abandoned sessions don't accumulate.
+pub(crate) fn cleanup_stale_shell_outputs(session_cwd: &Path) {
+    let dir = session_cwd.join(SPILL_DIR_RELATIVE);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
             continue;
         }
-        return false;
-    }
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-fn env_value_truthy(value: &str) -> bool {
-    matches!(
-        value
-            .trim_matches(|c| matches!(c, '\'' | '"'))
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn rtk_rewritten_command(command: &str) -> String {
-    command.to_string()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn rtk_rewritten_command(command: &str) -> String {
-    // RTK's native Windows support is CLI/filtering-oriented; its automatic
-    // rewrite hook path requires Unix shell semantics. Anvil's hosted rewrite
-    // emits POSIX env-prefix syntax, so leave native Windows shell commands
-    // untouched. WSL is a Linux target and still takes the rewrite path.
-    if env_var_truthy(ANVIL_RTK_DISABLED_ENV)
-        || rtk_disabled_in_command_prefix(command)
-        || command.contains(ANVIL_RTK_SUBCOMMAND)
-    {
-        return command.to_string();
-    }
-
-    let proxy = if let Some(value) = std::env::var(ANVIL_RTK_PROXY_PREFIX_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        value
-    } else {
-        match std::env::current_exe() {
-            Ok(path) => format!("{} {}", shell_quote_path(&path), ANVIL_RTK_SUBCOMMAND),
-            Err(e) => {
-                tracing::warn!("could not resolve current executable for RTK rewrite: {e}");
-                return command.to_string();
-            }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_SPILL_FILE_AGE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
         }
-    };
-    let proxy = format!(
-        "{RTK_HOSTED_ENV}=1 {RTK_TELEMETRY_DISABLED_ENV}=1 {RTK_TRACKING_DISABLED_ENV}=1 {proxy}"
-    );
-
-    match rtk_core::rewrite_command_with_proxy(command, &[], &[], &proxy) {
-        Some(rewritten) => {
-            tracing::debug!(
-                target: "brokk_acp_rust::tools::shell",
-                original = %command,
-                rewritten = %rewritten,
-                "rewrote shell command through hosted RTK",
-            );
-            rewritten
-        }
-        None => command.to_string(),
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn shell_quote_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("'{}'", raw.replace('\'', "'\\''"))
+/// Effective ceiling on a shell timeout, in seconds.
+///
+/// [`MAX_TIMEOUT_SECONDS`] unless `ANVIL_SHELL_TIMEOUT_CAP_SECONDS` names a
+/// positive integer. An absent, empty, zero, or unparseable value falls back
+/// to the default rather than failing the call: a mistyped deployment knob
+/// must not break every shell command.
+fn timeout_cap_seconds() -> u64 {
+    parse_timeout_cap(std::env::var(TIMEOUT_CAP_ENV).ok().as_deref())
 }
 
+fn parse_timeout_cap(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(MAX_TIMEOUT_SECONDS)
+}
+
+/// A resolved wall-clock budget for one shell call, plus the user-visible
+/// notice to emit when the request had to be clamped.
+///
+/// Every timeout policy decision lives here so the advertised
+/// `timeout_seconds` field, the retained legacy millisecond `timeout` field,
+/// and internal callers cannot drift apart:
+///
+/// - [`Self::from_request_seconds`] -- what the model asks for. Clamped to
+///   `[MIN_TIMEOUT_SECONDS, cap]`, with a notice in either direction.
+/// - [`Self::from_legacy_millis`] -- the unadvertised millisecond field kept
+///   for replay/internal compatibility. Rounds up to whole seconds with a 1s
+///   floor exactly as before; only the ceiling moved. It is deliberately NOT
+///   raised to `MIN_TIMEOUT_SECONDS`, so a replayed trace that asked for
+///   1500ms still gets 2s.
+/// - [`Self::from_exact_seconds`] -- in-process callers that already speak
+///   seconds; same permissive floor as the legacy path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellTimeout {
+    seconds: u64,
+    clamp_notice: Option<String>,
+}
+
+impl ShellTimeout {
+    /// Pick the budget for one `run_shell_command` call from its arguments.
+    /// `timeout_seconds` wins when both fields are present.
+    pub(super) fn resolve(timeout_seconds: Option<u64>, legacy_millis: Option<u64>) -> Self {
+        match (timeout_seconds, legacy_millis) {
+            (Some(seconds), _) => Self::from_request_seconds(seconds),
+            (None, Some(millis)) => Self::from_legacy_millis(millis),
+            (None, None) => Self::default_budget(),
+        }
+    }
+
+    /// Neither timeout field was supplied. The model asked for nothing, so
+    /// there is nothing to report even if a deployment cap lowers the
+    /// default.
+    fn default_budget() -> Self {
+        Self {
+            seconds: DEFAULT_TIMEOUT_SECONDS.min(timeout_cap_seconds()),
+            clamp_notice: None,
+        }
+    }
+
+    fn from_request_seconds(requested: u64) -> Self {
+        let cap = timeout_cap_seconds();
+        let seconds = requested.max(MIN_TIMEOUT_SECONDS).min(cap);
+        let clamp_notice = if seconds < requested {
+            Some(format!(
+                "Notice: requested timeout {requested}s exceeded the server maximum; clamped to {seconds}s."
+            ))
+        } else if seconds > requested {
+            Some(format!(
+                "Notice: requested timeout {requested}s was below the {MIN_TIMEOUT_SECONDS}s minimum; raised to {seconds}s."
+            ))
+        } else {
+            None
+        };
+        Self {
+            seconds,
+            clamp_notice,
+        }
+    }
+
+    fn from_legacy_millis(millis: u64) -> Self {
+        Self::from_exact_seconds(millis.saturating_add(999) / 1000)
+    }
+
+    fn from_exact_seconds(requested: u64) -> Self {
+        let requested = requested.max(1);
+        let seconds = requested.min(timeout_cap_seconds());
+        let clamp_notice = (seconds != requested).then(|| {
+            format!(
+                "Notice: requested timeout {requested}s exceeded the server maximum; clamped to {seconds}s."
+            )
+        });
+        Self {
+            seconds,
+            clamp_notice,
+        }
+    }
+
+    #[cfg(test)]
+    fn seconds(&self) -> u64 {
+        self.seconds
+    }
+
+    #[cfg(test)]
+    fn clamp_notice(&self) -> Option<&str> {
+        self.clamp_notice.as_deref()
+    }
+}
+
+/// Seconds-taking entry point kept for the tests that predate
+/// [`ShellTimeout`]; production dispatch resolves the budget from the tool
+/// arguments and calls [`run_shell_command_with_timeout`] directly. Every
+/// caller lives in the unix-only test module below, so the gate must match
+/// or Windows test builds flag it as dead code.
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_shell_command_cancellable(
     cwd: &Path,
     command: &str,
@@ -485,6 +665,29 @@ pub async fn run_shell_command_cancellable(
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
     cancel: Option<&CancellationToken>,
+    minimizer: Option<&ShellMinimizer>,
+) -> ToolResult {
+    run_shell_command_with_timeout(
+        cwd,
+        command,
+        ShellTimeout::from_exact_seconds(timeout_seconds),
+        policy,
+        outside_sandbox_once,
+        cancel,
+        minimizer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_shell_command_with_timeout(
+    cwd: &Path,
+    command: &str,
+    timeout: ShellTimeout,
+    policy: SandboxPolicy,
+    outside_sandbox_once: bool,
+    cancel: Option<&CancellationToken>,
+    minimizer: Option<&ShellMinimizer>,
 ) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult {
@@ -492,19 +695,14 @@ pub async fn run_shell_command_cancellable(
             output: "Command must not be empty".to_string(),
         };
     }
-    let requested_timeout_seconds = timeout_seconds.max(1);
-    let timeout_seconds = requested_timeout_seconds.min(MAX_TIMEOUT_SECONDS);
-    let timeout_clamp_notice = (requested_timeout_seconds != timeout_seconds).then(|| {
-        format!(
-            "Notice: requested timeout {requested_timeout_seconds}s exceeded the server maximum; clamped to {timeout_seconds}s."
-        )
-    });
-
-    let command_to_run = rtk_rewritten_command(command);
+    let ShellTimeout {
+        seconds: timeout_seconds,
+        clamp_notice: timeout_clamp_notice,
+    } = timeout;
 
     // Wrap once. `wrapped` owns the temp policy file (Seatbelt) and must
     // outlive the spawned child.
-    let wrapped = match sandbox::wrap_command(policy, cwd, &command_to_run) {
+    let wrapped = match sandbox::wrap_command(policy, cwd, command) {
         Ok(w) => w,
         Err(e) => {
             // Sandbox-layer errors are tagged with `[sandbox]` by sandbox.rs
@@ -624,9 +822,15 @@ pub async fn run_shell_command_cancellable(
             let stdout = String::from_utf8_lossy(&stdout);
             let stderr = String::from_utf8_lossy(&stderr);
             let exit_code = status.code().unwrap_or(-1);
+            // Minimization sees the untruncated capture (the engine's own
+            // 4 MiB cap turns monsters into passthrough); truncation happens
+            // afterwards in the formatter.
+            let minimized =
+                minimizer.and_then(|m| m.minimize(command, &stdout, &stderr, exit_code));
             format_shell_tool_result(
                 &stdout,
                 &stderr,
+                minimized,
                 exit_code,
                 status.success(),
                 outside_sandbox_once,
@@ -856,33 +1060,6 @@ mod tests {
         }
     }
 
-    fn fake_rtk_proxy(dir: &Path) -> PathBuf {
-        let path = dir.join("fake-rtk-proxy.sh");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\n\
-             if [ \"$1\" = cargo ] && [ \"$2\" = test ]; then\n\
-               echo hosted-rtk-cargo-test\n\
-               exit 0\n\
-             fi\n\
-             if [ \"$1\" = git ] && [ \"$2\" = status ]; then\n\
-               echo '## main'\n\
-               echo '?? changed.txt'\n\
-               exit 0\n\
-             fi\n\
-             echo \"unexpected hosted rtk args: $*\" >&2\n\
-             exit 42\n",
-        )
-        .expect("write fake RTK proxy");
-        let mut perms = std::fs::metadata(&path)
-            .expect("stat fake RTK proxy")
-            .permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod fake RTK proxy");
-        path
-    }
-
     #[test]
     fn parse_rlimit_value_accepts_decimal_byte_count() {
         assert_eq!(parse_rlimit_value("X", "1024", 999), 1024);
@@ -953,6 +1130,41 @@ mod tests {
         assert_eq!(clamped_inf, hard);
     }
 
+    #[test]
+    fn shell_output_truncation_preserves_utf8() {
+        let mut stdout = "a".repeat(MAX_OUTPUT_BYTES - 1);
+        stdout.push('\u{25cf}');
+        stdout.push_str("tail");
+
+        let result = format_shell_tool_result(&stdout, "", None, 0, true, false, false, None);
+
+        assert!(result.output.starts_with('a'), "head must be preserved");
+        assert!(
+            result.output.contains("bytes elided"),
+            "middle-out marker expected; got tail: {}",
+            &result.output[result.output.len().saturating_sub(80)..]
+        );
+        assert!(
+            result.output.ends_with("tail"),
+            "tail must be preserved; got tail: {}",
+            &result.output[result.output.len().saturating_sub(80)..]
+        );
+    }
+
+    /// The exit-code line is appended after truncation, so it must survive
+    /// even when the body is far over budget. Regression for the head-only
+    /// truncation that used to eat it.
+    #[test]
+    fn exit_code_survives_truncation_of_huge_output() {
+        let stdout = "x".repeat(MAX_OUTPUT_BYTES * 3);
+        let result = format_shell_tool_result(&stdout, "", None, 1, false, false, false, None);
+        assert!(
+            result.output.ends_with("Exit code: 1"),
+            "exit code must be the suffix; got tail: {}",
+            &result.output[result.output.len().saturating_sub(80)..]
+        );
+    }
+
     /// End-to-end: a tight `BROKK_ACP_RLIMIT_FSIZE_BYTES` actually kills
     /// `dd` when it tries to write past the cap. This is the regression
     /// test the reviewer flagged as missing -- a future refactor that
@@ -975,7 +1187,8 @@ mod tests {
         );
 
         let result =
-            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
+            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None, None)
+                .await;
         let written = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&target);
 
@@ -1009,7 +1222,8 @@ mod tests {
         );
 
         let result =
-            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
+            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None, None)
+                .await;
         let _ = std::fs::remove_file(&target);
 
         assert!(
@@ -1033,6 +1247,7 @@ mod tests {
             30,
             SandboxPolicy::None,
             false,
+            None,
             None,
         )
         .await;
@@ -1062,6 +1277,7 @@ mod tests {
             SandboxPolicy::None,
             false,
             None,
+            None,
         )
         .await;
         assert!(
@@ -1076,134 +1292,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rtk_disabled_prefix_requires_truthy_value() {
-        assert!(rtk_disabled_in_command_prefix("RTK_DISABLED=1 cargo test"));
-        assert!(rtk_disabled_in_command_prefix(
-            "FOO=bar RTK_DISABLED=true git status"
-        ));
-        assert!(rtk_disabled_in_command_prefix(
-            "RTK_DISABLED='yes' git status"
-        ));
-        assert!(!rtk_disabled_in_command_prefix("RTK_DISABLED=0 cargo test"));
-        assert!(!rtk_disabled_in_command_prefix(
-            "RTK_DISABLED=false cargo test"
-        ));
-        assert!(!rtk_disabled_in_command_prefix("echo RTK_DISABLED=1"));
-    }
-
     #[tokio::test]
-    async fn anvil_rtk_disabled_env_requires_truthy_value() {
-        let _guard = ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().expect("create temp project");
-        let proxy = fake_rtk_proxy(dir.path());
-        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
-        let _disabled_env = EnvGuard::set(ANVIL_RTK_DISABLED_ENV, "0");
-
-        let result = run_shell_command_cancellable(
-            dir.path(),
-            "git status",
-            30,
-            SandboxPolicy::None,
-            false,
-            None,
-        )
-        .await;
-
-        assert!(
-            result.output.contains("## main"),
-            "ANVIL_RTK_DISABLED=0 should not disable hosted RTK rewrite; got: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn anvil_rtk_disabled_env_truthy_skips_rewrite() {
-        let _guard = ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().expect("create temp project");
-        let proxy = fake_rtk_proxy(dir.path());
-        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
-        let _disabled_env = EnvGuard::set(ANVIL_RTK_DISABLED_ENV, "1");
-
-        let result = run_shell_command_cancellable(
-            dir.path(),
-            "git status",
-            30,
-            SandboxPolicy::None,
-            false,
-            None,
-        )
-        .await;
-
-        assert!(
-            !result.output.contains("## main"),
-            "ANVIL_RTK_DISABLED=1 should skip hosted RTK rewrite; got: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn run_shell_command_rewrites_to_hosted_rtk_for_cargo_test() {
-        let _guard = ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().expect("create temp cargo project");
-        let proxy = fake_rtk_proxy(dir.path());
-        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"rtk-filter-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::create_dir(dir.path().join("src")).expect("create src");
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\
-             #[cfg(test)]\n\
-             mod tests {\n\
-                 #[test]\n\
-                 fn adds() { assert_eq!(super::add(1, 2), 3); }\n\
-             }\n",
-        )
-        .expect("write lib.rs");
-
-        let result = run_shell_command_cancellable(
-            dir.path(),
-            "cargo test --quiet",
-            120,
-            SandboxPolicy::None,
-            false,
-            None,
-        )
-        .await;
-
-        assert!(
-            matches!(result.status, ToolStatus::Success),
-            "cargo test must succeed; got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("hosted-rtk-cargo-test"),
-            "cargo test should be routed through the hosted RTK proxy; got: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("running 1 test"),
-            "native cargo test output means the rewrite did not run; got: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn run_shell_command_rewrites_to_hosted_rtk_for_git_status() {
+    async fn run_shell_command_minimizes_git_status_and_writes_spill() {
         let _guard = ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("create temp git repo");
-        let proxy = fake_rtk_proxy(dir.path());
-        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
+        let minimizer = ShellMinimizer::new(dir.path());
         let init = run_shell_command_cancellable(
             dir.path(),
             "git init",
             30,
             SandboxPolicy::None,
             false,
+            None,
             None,
         )
         .await;
@@ -1221,6 +1321,7 @@ mod tests {
             SandboxPolicy::None,
             false,
             None,
+            Some(&minimizer),
         )
         .await;
 
@@ -1230,14 +1331,65 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("changed.txt") || result.output.contains("??"),
-            "hosted RTK git status output should mention the untracked file; got: {}",
+            result.output.contains("changed.txt"),
+            "condensed git status must still mention the untracked file; got: {}",
+            result.output
+        );
+        let reference_start = result
+            .output
+            .find("[raw output: ")
+            .unwrap_or_else(|| panic!("expected raw-output reference; got: {}", result.output));
+        let reference = &result.output[reference_start + "[raw output: ".len()..];
+        let reference = &reference[..reference.find(']').expect("closing bracket")];
+        let spill_path = dir.path().join(reference);
+        let spilled = std::fs::read_to_string(&spill_path).expect("spill file readable");
+        assert!(
+            spilled.contains("changed.txt"),
+            "spill file must hold the raw capture; got: {spilled}"
+        );
+        let gitignore = dir.path().join(SPILL_DIR_RELATIVE).join(".gitignore");
+        assert_eq!(
+            std::fs::read_to_string(gitignore).expect("spill .gitignore"),
+            "*\n",
+            "spill dir must self-ignore"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_without_minimizer_is_verbatim() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("create temp git repo");
+        let init = run_shell_command_cancellable(
+            dir.path(),
+            "git init",
+            30,
+            SandboxPolicy::None,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(init.status, ToolStatus::Success));
+
+        let result = run_shell_command_cancellable(
+            dir.path(),
+            "git status",
+            30,
+            SandboxPolicy::None,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            !result.output.contains("[raw output: "),
+            "no minimizer means no spill reference; got: {}",
             result.output
         );
         assert!(
-            !result.output.contains("On branch"),
-            "native git status output means the rewrite did not run; got: {}",
-            result.output
+            !dir.path().join(SPILL_DIR_RELATIVE).exists(),
+            "no minimizer means no spill dir"
         );
     }
 
@@ -1251,6 +1403,7 @@ mod tests {
             30,
             SandboxPolicy::None,
             true,
+            None,
             None,
         )
         .await;
@@ -1315,6 +1468,7 @@ mod tests {
                 SandboxPolicy::None,
                 false,
                 Some(&cancel),
+                None,
             ),
         )
         .await
@@ -1334,6 +1488,289 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "cancellation waited too long: {:?}",
             started.elapsed()
+        );
+    }
+}
+
+/// Timeout-resolution tests. Separate from the `unix`-gated module above
+/// because this arithmetic is platform-independent, and because every case
+/// that depends on the deployment cap must be serialized against the cases
+/// that override it.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate `ANVIL_SHELL_TIMEOUT_CAP_SECONDS`. Every
+    /// test here sets the var explicitly (empty string == "unset, use the
+    /// default cap") so an ambient value in the developer's environment
+    /// cannot change the expected numbers either.
+    static CAP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets `ANVIL_SHELL_TIMEOUT_CAP_SECONDS` and removes it on drop. Pair
+    /// with `CAP_ENV_LOCK`; the guard must be dropped before the lock.
+    struct CapEnvGuard;
+
+    impl CapEnvGuard {
+        fn set(value: &str) -> Self {
+            // SAFETY: the caller holds CAP_ENV_LOCK, which serializes
+            // mutation of this var across the crate's tests.
+            unsafe {
+                std::env::set_var(TIMEOUT_CAP_ENV, value);
+            }
+            Self
+        }
+    }
+
+    impl Drop for CapEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as set() -- guarded by CAP_ENV_LOCK.
+            unsafe {
+                std::env::remove_var(TIMEOUT_CAP_ENV);
+            }
+        }
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn omitted_timeout_uses_the_two_minute_default() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(None, None);
+        assert_eq!(timeout.seconds(), DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(timeout.seconds(), 120);
+        assert_eq!(timeout.clamp_notice(), None);
+    }
+
+    #[test]
+    fn timeout_seconds_below_the_floor_is_raised_with_a_notice() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(3), None);
+        assert_eq!(timeout.seconds(), MIN_TIMEOUT_SECONDS);
+        assert_eq!(
+            timeout.clamp_notice(),
+            Some("Notice: requested timeout 3s was below the 10s minimum; raised to 10s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_above_the_cap_is_clamped_with_a_notice() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(4000), None);
+        assert_eq!(timeout.seconds(), MAX_TIMEOUT_SECONDS);
+        assert_eq!(timeout.seconds(), 3600);
+        assert_eq!(
+            timeout.clamp_notice(),
+            Some("Notice: requested timeout 4000s exceeded the server maximum; clamped to 3600s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_inside_the_range_passes_through_unannounced() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        for requested in [MIN_TIMEOUT_SECONDS, 120, MAX_TIMEOUT_SECONDS] {
+            let timeout = ShellTimeout::resolve(Some(requested), None);
+            assert_eq!(timeout.seconds(), requested);
+            assert_eq!(timeout.clamp_notice(), None, "requested={requested}");
+        }
+    }
+
+    /// The unadvertised millisecond field keeps its exact pre-`timeout_seconds`
+    /// behavior -- round up to whole seconds, 1s floor -- so replayed traces
+    /// and in-process callers that still pass milliseconds are unaffected.
+    /// Only the ceiling moved (600s -> 3600s).
+    #[test]
+    fn legacy_millis_round_up_and_keep_the_one_second_floor() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        for (millis, expected) in [
+            (0_u64, 1_u64),
+            (1, 1),
+            (999, 1),
+            (1_000, 1),
+            (1_500, 2),
+            (60_000, 60),
+            (120_000, 120),
+            (601_000, 601),
+        ] {
+            let timeout = ShellTimeout::resolve(None, Some(millis));
+            assert_eq!(timeout.seconds(), expected, "millis={millis}");
+            assert_eq!(timeout.clamp_notice(), None, "millis={millis}");
+        }
+    }
+
+    #[test]
+    fn legacy_millis_are_capped_but_never_floored_to_the_new_minimum() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let capped = ShellTimeout::resolve(None, Some(3_601_000));
+        assert_eq!(capped.seconds(), MAX_TIMEOUT_SECONDS);
+        assert_eq!(
+            capped.clamp_notice(),
+            Some("Notice: requested timeout 3601s exceeded the server maximum; clamped to 3600s.")
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_wins_when_both_fields_are_present() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("");
+
+        let timeout = ShellTimeout::resolve(Some(300), Some(1_000));
+        assert_eq!(timeout.seconds(), 300);
+        assert_eq!(timeout.clamp_notice(), None);
+
+        // Even when the seconds value is the one that needs clamping.
+        let floored = ShellTimeout::resolve(Some(3), Some(600_000));
+        assert_eq!(floored.seconds(), MIN_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn deployment_cap_env_lowers_the_ceiling_for_every_path() {
+        let _lock = lock();
+        let _env = CapEnvGuard::set("30");
+
+        assert_eq!(timeout_cap_seconds(), 30);
+
+        let requested = ShellTimeout::resolve(Some(600), None);
+        assert_eq!(requested.seconds(), 30);
+        assert_eq!(
+            requested.clamp_notice(),
+            Some("Notice: requested timeout 600s exceeded the server maximum; clamped to 30s.")
+        );
+
+        let legacy = ShellTimeout::resolve(None, Some(600_000));
+        assert_eq!(legacy.seconds(), 30);
+
+        // The default is lowered silently: the model asked for nothing, so
+        // there is no request to report a clamp against.
+        let defaulted = ShellTimeout::resolve(None, None);
+        assert_eq!(defaulted.seconds(), 30);
+        assert_eq!(defaulted.clamp_notice(), None);
+    }
+
+    #[test]
+    fn invalid_or_absent_cap_env_falls_back_to_the_default_ceiling() {
+        assert_eq!(parse_timeout_cap(None), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("   ")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("abc")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("-5")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some("0")), MAX_TIMEOUT_SECONDS);
+        assert_eq!(parse_timeout_cap(Some(" 45 ")), 45);
+        // A cap above the compiled-in default is honored too: the env var is
+        // a deployment decision, not a second maximum.
+        assert_eq!(parse_timeout_cap(Some("7200")), 7200);
+    }
+}
+
+/// Pure minimizer/spill tests -- no process spawning, so they run on every
+/// platform (the spawn-based coverage above is unix-gated).
+#[cfg(test)]
+mod minimizer_tests {
+    use super::*;
+
+    const GIT_STATUS_LONG: &str = "On branch main\n\n\
+        Untracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\
+        \tchanged.txt\n\n\
+        nothing added to commit but untracked files present (use \"git add\" to track)\n";
+
+    #[test]
+    fn minimize_condenses_git_status_and_spills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let minimizer = ShellMinimizer::new(dir.path());
+
+        let text = minimizer
+            .minimize("git status", GIT_STATUS_LONG, "", 0)
+            .expect("git status long format should be condensed");
+
+        let reference_start = text
+            .find("[raw output: ")
+            .unwrap_or_else(|| panic!("expected raw-output reference; got: {text}"));
+        let reference = &text[reference_start + "[raw output: ".len()..];
+        let reference = &reference[..reference.find(']').expect("closing bracket")];
+        assert!(
+            reference.starts_with(SPILL_DIR_RELATIVE),
+            "reference must be session-relative; got: {reference}"
+        );
+        let spilled =
+            std::fs::read_to_string(dir.path().join(reference)).expect("spill file readable");
+        assert_eq!(spilled, GIT_STATUS_LONG, "spill must be the raw capture");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SPILL_DIR_RELATIVE).join(".gitignore"))
+                .expect("spill .gitignore"),
+            "*\n"
+        );
+    }
+
+    #[test]
+    fn minimize_passes_through_unknown_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let minimizer = ShellMinimizer::new(dir.path());
+        assert!(
+            minimizer
+                .minimize("frobnicate --xyz", "some output\n", "", 0)
+                .is_none(),
+            "unknown command must pass through verbatim"
+        );
+        assert!(
+            !dir.path().join(SPILL_DIR_RELATIVE).exists(),
+            "passthrough must not create a spill dir"
+        );
+    }
+
+    #[test]
+    fn spill_failure_falls_back_to_minimized_without_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `.brokk` as a *file* makes create_dir_all fail deterministically.
+        std::fs::write(dir.path().join(".brokk"), "not a dir").expect("write blocker");
+        let minimizer = ShellMinimizer::new(dir.path());
+
+        let text = minimizer
+            .minimize("git status", GIT_STATUS_LONG, "", 0)
+            .expect("minimization itself must still happen");
+        assert!(
+            !text.contains("[raw output: "),
+            "failed spill must omit the reference; got: {text}"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_stale_spill_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spill_dir = dir.path().join(SPILL_DIR_RELATIVE);
+        std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+        std::fs::write(spill_dir.join(".gitignore"), "*\n").expect("gitignore");
+        std::fs::write(spill_dir.join("fresh.txt"), "fresh").expect("fresh");
+        let stale_path = spill_dir.join("stale.txt");
+        std::fs::write(&stale_path, "stale").expect("stale");
+        let stale_mtime = std::time::SystemTime::now() - (STALE_SPILL_FILE_AGE * 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_path)
+            .expect("open stale")
+            .set_modified(stale_mtime)
+            .expect("backdate stale");
+
+        cleanup_stale_shell_outputs(dir.path());
+
+        assert!(!stale_path.exists(), "stale spill file must be removed");
+        assert!(spill_dir.join("fresh.txt").exists(), "fresh file must stay");
+        assert!(
+            spill_dir.join(".gitignore").exists(),
+            ".gitignore must survive GC"
         );
     }
 }

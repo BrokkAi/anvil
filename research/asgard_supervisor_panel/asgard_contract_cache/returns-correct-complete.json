@@ -1,0 +1,185 @@
+{
+  "contracts": [
+    {
+      "id": "C01",
+      "kind": "inspection",
+      "text": "A container type named Validated must exist with two concrete subtypes: Valid and Invalid.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C02",
+      "kind": "inspection",
+      "text": "Invalid must store its errors as an immutable tuple.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C03",
+      "kind": "inspection",
+      "text": "Invalid must expose a from_failure classmethod that wraps a single error into a 1-tuple: the task states \"wrap a single error into a 1-tuple so accumulation works uniformly.\"",
+      "adverse_condition": null
+    },
+    {
+      "id": "C04",
+      "kind": "execution",
+      "text": "When apply combines two Invalid containers, the resulting error tuple must be self's errors concatenated with the other's errors, preserving stable left-to-right order.",
+      "adverse_condition": "Both operands are Invalid (contain failures)."
+    },
+    {
+      "id": "C05",
+      "kind": "execution",
+      "text": "The swap method on Valid must turn Valid(x) into Invalid((x,)).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C06",
+      "kind": "execution",
+      "text": "The swap method on Invalid must turn Invalid(errs) into Valid(errs).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C07",
+      "kind": "execution",
+      "text": "The from_validated classmethod must return the same instance it receives (identity).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C08",
+      "kind": "execution",
+      "text": "The alt method on Invalid must apply the provided function to each individual error element in the tuple, returning a new Invalid with the mapped results.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C09",
+      "kind": "inspection",
+      "text": "Valid and Invalid must support structural pattern matching via __match_args__.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "Validated must integrate into the library's container interface hierarchy, inheriting standard container behavior including equality, repr, do-notation, unwrap, failure, value_or, and from_value.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "Validated must have a bind_validated method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "The bind method must short-circuit on Invalid (not accumulate errors — only apply collects all errors).",
+      "adverse_condition": "The container is Invalid."
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "Validated must have a from_result classmethod that converts a Result into a Validated: Success becomes Valid, Failure's error is wrapped in a 1-tuple to become Invalid.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "A pointfree bind_validated function must be added and exported from returns/pointfree/__init__.py.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "Validated needs a combine classmethod that takes two Validated values and a binary function and produces a single Validated using applicative combination.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "When combine receives two Invalid containers, it must accumulate all errors from both (not short-circuit).",
+      "adverse_condition": "Both arguments to combine are Invalid."
+    },
+    {
+      "id": "C17",
+      "kind": "inspection",
+      "text": "Validated needs a combine_n classmethod that takes a tuple of N Validated containers and an N-ary function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "combine_n must accumulate all errors if any of the N Validated containers are failures.",
+      "adverse_condition": "At least one of the N Validated containers is Invalid."
+    },
+    {
+      "id": "C19",
+      "kind": "inspection",
+      "text": "Converter function result_to_validated must be added to the converters module.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C20",
+      "kind": "inspection",
+      "text": "Converter function validated_to_result must be added to the converters module.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C21",
+      "kind": "inspection",
+      "text": "A validated decorator must be added that catches exceptions and returns Invalid.",
+      "adverse_condition": "The decorated function raises an exception."
+    },
+    {
+      "id": "C22",
+      "kind": "inspection",
+      "text": "The validated decorator must support specifying exception types via an exceptions parameter.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C23",
+      "kind": "execution",
+      "text": "The validated decorator must preserve the wrapped function's name (i.e., functools.wraps or equivalent).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "inspection",
+      "text": "A new interface ValidatedLikeN must be created extending FailableN directly with its own from_failure classmethod and custom short-circuit law specs for map, bind, and apply on failure values (not extending DiverseFailableN/SwappableN).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "inspection",
+      "text": "returns/methods/cond.py must be updated to add a ValidatedLikeN dispatch branch before the container_type.empty fallback.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C26",
+      "kind": "inspection",
+      "text": "returns/contrib/hypothesis/containers.py must be updated to register ValidatedLikeN with from_failure strategy generation.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C27",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from main.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C28",
+      "kind": "delivery",
+      "text": "Everything must be committed when done.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1612,
+    "completion_tokens": 1876,
+    "total_tokens": 3488,
+    "prompt_tokens_details": {
+      "cached_tokens": 896
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 444
+    },
+    "prompt_cache_hit_tokens": 896,
+    "prompt_cache_miss_tokens": 716
+  }
+}

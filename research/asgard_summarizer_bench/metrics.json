@@ -1,0 +1,318 @@
+{
+  "gemma4-e4b": {
+    "all": {
+      "completion_like_directions": 2,
+      "compression_ratio": {
+        "median": 0.12818897637795276,
+        "p90": 0.5587215064420218
+      },
+      "edit_location_grounding": {
+        "grounded": 346,
+        "rate": 0.7935779816513762,
+        "total": 436
+      },
+      "edit_presence": {
+        "rate": 0.9045226130653267,
+        "summaries_with_edits": 180,
+        "total_items": 436
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 53,
+        "inconclusive": 94,
+        "passed": 410
+      },
+      "finish_reasons": {
+        "stop": 199
+      },
+      "latency_seconds": {
+        "max": 77.61531419900712,
+        "median": 25.260927166003967,
+        "p90": 47.079154074017424
+      },
+      "rows": 200,
+      "schema_invalid": 1,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.2565313636414554,
+        "median": 0.2,
+        "n": 109
+      },
+      "summary_items_median": {
+        "edits": 2,
+        "evidence": 2,
+        "risks": 2
+      },
+      "tokens": {
+        "completion_max": 1192,
+        "completion_median": 504,
+        "completion_p90": 744,
+        "completion_total": 102928,
+        "prompt_total": 1592291
+      },
+      "valid": 199
+    },
+    "edit-producing": {
+      "completion_like_directions": 1,
+      "compression_ratio": {
+        "median": 0.11503944503704733,
+        "p90": 0.2297714638665843
+      },
+      "edit_location_grounding": {
+        "grounded": 189,
+        "rate": 0.9545454545454546,
+        "total": 198
+      },
+      "edit_presence": {
+        "rate": 1.0,
+        "summaries_with_edits": 100,
+        "total_items": 198
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 30,
+        "inconclusive": 21,
+        "passed": 212
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 56.37386583199259,
+        "median": 21.962360486504622,
+        "p90": 33.49038567999378
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.19873876123876125,
+        "median": 0.16666666666666666,
+        "n": 52
+      },
+      "summary_items_median": {
+        "edits": 1.5,
+        "evidence": 2.0,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 1192,
+        "completion_median": 477.0,
+        "completion_p90": 664,
+        "completion_total": 49203,
+        "prompt_total": 687452
+      },
+      "valid": 100
+    },
+    "read-only": {
+      "completion_like_directions": 1,
+      "compression_ratio": {
+        "median": 0.1559082892416226,
+        "p90": 0.9609544468546638
+      },
+      "edit_location_grounding": {
+        "grounded": 157,
+        "rate": 0.6596638655462185,
+        "total": 238
+      },
+      "edit_presence": {
+        "rate": 0.8080808080808081,
+        "summaries_with_edits": 80,
+        "total_items": 238
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 23,
+        "inconclusive": 73,
+        "passed": 198
+      },
+      "finish_reasons": {
+        "stop": 99
+      },
+      "latency_seconds": {
+        "max": 77.61531419900712,
+        "median": 30.93682078801794,
+        "p90": 49.68804788199486
+      },
+      "rows": 100,
+      "schema_invalid": 1,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.3092544395175974,
+        "median": 0.2,
+        "n": 57
+      },
+      "summary_items_median": {
+        "edits": 2,
+        "evidence": 3,
+        "risks": 2
+      },
+      "tokens": {
+        "completion_max": 990,
+        "completion_median": 514,
+        "completion_p90": 798,
+        "completion_total": 53725,
+        "prompt_total": 904839
+      },
+      "valid": 99
+    }
+  },
+  "paired_reference_recall": {
+    "gemma4-e4b_higher": 18,
+    "n": 105,
+    "qwen35-4b_higher": 28,
+    "ties": 59
+  },
+  "qwen35-4b": {
+    "all": {
+      "completion_like_directions": 91,
+      "compression_ratio": {
+        "median": 0.11782636942645842,
+        "p90": 0.4144084600132188
+      },
+      "edit_location_grounding": {
+        "grounded": 491,
+        "rate": 0.7405731523378583,
+        "total": 663
+      },
+      "edit_presence": {
+        "rate": 0.9587628865979382,
+        "summaries_with_edits": 186,
+        "total_items": 663
+      },
+      "errors": 2,
+      "evidence_statuses": {
+        "failed": 154,
+        "inconclusive": 22,
+        "passed": 639
+      },
+      "finish_reasons": {
+        "stop": 194
+      },
+      "latency_seconds": {
+        "max": 369.04568964097416,
+        "median": 57.40322597550403,
+        "p90": 155.86862718799966
+      },
+      "rows": 200,
+      "schema_invalid": 4,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.2864807150521436,
+        "median": 0.21428571428571427,
+        "n": 105
+      },
+      "summary_items_median": {
+        "edits": 2.0,
+        "evidence": 3.0,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 1754,
+        "completion_median": 438.0,
+        "completion_p90": 1063,
+        "completion_total": 106180,
+        "prompt_total": 1445728
+      },
+      "valid": 194
+    },
+    "edit-producing": {
+      "completion_like_directions": 52,
+      "compression_ratio": {
+        "median": 0.10614769536828444,
+        "p90": 0.2175415027348623
+      },
+      "edit_location_grounding": {
+        "grounded": 227,
+        "rate": 0.9190283400809717,
+        "total": 247
+      },
+      "edit_presence": {
+        "rate": 1.0,
+        "summaries_with_edits": 100,
+        "total_items": 247
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 81,
+        "inconclusive": 14,
+        "passed": 243
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 150.5266748649883,
+        "median": 45.87818550398515,
+        "p90": 75.30570827101474
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.23939324564324563,
+        "median": 0.2,
+        "n": 52
+      },
+      "summary_items_median": {
+        "edits": 2.0,
+        "evidence": 2.5,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 1610,
+        "completion_median": 402.0,
+        "completion_p90": 767,
+        "completion_total": 46047,
+        "prompt_total": 633699
+      },
+      "valid": 100
+    },
+    "read-only": {
+      "completion_like_directions": 39,
+      "compression_ratio": {
+        "median": 0.15484744474769807,
+        "p90": 0.5728709394205443
+      },
+      "edit_location_grounding": {
+        "grounded": 264,
+        "rate": 0.6346153846153846,
+        "total": 416
+      },
+      "edit_presence": {
+        "rate": 0.9148936170212766,
+        "summaries_with_edits": 86,
+        "total_items": 416
+      },
+      "errors": 2,
+      "evidence_statuses": {
+        "failed": 73,
+        "inconclusive": 8,
+        "passed": 396
+      },
+      "finish_reasons": {
+        "stop": 94
+      },
+      "latency_seconds": {
+        "max": 369.04568964097416,
+        "median": 89.87173205800354,
+        "p90": 187.15305551400525
+      },
+      "rows": 100,
+      "schema_invalid": 4,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.3326797416420058,
+        "median": 0.2857142857142857,
+        "n": 53
+      },
+      "summary_items_median": {
+        "edits": 4.0,
+        "evidence": 3.0,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 1754,
+        "completion_median": 513.0,
+        "completion_p90": 1207,
+        "completion_total": 60133,
+        "prompt_total": 812029
+      },
+      "valid": 94
+    }
+  }
+}

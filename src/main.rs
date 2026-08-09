@@ -1,50 +1,66 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
 use clap::builder::RangedU64ValueParser;
+use clap::{Parser, Subcommand};
 
-mod agent;
+mod acp;
 mod agents;
 mod agents_md;
 mod bedrock_auth;
 mod bedrock_client;
+mod bedrock_credits;
 mod codex_auth;
 mod codex_client;
 mod codex_credits;
 mod context_manager;
 mod deepseek_auth;
+mod deepseek_balance;
 mod discovery;
+mod goal;
+mod headless;
 mod host_notice;
+#[cfg(feature = "http-api")]
+mod http_api;
 mod http_retry;
+mod infer;
+mod installer;
+mod kimi_auth;
 mod llm_client;
 mod lsp;
 mod mcp;
 mod multi_backend;
+mod openai_providers;
 mod openrouter_auth;
 mod openrouter_credits;
 mod p2t;
+mod plan;
 mod plugins;
 mod responses_api;
+mod runtime;
 mod sandbox_backend;
 mod secrets;
 mod semantic_rerank;
 mod session;
 mod setup_state;
 mod skills;
+mod slash;
 mod structured_output;
 mod terminal_notifications;
+mod text;
 mod tokens;
 mod tool_arguments;
 mod tool_loop;
 mod tools;
 mod trace_logging;
 mod train_bifrost;
+mod turn_runner;
+mod usage_report;
+mod workspace_delta;
 
 use crate::llm_client::LlmBackend;
-use crate::multi_backend::MultiBackend;
+use crate::multi_backend::{BackendRegistration, MultiBackend};
 
 /// Anvil -- Rust-based Agent Client Protocol (ACP) server with
 /// first-run setup and zero-config auto-discovery: at startup we read
@@ -56,6 +72,58 @@ use crate::multi_backend::MultiBackend;
 #[derive(Parser)]
 #[command(name = "anvil", version, about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run one prompt headlessly and exit: connect a built-in ACP client to
+    /// the in-process agent, stream or print the result, then quit. Omit the
+    /// value, or pass `-`, to read the prompt from stdin. For a prompt that
+    /// starts with `-`, use `--print=<prompt>` or stdin. Mirrors Mjolnir's
+    /// `mj --print` contract (#356).
+    #[arg(
+        short = 'p',
+        long = "print",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = "-"
+    )]
+    print: Option<String>,
+
+    /// Output format for --print: `text` prints the final assistant message,
+    /// `json` prints one object at exit, `stream-json` prints
+    /// newline-delimited records as they happen with `result` last.
+    #[arg(long, value_enum, default_value_t = headless::OutputFormat::Text, requires = "print")]
+    output_format: headless::OutputFormat,
+
+    /// Permission policy for --print. `manual` honors read-only auto-approvals
+    /// and remembered repo-scoped Always allow grants, but rejects every
+    /// permission request so a run can never hang; `auto` accepts
+    /// edit/delete/move requests but rejects shell execution; `yolo` accepts
+    /// everything.
+    #[arg(long, value_enum, requires = "print")]
+    permission_mode: Option<headless::PermissionMode>,
+
+    /// Working directory for the --print session. Defaults to the current
+    /// directory.
+    #[arg(long, value_name = "PATH", requires = "print")]
+    cwd: Option<PathBuf>,
+
+    /// Model for the --print session, with an optional trailing `+<effort>`
+    /// (off, none, minimal, low, medium, high, xhigh, max) to set the
+    /// session's reasoning effort independent of the model default.
+    #[arg(
+        long,
+        value_name = "MODEL[+EFFORT]",
+        requires = "print",
+        value_parser = headless::parse_model_override
+    )]
+    model: Option<(String, Option<String>)>,
+
+    /// Resume an existing session by id instead of creating a new one. The
+    /// session's original working directory must match.
+    #[arg(long, value_name = "SESSION_ID", requires = "print")]
+    resume: Option<String>,
+
     /// Override the default model id for new sessions. Accepts a wire
     /// form (`codex::<id>`, `ollama::llama3:latest`) or a bare id
     /// that routes to the preferred backend (Codex if available, else
@@ -131,8 +199,8 @@ struct Args {
     /// and first-run choices made during this process are not read from or
     /// written to setup.json. ACP session config options (model, reasoning,
     /// behavior, permission, and service tier) are already live-session-only.
-    /// Provider credential commands and `/mcp` use their own stores and are not
-    /// made transient by this flag.
+    /// Provider credential commands, the `allowed_tools` tool allowlist, and
+    /// `/mcp` are not made transient by this flag.
     #[arg(long, env = "ANVIL_TRANSIENT_SETUP", default_value_t = false)]
     transient_setup: bool,
 
@@ -168,11 +236,38 @@ struct Args {
     /// runs without any sandbox of any kind.
     #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
+
+    /// Disable the built-in shell-output minimizer. By default,
+    /// `run_shell_command` output from well-known tools (git, cargo,
+    /// pytest, npm, ...) is condensed after capture, with the raw output
+    /// preserved under `.brokk/shell-output/` in the workspace and
+    /// referenced from the tool result.
+    #[arg(long, env = "ANVIL_NO_SHELL_MINIMIZER", default_value_t = false)]
+    no_shell_minimizer: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install Anvil as an ACP agent in a supported editor.
+    Install(installer::InstallArgs),
+    /// Run one tool-free, schema-constrained Codex inference from JSON on stdin.
+    Infer(infer::InferArgs),
+    /// Run Anvil as an HTTP daemon exposing the versioned REST API
+    /// (sessions, models, tools, runs) on a loopback listener.
+    #[cfg(feature = "http-api")]
+    Serve(http_api::ServeArgs),
 }
 
 impl std::fmt::Debug for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Args")
+            .field("command", &self.command)
+            .field("print", &self.print)
+            .field("output_format", &self.output_format)
+            .field("permission_mode", &self.permission_mode)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("resume", &self.resume)
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
@@ -182,6 +277,7 @@ impl std::fmt::Debug for Args {
             .field("llm_idle_timeout_secs", &self.llm_idle_timeout_secs)
             .field("llm_stall_timeout_secs", &self.llm_stall_timeout_secs)
             .field("transient_setup", &self.transient_setup)
+            .field("no_shell_minimizer", &self.no_shell_minimizer)
             // Deprecated flags omitted from Debug to avoid leaking api_key.
             .finish()
     }
@@ -193,7 +289,7 @@ impl std::fmt::Debug for Args {
 /// the picker stays honest.
 ///
 /// Shared by the startup path (`build_codex_backend`) and the
-/// post-`/codex-login` install path in `agent.rs`. Keeps the
+/// post-`/setup codex` install path in `agent.rs`. Keeps the
 /// `auth.auth_mode + tokens` decision tree in one place so the two
 /// callers can't drift.
 pub fn codex_backend_from_auth(auth: &codex_auth::AuthDotJson) -> Option<Arc<dyn LlmBackend>> {
@@ -359,6 +455,31 @@ fn build_deepseek_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
+fn build_kimi_backend() -> Option<Arc<dyn LlmBackend>> {
+    let auth = match kimi_auth::load_provider() {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::warn!("failed to configure Kimi authentication: {error:#}");
+            return None;
+        }
+    }?;
+    let headers = match kimi_auth::default_headers() {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::warn!("failed to configure Kimi request headers: {error:#}");
+            return None;
+        }
+    };
+    let base_url = kimi_auth::base_url();
+    tracing::info!(
+        base_url,
+        "Kimi backend wired from KIMI_API_KEY or Kimi Code credentials"
+    );
+    Some(Arc::new(llm_client::OpenAiClient::with_kimi_support(
+        base_url, auth, headers,
+    )))
+}
+
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks
 /// the OpenAI Chat Completions wire format verbatim, so we reuse
 /// `OpenAiClient` with the OpenRouter base URL and attach the optional
@@ -391,7 +512,7 @@ pub fn openrouter_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
     );
 
     // OpenRouter supports the unified reasoning object, so enable it.
-    Some(Arc::new(llm_client::OpenAiClient::with_reasoning_support(
+    Some(Arc::new(llm_client::OpenAiClient::with_openrouter_support(
         discovery::OPENROUTER_BASE_URL.to_string(),
         Some(key.to_string()),
         headers,
@@ -455,9 +576,40 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
-fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
-    let backend = match bedrock_client::build_backend_from_config() {
-        Ok(Some(backend)) => backend,
+fn build_openai_compatible_backend() -> Result<Option<Arc<dyn LlmBackend>>> {
+    let config = openai_providers::read()?;
+    if config.is_empty() {
+        tracing::info!(
+            "No generic OpenAI-compatible providers configured at {}; create providers.json to enable them.",
+            openai_providers::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the Brokk config directory".to_string())
+        );
+        return Ok(None);
+    }
+    for profile in &config.profiles {
+        tracing::info!(
+            profile = %profile.name,
+            base_url = %profile.base_url,
+            auth = profile.api_key_env.as_deref().unwrap_or("none"),
+            "Generic OpenAI-compatible provider profile configured"
+        );
+    }
+    Ok(openai_providers::build_backend(config))
+}
+
+fn build_bedrock_backend(
+    catalog_mode: setup_state::BedrockCatalogMode,
+) -> Option<Arc<dyn LlmBackend>> {
+    let backend: Arc<dyn LlmBackend> = match bedrock_client::backend_config() {
+        Ok(Some((token, region, model))) => {
+            Arc::new(bedrock_client::BedrockClient::new_with_catalog_mode(
+                token,
+                region,
+                model,
+                catalog_mode,
+            ))
+        }
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!("failed to read Bedrock credentials: {e:#}");
@@ -476,11 +628,6 @@ fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__rtk")) {
-        let rtk_args = std::iter::once(OsString::from("rtk")).chain(std::env::args_os().skip(2));
-        std::process::exit(rtk_core::cli_entry_code(rtk_args));
-    }
-
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -491,6 +638,18 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.print.is_some() && args.command.is_some() {
+        anyhow::bail!("--print cannot be combined with a subcommand");
+    }
+
+    if let Some(Command::Install(install_args)) = &args.command {
+        installer::install(install_args)?;
+        return Ok(());
+    }
+    if let Some(Command::Infer(infer_args)) = &args.command {
+        return infer::run(infer_args).await;
+    }
 
     // Install the parser sandbox before any code that might load a SKILL.md
     // (or, eventually, parse AGENTS.md / session zips / regex queries) so
@@ -578,9 +737,16 @@ async fn main() -> Result<()> {
     // single secrets store before the backends read their credentials.
     secrets::migrate_legacy_files();
 
-    let bedrock_backend = build_bedrock_backend();
+    let bedrock_catalog_mode = if args.transient_setup {
+        setup_state::BedrockCatalogMode::default()
+    } else {
+        setup_state::bedrock_catalog_mode()
+    };
+    let bedrock_backend = build_bedrock_backend(bedrock_catalog_mode);
     let codex_backend = build_codex_backend().await;
     let deepseek_backend = build_deepseek_backend();
+    let kimi_backend = build_kimi_backend();
+    let openai_backend = build_openai_compatible_backend()?;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
 
@@ -605,6 +771,15 @@ async fn main() -> Result<()> {
             discovery::DEEPSEEK_API_KEY_ENV
         );
     }
+    if kimi_backend.is_none() {
+        tracing::info!(
+            "Kimi backend not available; set {} or run `kimi login` to create {}.",
+            kimi_auth::KIMI_API_KEY_ENV,
+            kimi_auth::credentials_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "the Kimi Code credential file".to_string())
+        );
+    }
     if openrouter_backend.is_none() {
         tracing::info!(
             "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
@@ -613,13 +788,32 @@ async fn main() -> Result<()> {
         );
     }
 
-    let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(
-        bedrock_backend,
-        codex_backend,
-        deepseek_backend,
-        openrouter_backend,
-        ollama_backend,
-    ));
+    let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(vec![
+        BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
+        BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OLLAMA,
+            "Local models",
+            ollama_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::DS4, "ds4", None),
+        BackendRegistration::new(
+            discovery::ModelSource::DEEPSEEK,
+            "DeepSeek",
+            deepseek_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENAI,
+            "OpenAI-compatible",
+            openai_backend,
+        ),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENROUTER,
+            "OpenRouter",
+            openrouter_backend,
+        ),
+    ]));
 
     // Kick off model discovery eagerly so any provider errors ("skipped"
     // log lines with HTTP status codes) appear immediately in the startup
@@ -642,7 +836,8 @@ async fn main() -> Result<()> {
         args.default_model,
         limits,
         args.transient_setup,
-    );
+    )
+    .with_shell_minimizer(!args.no_shell_minimizer);
     sessions
         .set_default_reasoning_effort(args.reasoning_effort)
         .await;
@@ -655,9 +850,48 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
+
+    // Headless one-shot mode (#356): drive the same agent component with the
+    // built-in ACP client instead of serving stdio.
+    if let Some(prompt_arg) = args.print {
+        return headless::run(
+            headless::RunConfig {
+                prompt_arg,
+                output_format: args.output_format,
+                permission_mode: args
+                    .permission_mode
+                    .unwrap_or(headless::PermissionMode::Manual),
+                cwd: args.cwd,
+                model: args.model,
+                resume: args.resume,
+            },
+            llm,
+            sessions,
+            max_turns,
+            args.llm_idle_timeout_secs,
+            args.llm_stall_timeout_secs,
+        )
+        .await;
+    }
+
+    // HTTP daemon mode shares the backend registrations, SessionStore, and
+    // turn limits built above with the ACP path, so both transports use one
+    // runtime and persistence implementation (#317, #318).
+    #[cfg(feature = "http-api")]
+    if let Some(Command::Serve(serve_args)) = args.command {
+        return http_api::serve(
+            serve_args,
+            llm,
+            sessions,
+            max_turns,
+            args.llm_idle_timeout_secs,
+            args.llm_stall_timeout_secs,
+        )
+        .await;
+    }
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
-    agent::run_agent(
+    acp::run_agent(
         llm,
         sessions,
         max_turns,

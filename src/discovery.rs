@@ -2,7 +2,8 @@
 //! (`~/.codex/auth.json`), a local Ollama daemon
 //! (`http://localhost:11434/v1/models`), a local ds4-server
 //! (antirez/ds4, an OpenAI-compatible DeepSeek V4 inference engine), and
-//! OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
+//! Kimi Code, generic OpenAI-compatible profiles from `providers.json`,
+//! and OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
 //! `OPENROUTER_API_KEY` env var), and hosted DeepSeek
 //! (`https://api.deepseek.com/v1/models`, gated on `DEEPSEEK_API_KEY`).
 //!
@@ -10,8 +11,10 @@
 //! port. If your daemon listens elsewhere, the catalog will simply not
 //! include Ollama models -- run `ollama serve` on `:11434` to make them
 //! discoverable. OpenRouter and hosted DeepSeek are enabled only when
-//! their API keys are set in the environment; absent the key, the catalog
-//! simply omits their models with no warning.
+//! their API keys are set in the environment or stored setup credentials.
+//! Kimi uses `KIMI_API_KEY` or the Kimi CLI OAuth credential file. Generic
+//! OpenAI-compatible profiles are enabled only when `providers.json`
+//! configures them.
 //!
 //! ds4 is the one source whose port is *not* fixed: `ds4-server` has no
 //! standard port, so instead of probing a constant we detect a running
@@ -21,16 +24,17 @@
 //! macOS (Metal) and Linux (CUDA/ROCm) only, so the process probe is
 //! `cfg(unix)`; elsewhere only the `DS4_BASE_URL` env override is honored.
 //!
-//! Each discovered model carries a `ModelSource` tag so the routing backend
+//! Each discovered model carries a source namespace so the routing backend
 //! (`MultiBackend`) can pick the right HTTP client at request time. The
 //! catalog is presented to ACP clients as `<source>::<id>` wire ids, e.g.
-//! `codex::gpt-5-codex`, `ollama::llama3:latest`, `deepseek::deepseek-v4-pro`, and
+//! `codex::gpt-5-codex`, `ollama::llama3:latest`, `deepseek::deepseek-v4-pro`,
+//! `kimi::k3`, `openai::deca/model-id`, and
 //! `openrouter::anthropic/claude-3.5-sonnet`. The double-colon separator
 //! avoids collision with Ollama tags (`model:tag`) and with OpenRouter
 //! ids (`vendor/model`).
 //!
 //! Failure posture: missing or unreachable sources are logged and skipped,
-//! never propagated. A user with none of the three configured still gets a
+//! never propagated. A user with no providers configured still gets a
 //! working server -- they just see an empty model picker until one of the
 //! sources comes online (and can re-run discovery via `session/new`, which
 //! refreshes the cache).
@@ -38,68 +42,39 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use futures::future::join_all;
 use serde::Deserialize;
 
 use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 
-/// Where a discovered model came from. The variant is encoded into the
-/// wire id so the routing backend doesn't need a per-request map lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModelSource {
-    Bedrock,
-    Codex,
-    DeepSeek,
-    Ds4,
-    Ollama,
-    OpenRouter,
-}
+/// Well-known backend source names. Wire parsing itself accepts any valid
+/// source so adding a registry entry does not require extending a closed enum.
+pub struct ModelSource;
 
 impl ModelSource {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Bedrock => "bedrock",
-            Self::Codex => "codex",
-            Self::DeepSeek => "deepseek",
-            Self::Ds4 => "ds4",
-            Self::Ollama => "ollama",
-            Self::OpenRouter => "openrouter",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DiscoveredModel {
-    /// Bare model id as the upstream returns it (e.g. `gpt-5-codex`,
-    /// `llama3:latest`). Pass this verbatim to the source's chat endpoint.
-    pub id: String,
-    pub source: ModelSource,
-}
-
-impl DiscoveredModel {
-    /// Wire form: `<source>::<id>`. Round-trips through the ACP model picker.
-    pub fn wire_id(&self) -> String {
-        format!("{}::{}", self.source.as_str(), self.id)
-    }
+    pub const BEDROCK: &'static str = "bedrock";
+    pub const CODEX: &'static str = "codex";
+    pub const DEEPSEEK: &'static str = "deepseek";
+    pub const DS4: &'static str = "ds4";
+    pub const KIMI: &'static str = "kimi";
+    pub const OLLAMA: &'static str = "ollama";
+    pub const OPENAI: &'static str = "openai";
+    pub const OPENROUTER: &'static str = "openrouter";
 }
 
 /// Parse a wire-form model id back into `(source, bare_id)`. Returns `None`
-/// if the input is missing the `<source>::` prefix or the prefix is unknown,
-/// in which case callers should treat the input as already-bare and pick a
-/// default backend.
-pub fn split_wire_id(wire: &str) -> Option<(ModelSource, &str)> {
+/// if the input is missing a syntactically valid `<source>::` prefix. Source
+/// membership is checked separately by the backend registry.
+pub fn split_wire_id(wire: &str) -> Option<(&str, &str)> {
     let (prefix, rest) = wire.split_once("::")?;
-    let source = match prefix {
-        "bedrock" => ModelSource::Bedrock,
-        "codex" => ModelSource::Codex,
-        "deepseek" => ModelSource::DeepSeek,
-        "ds4" => ModelSource::Ds4,
-        "ollama" => ModelSource::Ollama,
-        "openrouter" => ModelSource::OpenRouter,
-        _ => return None,
-    };
-    Some((source, rest))
+    let valid_prefix = !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !valid_prefix || rest.is_empty() {
+        return None;
+    }
+    Some((prefix, rest))
 }
 
 /// Default Ollama base URL. Hardcoded by design: the whole point of the
@@ -278,61 +253,6 @@ pub fn discovery_http_client() -> reqwest::Client {
     .expect("failed to build discovery HTTP client")
 }
 
-/// Query Ollama's OpenAI-compatible `/v1/models` endpoint. Recent Ollama
-/// versions preserve tag suffixes (`llama3:latest`) in the OpenAI shim,
-/// so we use it directly instead of the native `/api/tags`. This also
-/// keeps the parsing identical to any other OpenAI-compatible local
-/// server a user might run on the same port.
-pub async fn discover_ollama(
-    http: &reqwest::Client,
-    base_url: &str,
-) -> Result<Vec<DiscoveredModel>> {
-    discover_ollama_models(http, base_url).await
-}
-
-async fn discover_ollama_models(
-    http: &reqwest::Client,
-    base_url: &str,
-) -> Result<Vec<DiscoveredModel>> {
-    discover_openai_compatible_models(http, base_url, ModelSource::Ollama).await
-}
-
-/// Discover models from a local `ds4-server` (antirez/ds4). ds4 speaks the
-/// same OpenAI-compatible `/v1/models` shape as Ollama, so this is the same
-/// probe tagged with [`ModelSource::Ds4`]. `base_url` comes from
-/// [`ds4_base_url`], which already resolved the running server's port.
-pub async fn discover_ds4(http: &reqwest::Client, base_url: &str) -> Result<Vec<DiscoveredModel>> {
-    discover_openai_compatible_models(http, base_url, ModelSource::Ds4).await
-}
-
-/// Shared `/v1/models` probe for any OpenAI-compatible local server. Tags
-/// every returned id with `source` so the catalog routes it back to the
-/// right backend.
-async fn discover_openai_compatible_models(
-    http: &reqwest::Client,
-    base_url: &str,
-    source: ModelSource,
-) -> Result<Vec<DiscoveredModel>> {
-    let base = base_url.trim_end_matches('/');
-    let url = format!("{base}/v1/models");
-    let resp = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("{} /v1/models returned HTTP {status}", source.as_str());
-    }
-    let parsed: crate::llm_client::ModelsResponse =
-        resp.json().await.context("parsing /v1/models JSON")?;
-    Ok(parsed
-        .data
-        .into_iter()
-        .map(|m| DiscoveredModel { id: m.id, source })
-        .collect())
-}
-
 #[derive(Debug, Deserialize)]
 struct OllamaShowResponse {
     #[serde(default)]
@@ -367,15 +287,33 @@ pub async fn discover_ollama_model_metadata(
     http: &reqwest::Client,
     base_url: &str,
 ) -> HashMap<String, ModelMetadata> {
-    let models = match discover_ollama_models(http, base_url).await {
-        Ok(models) => models,
-        Err(e) => {
-            tracing::info!("ollama model metadata discovery skipped at {base_url}: {e:#}");
+    let base = base_url.trim_end_matches('/');
+    let models_url = format!("{base}/v1/models");
+    let models = match http.get(&models_url).send().await {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<crate::llm_client::ModelsResponse>().await {
+                Ok(models) => models.data,
+                Err(error) => {
+                    tracing::info!(
+                        "ollama model metadata discovery skipped at {models_url}: {error:#}"
+                    );
+                    return HashMap::new();
+                }
+            }
+        }
+        Ok(response) => {
+            tracing::info!(
+                "ollama model metadata discovery skipped at {models_url}: HTTP {}",
+                response.status()
+            );
+            return HashMap::new();
+        }
+        Err(error) => {
+            tracing::info!("ollama model metadata discovery skipped at {base_url}: {error:#}");
             return HashMap::new();
         }
     };
 
-    let base = base_url.trim_end_matches('/');
     let show_url = format!("{base}/api/show");
     let futures = models.into_iter().map(|model| {
         let http = http.clone();
@@ -453,177 +391,14 @@ pub async fn discover_ollama_model_metadata(
     join_all(futures).await.into_iter().flatten().collect()
 }
 
-// ---------------------------------------------------------------------------
-// Top-level orchestrator
-// ---------------------------------------------------------------------------
-
-/// Run all configured discovery sources concurrently and merge results.
-/// Failures are logged and treated as "no models from this source" so a
-/// dead Ollama daemon doesn't shadow a working Codex login (or vice versa).
-///
-/// `ollama_url` is a parameter purely for test injection -- production
-/// always passes `OLLAMA_DEFAULT_URL`. There's no CLI flag for this; the
-/// zero-config posture means the user doesn't pick a port.
-///
-/// Codex, hosted DeepSeek, and OpenRouter discovery are delegated to caller-provided
-/// closures. For Codex, the `CodexClient` lives in a sibling module that
-/// already handles auth.json parsing, fallback slugs, and
-/// `chatgpt`/`apikey` mode branching. For the hosted providers, each
-/// closure lets the caller short-circuit cleanly when the matching API
-/// key is absent without `discovery.rs` having to know about env vars.
-/// Each closure keeps `discovery.rs` agnostic of those concerns while
-/// still running all sources in parallel.
-///
-/// `ds4_url` is `Some` only when a local `ds4-server` was detected (or
-/// `DS4_BASE_URL` is set); `None` skips ds4 entirely. See [`ds4_base_url`].
-///
-/// Output ordering is fixed: Bedrock, Codex, Ollama, ds4, hosted DeepSeek,
-/// then OpenRouter.
-/// The first model in the merged list is auto-selected as the session
-/// default elsewhere -- keeping ordering deterministic stops users from
-/// seeing a different default just because one source happened to be
-/// slow on a given boot. ds4 sits after Ollama so an existing Ollama
-/// user's default is unchanged. Hosted DeepSeek sits before OpenRouter so
-/// a direct vendor backend wins over the aggregator when both expose the
-/// same family of models.
-pub async fn discover_all<FB, FutB, FC, FutC, FDS, FutDS, FOR, FutOR>(
-    http: &reqwest::Client,
-    ollama_url: &str,
-    ds4_url: Option<&str>,
-    bedrock_lookup: FB,
-    codex_lookup: FC,
-    deepseek_lookup: FDS,
-    openrouter_lookup: FOR,
-) -> Vec<DiscoveredModel>
-where
-    FB: FnOnce() -> FutB,
-    FutB: std::future::Future<Output = Result<Vec<String>>>,
-    FC: FnOnce() -> FutC,
-    FutC: std::future::Future<Output = Result<Vec<String>>>,
-    FDS: FnOnce() -> FutDS,
-    FutDS: std::future::Future<Output = Result<Vec<String>>>,
-    FOR: FnOnce() -> FutOR,
-    FutOR: std::future::Future<Output = Result<Vec<String>>>,
-{
-    let bedrock_fut = async {
-        match bedrock_lookup().await {
-            Ok(ids) => ids
-                .into_iter()
-                .map(|id| DiscoveredModel {
-                    id,
-                    source: ModelSource::Bedrock,
-                })
-                .collect(),
-            Err(e) => {
-                tracing::info!("bedrock model discovery skipped: {e:#}");
-                Vec::new()
-            }
-        }
-    };
-
-    let codex_fut = async {
-        match codex_lookup().await {
-            Ok(ids) => ids
-                .into_iter()
-                .map(|id| DiscoveredModel {
-                    id,
-                    source: ModelSource::Codex,
-                })
-                .collect(),
-            Err(e) => {
-                tracing::info!("codex model discovery skipped: {e:#}");
-                Vec::new()
-            }
-        }
-    };
-
-    let deepseek_fut = async {
-        match deepseek_lookup().await {
-            Ok(ids) => ids
-                .into_iter()
-                .map(|id| DiscoveredModel {
-                    id,
-                    source: ModelSource::DeepSeek,
-                })
-                .collect(),
-            Err(e) => {
-                tracing::info!("deepseek model discovery skipped: {e:#}");
-                Vec::new()
-            }
-        }
-    };
-
-    let openrouter_fut = async {
-        match openrouter_lookup().await {
-            Ok(ids) => ids
-                .into_iter()
-                .map(|id| DiscoveredModel {
-                    id,
-                    source: ModelSource::OpenRouter,
-                })
-                .collect(),
-            Err(e) => {
-                tracing::info!("openrouter model discovery skipped: {e:#}");
-                Vec::new()
-            }
-        }
-    };
-
-    let ollama_fut = async {
-        match discover_ollama(http, ollama_url).await {
-            Ok(models) => models,
-            Err(e) => {
-                tracing::info!("ollama model discovery skipped at {ollama_url}: {e:#}");
-                Vec::new()
-            }
-        }
-    };
-
-    let ds4_fut = async {
-        match ds4_url {
-            Some(url) => match discover_ds4(http, url).await {
-                Ok(models) => models,
-                Err(e) => {
-                    tracing::info!("ds4 model discovery skipped at {url}: {e:#}");
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        }
-    };
-
-    let (bedrock, codex, deepseek, openrouter, ollama, ds4) = tokio::join!(
-        bedrock_fut,
-        codex_fut,
-        deepseek_fut,
-        openrouter_fut,
-        ollama_fut,
-        ds4_fut
-    );
-    let mut all = Vec::with_capacity(
-        bedrock.len() + codex.len() + ollama.len() + ds4.len() + deepseek.len() + openrouter.len(),
-    );
-    all.extend(bedrock);
-    all.extend(codex);
-    all.extend(ollama);
-    all.extend(ds4);
-    all.extend(deepseek);
-    all.extend(openrouter);
-    all
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// `discover_ollama` parses the OpenAI-shape `/v1/models` body and
-    /// preserves tag suffixes (`llama3:latest`) verbatim through to
-    /// `DiscoveredModel.id`. Without this test, the existing
-    /// `discover_all_*` cases only hit the connect-refused error path
-    /// via `TEST_DEAD_OLLAMA_URL`, so the JSON parsing path was never
-    /// exercised.
+    /// Ollama metadata discovery parses the OpenAI-shape `/v1/models` body
+    /// and preserves tag suffixes (`llama3:latest`) verbatim.
     #[tokio::test]
     async fn discover_ollama_parses_v1_models_shape() {
         let server = MockServer::start().await;
@@ -640,11 +415,10 @@ mod tests {
             .await;
 
         let http = discovery_http_client();
-        let models = discover_ollama(&http, &server.uri()).await.expect("ok");
+        let models = discover_ollama_model_metadata(&http, &server.uri()).await;
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "llama3:latest");
-        assert_eq!(models[0].source, ModelSource::Ollama);
-        assert_eq!(models[1].id, "qwen3.6:35b-a3b-coding-mxfp8");
+        assert!(models.contains_key("llama3:latest"));
+        assert!(models.contains_key("qwen3.6:35b-a3b-coding-mxfp8"));
     }
 
     /// `discover_ollama_model_metadata` marks only models whose
@@ -708,220 +482,29 @@ mod tests {
         assert_eq!(plain.supports_images, Some(false));
     }
 
-    /// `wire_id` round-trips through `split_wire_id` for every source,
-    /// preserves Ollama tag suffixes (the inner colon in `llama3:latest`),
-    /// and preserves OpenRouter vendor-prefixed ids (the inner slash in
-    /// `anthropic/claude-3.5-sonnet`).
     #[test]
-    fn wire_id_round_trips_for_every_source() {
-        let bedrock = DiscoveredModel {
-            id: "us.anthropic.claude-sonnet-4-6".into(),
-            source: ModelSource::Bedrock,
-        };
-        let bedrock_wire = bedrock.wire_id();
-        assert_eq!(bedrock_wire, "bedrock::us.anthropic.claude-sonnet-4-6");
-        let (src, id) = split_wire_id(&bedrock_wire).expect("must parse");
-        assert_eq!(src, ModelSource::Bedrock);
-        assert_eq!(id, "us.anthropic.claude-sonnet-4-6");
-
-        let codex = DiscoveredModel {
-            id: "gpt-5-codex".into(),
-            source: ModelSource::Codex,
-        };
-        let codex_wire = codex.wire_id();
-        assert_eq!(codex_wire, "codex::gpt-5-codex");
-        let (src, id) = split_wire_id(&codex_wire).expect("must parse");
-        assert_eq!(src, ModelSource::Codex);
-        assert_eq!(id, "gpt-5-codex");
-
-        let deepseek = DiscoveredModel {
-            id: "deepseek-v4-pro".into(),
-            source: ModelSource::DeepSeek,
-        };
-        let deepseek_wire = deepseek.wire_id();
-        assert_eq!(deepseek_wire, "deepseek::deepseek-v4-pro");
-        let (src, id) = split_wire_id(&deepseek_wire).expect("must parse");
-        assert_eq!(src, ModelSource::DeepSeek);
-        assert_eq!(id, "deepseek-v4-pro");
-
-        let ollama = DiscoveredModel {
-            id: "llama3:latest".into(),
-            source: ModelSource::Ollama,
-        };
-        let ollama_wire = ollama.wire_id();
-        assert_eq!(ollama_wire, "ollama::llama3:latest");
-        let (src, id) = split_wire_id(&ollama_wire).expect("must parse");
-        assert_eq!(src, ModelSource::Ollama);
-        // The inner `:` survives -- our separator is the double-colon, so
-        // the bare id keeps its tag suffix and routes correctly to Ollama.
-        assert_eq!(id, "llama3:latest");
-
-        let ds4 = DiscoveredModel {
-            id: "deepseek-v4-flash".into(),
-            source: ModelSource::Ds4,
-        };
-        let ds4_wire = ds4.wire_id();
-        assert_eq!(ds4_wire, "ds4::deepseek-v4-flash");
-        let (src, id) = split_wire_id(&ds4_wire).expect("must parse");
-        assert_eq!(src, ModelSource::Ds4);
-        assert_eq!(id, "deepseek-v4-flash");
-
-        let openrouter = DiscoveredModel {
-            id: "anthropic/claude-3.5-sonnet".into(),
-            source: ModelSource::OpenRouter,
-        };
-        let openrouter_wire = openrouter.wire_id();
-        assert_eq!(openrouter_wire, "openrouter::anthropic/claude-3.5-sonnet");
-        let (src, id) = split_wire_id(&openrouter_wire).expect("must parse");
-        assert_eq!(src, ModelSource::OpenRouter);
-        // The inner `/` survives -- OpenRouter's `vendor/model` format
-        // round-trips through the wire id without escaping.
-        assert_eq!(id, "anthropic/claude-3.5-sonnet");
+    fn split_wire_id_preserves_model_syntax_and_accepts_registered_extensions() {
+        assert_eq!(
+            split_wire_id("ollama::llama3:latest"),
+            Some((ModelSource::OLLAMA, "llama3:latest"))
+        );
+        assert_eq!(
+            split_wire_id("openrouter::anthropic/claude-3.5-sonnet"),
+            Some((ModelSource::OPENROUTER, "anthropic/claude-3.5-sonnet"))
+        );
+        assert_eq!(split_wire_id("kimi::k3"), Some((ModelSource::KIMI, "k3")));
+        assert_eq!(
+            split_wire_id("future-provider::model"),
+            Some(("future-provider", "model"))
+        );
     }
 
-    /// Wire ids without the `::` separator or with an unknown source are
-    /// rejected so callers can treat them as already-bare and route to a
-    /// default backend rather than silently mis-tagging them.
     #[test]
-    fn split_wire_id_rejects_bare_or_unknown_prefix() {
+    fn split_wire_id_rejects_bare_or_invalid_prefix() {
         assert!(split_wire_id("gpt-5-codex").is_none());
         assert!(split_wire_id("llama3:latest").is_none());
-        assert!(split_wire_id("anthropic/claude-3.5-sonnet").is_none());
-        assert!(split_wire_id("unknown::foo").is_none());
-        // Single colon is not enough -- `llama3:latest` is a bare Ollama id,
-        // not a wire id, so we must NOT treat it as `source=llama3`.
-        assert!(split_wire_id("llama3:latest").is_none());
-    }
-
-    /// Closed-port URL used by tests to force `discover_ollama` to fail
-    /// fast via `connect_timeout`, regardless of whether the test host
-    /// happens to have a real Ollama running on the default port.
-    const TEST_DEAD_OLLAMA_URL: &str = "http://127.0.0.1:1";
-
-    /// `discover_all` returns Bedrock first, then Codex, Ollama, ds4,
-    /// DeepSeek, then OpenRouter,
-    /// regardless of which future resolves first. Stable ordering matters
-    /// because the first model in the catalog is auto-selected as the
-    /// session default; OpenRouter stays last because it is the explicit
-    /// aggregator choice rather than the "choose for me" default.
-    #[tokio::test]
-    async fn discover_all_orders_codex_ollama_openrouter() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "object": "list",
-                "data": [
-                    {"id": "llama3:latest", "object": "model"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let http = discovery_http_client();
-        // Point ds4 at the same mock /v1/models so it also yields one model;
-        // this exercises the fixed ordering with every source populated.
-        let models = discover_all(
-            &http,
-            &server.uri(),
-            Some(&server.uri()),
-            || async { Ok(vec!["us.anthropic.claude-sonnet-4-6".to_string()]) },
-            || async { Ok(vec!["gpt-5-codex".to_string(), "gpt-4o".to_string()]) },
-            || async { Ok(vec!["deepseek-v4-pro".to_string()]) },
-            || async {
-                Ok(vec![
-                    "anthropic/claude-3.5-sonnet".to_string(),
-                    "openai/gpt-4o".to_string(),
-                ])
-            },
-        )
-        .await;
-        // Bedrock 1; Codex 2; Ollama 1; ds4 1; DeepSeek 1; OpenRouter 2.
-        assert_eq!(models.len(), 8);
-        assert_eq!(models[0].source, ModelSource::Bedrock);
-        assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
-        assert_eq!(models[1].source, ModelSource::Codex);
-        assert_eq!(models[1].id, "gpt-5-codex");
-        assert_eq!(models[2].source, ModelSource::Codex);
-        assert_eq!(models[3].source, ModelSource::Ollama);
-        assert_eq!(models[3].id, "llama3:latest");
-        assert_eq!(models[4].source, ModelSource::Ds4);
-        assert_eq!(models[4].id, "llama3:latest");
-        assert_eq!(models[5].source, ModelSource::DeepSeek);
-        assert_eq!(models[5].id, "deepseek-v4-pro");
-        assert_eq!(models[6].source, ModelSource::OpenRouter);
-        assert_eq!(models[6].id, "anthropic/claude-3.5-sonnet");
-        assert_eq!(models[7].source, ModelSource::OpenRouter);
-    }
-
-    /// When every source fails, the merged vec is empty rather than an
-    /// error -- the server still starts and the user can run /setup codex,
-    /// start Ollama, or export `OPENROUTER_API_KEY`, then re-run discovery
-    /// via the next session/new.
-    #[tokio::test]
-    async fn discover_all_returns_empty_when_every_source_fails() {
-        let http = discovery_http_client();
-        let models = discover_all(
-            &http,
-            TEST_DEAD_OLLAMA_URL,
-            None,
-            || async { anyhow::bail!("no Bedrock token") },
-            || async { anyhow::bail!("no auth.json") },
-            || async { anyhow::bail!("no DEEPSEEK_API_KEY") },
-            || async { anyhow::bail!("no OPENROUTER_API_KEY") },
-        )
-        .await;
-        assert!(models.is_empty());
-    }
-
-    /// OpenRouter discovery is treated independently from Codex: a Codex
-    /// failure (no auth.json) must not suppress OpenRouter results, and
-    /// vice versa. Regression for the "missing source shadows working
-    /// source" failure mode the orchestrator is specifically designed to
-    /// prevent.
-    #[tokio::test]
-    async fn discover_all_keeps_openrouter_when_codex_fails() {
-        let http = discovery_http_client();
-        let models = discover_all(
-            &http,
-            TEST_DEAD_OLLAMA_URL,
-            None,
-            || async { anyhow::bail!("no Bedrock token") },
-            || async { anyhow::bail!("no auth.json") },
-            || async { anyhow::bail!("no DEEPSEEK_API_KEY") },
-            || async { Ok(vec!["anthropic/claude-3.5-sonnet".to_string()]) },
-        )
-        .await;
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].source, ModelSource::OpenRouter);
-        assert_eq!(models[0].id, "anthropic/claude-3.5-sonnet");
-    }
-
-    /// `discover_ds4` hits the same OpenAI-compatible `/v1/models` shape as
-    /// Ollama but tags the results [`ModelSource::Ds4`]. ds4 reports
-    /// `deepseek-v4-flash` / `deepseek-v4-pro`, so verify both come back
-    /// verbatim and routed to the ds4 source.
-    #[tokio::test]
-    async fn discover_ds4_parses_v1_models_shape() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "object": "list",
-                "data": [
-                    {"id": "deepseek-v4-flash", "object": "model"},
-                    {"id": "deepseek-v4-pro", "object": "model"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let http = discovery_http_client();
-        let models = discover_ds4(&http, &server.uri()).await.expect("ok");
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "deepseek-v4-flash");
-        assert_eq!(models[0].source, ModelSource::Ds4);
-        assert_eq!(models[1].id, "deepseek-v4-pro");
+        assert!(split_wire_id("Bad::foo").is_none());
+        assert!(split_wire_id("openai::").is_none());
     }
 
     /// `parse_lsof_listen_port` pulls the port out of the first `(LISTEN)`

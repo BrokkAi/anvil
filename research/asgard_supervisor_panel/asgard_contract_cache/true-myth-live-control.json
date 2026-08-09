@@ -1,0 +1,365 @@
+{
+  "contracts": [
+    {
+      "id": "C01",
+      "kind": "inspection",
+      "text": "Maybe must implement `[Symbol.iterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C02",
+      "kind": "inspection",
+      "text": "Result must implement `[Symbol.iterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C03",
+      "kind": "inspection",
+      "text": "Task must implement `[Symbol.asyncIterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C04",
+      "kind": "execution",
+      "text": "Task's async iterator must yield exactly one Result: Ok for a resolved task and Err for a rejected one.",
+      "adverse_condition": "The iterator must produce Ok only when the task resolves and Err only when it rejects; a test that always resolves or always rejects cannot distinguish which Result variant pairs with which outcome."
+    },
+    {
+      "id": "C05",
+      "kind": "inspection",
+      "text": "`maybe` must export a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C06",
+      "kind": "inspection",
+      "text": "`result` must export a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C07",
+      "kind": "inspection",
+      "text": "`task` must export a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C08",
+      "kind": "inspection",
+      "text": "`maybe` must export a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C09",
+      "kind": "inspection",
+      "text": "`result` must export a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "`task` must export a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "`maybe` must export a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "`result` must export a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "`task` must export a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "`maybe` must export a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "`result` must export a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "`task` must export a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `sequence` must accept any Iterable.",
+      "adverse_condition": "Verification requires passing at least one non-Array Iterable (e.g., a generator, Set, or Map)."
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `sequence` must stop advancing the iterator immediately after the first failure.",
+      "adverse_condition": "Verification requires an Iterable whose advancement past the first failure can be observed (e.g., a generator with a side-effecting yield after the failure); a plain array conceals whether iteration continued."
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `traverse` must accept any Iterable.",
+      "adverse_condition": "Verification requires passing at least one non-Array Iterable."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `traverse` must stop advancing the iterator immediately after the first failure.",
+      "adverse_condition": "Verification requires an Iterable whose advancement past the first failure can be observed; a plain array conceals whether iteration continued."
+    },
+    {
+      "id": "C21",
+      "kind": "inspection",
+      "text": "`traverse` on `maybe` and `result` must have the non-curried signature `traverse(items, fn)` — items first, function second.",
+      "adverse_condition": "The argument order must be verified by calling traverse with two arguments where the first is iterable and the second is a function; swapping them must produce a detectably different result."
+    },
+    {
+      "id": "C22",
+      "kind": "inspection",
+      "text": "`traverse` on `maybe` and `result` must have a single-argument curried form `traverse(fn)` that returns `(items) => result`.",
+      "adverse_condition": "The curried form must be confirmed by calling with only a function and verifying the return is itself callable with an iterable, producing the same result as the non-curried call."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "`traverse` on `task` must have the non-curried signature `traverse(items, fn)`.",
+      "adverse_condition": "Verification requires calling with two arguments where the first is iterable and the second is a function, confirming the argument positions."
+    },
+    {
+      "id": "C24",
+      "kind": "inspection",
+      "text": "`traverse` on `task` must have a single-argument curried form `traverse(fn)` that returns `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "inspection",
+      "text": "`zipWith` on `maybe`, `result`, and `task` must take the signature `(a, b, fn)` — data arguments first, combiner function last.",
+      "adverse_condition": "Verification requires calling with three arguments where the first two are data/container values and the third is a function; reversing the argument positions must produce a detectably different result."
+    },
+    {
+      "id": "C26",
+      "kind": "inspection",
+      "text": "For `zipWith(a, b, fn)`, the value from container `a` must reach the first positional argument of `fn` and the value from container `b` must reach the second positional argument of `fn`.",
+      "adverse_condition": "Verification requires two containers holding different, distinguishable values and a non-commutative combiner (e.g., string concatenation or subtraction); homogeneous inputs or a commutative combiner (addition) cannot detect swaps."
+    },
+    {
+      "id": "C27",
+      "kind": "inspection",
+      "text": "`maybe` must export a `compact` function that drops failures silently.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`compact` on `maybe` must drop failures silently — only `Just` values appear in the output.",
+      "adverse_condition": "Verification requires an input containing at least one Nothing; a test with all-Just inputs cannot distinguish compact from identity."
+    },
+    {
+      "id": "C29",
+      "kind": "inspection",
+      "text": "`maybe` must export a `filterMap` function with non-curried signature `filterMap(items, fn)`.",
+      "adverse_condition": "Argument order must be verified by calling with two arguments where the first is iterable and the second is a function."
+    },
+    {
+      "id": "C30",
+      "kind": "inspection",
+      "text": "`filterMap` on `maybe` must have a curried form `filterMap(fn)` returning `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C31",
+      "kind": "inspection",
+      "text": "`result` must export a `partition` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "`partition` on `result` must split into `[oks, errs]`.",
+      "adverse_condition": "Verification requires an input containing at least one Ok and at least one Err; all-Ok or all-Err inputs cannot confirm both arrays receive correct items. Additionally, each value must carry a distinguishable marker to confirm it lands in the correct array — same-valued items cannot reveal misplacement."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "Each reported classification in `partition` output must carry the correct value for its specific scenario: an Ok value must appear in the `oks` array with its contained value, and an Err value must appear in the `errs` array with its contained error.",
+      "adverse_condition": "Verification requires distinguishable values in each Result variant; homogeneous values across variants cannot detect label-swapping bugs."
+    },
+    {
+      "id": "C34",
+      "kind": "inspection",
+      "text": "`task` must export a `traverseSerial` function with non-curried signature `traverseSerial(items, fn)`.",
+      "adverse_condition": "Argument order must be verified by calling with two arguments where the first is iterable and the second is a function."
+    },
+    {
+      "id": "C35",
+      "kind": "inspection",
+      "text": "`traverseSerial` on `task` must have a curried form `traverseSerial(fn)` returning `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C36",
+      "kind": "execution",
+      "text": "`traverseSerial` on `task` must execute tasks sequentially.",
+      "adverse_condition": "Verification requires tasks whose side effects are observable in order (e.g., appending to a shared array with timestamps); concurrent execution would produce interleaved or out-of-order effects."
+    },
+    {
+      "id": "C37",
+      "kind": "execution",
+      "text": "`traverseSerial` on `task` must stop on first rejection.",
+      "adverse_condition": "Verification requires a sequence where a task after the first rejection has an observable side effect; if that side effect fires, the stop-on-rejection contract is violated."
+    },
+    {
+      "id": "C38",
+      "kind": "inspection",
+      "text": "`task` must export a `tap` function with signature `tap(task, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C39",
+      "kind": "inspection",
+      "text": "`task` must export a `tapRejected` function with signature `tapRejected(task, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C40",
+      "kind": "inspection",
+      "text": "`tap` on `task` must have a curried form `tap(fn)` returning `(task) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C41",
+      "kind": "inspection",
+      "text": "`tapRejected` on `task` must have a curried form `tapRejected(fn)` returning `(task) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C42",
+      "kind": "execution",
+      "text": "`tap(task, fn)` must pass the resolved value through unchanged.",
+      "adverse_condition": "Verification requires the side-effect function to be distinguishable from the identity (e.g., it mutates external state); if fn does nothing observable, pass-through cannot be distinguished from the function altering the value and restoring it."
+    },
+    {
+      "id": "C43",
+      "kind": "execution",
+      "text": "`tapRejected(task, fn)` must pass the rejected value through unchanged.",
+      "adverse_condition": "Same as C42 but for the rejection path; a test that only exercises resolution cannot verify this."
+    },
+    {
+      "id": "C44",
+      "kind": "inspection",
+      "text": "`task` must export a `retryN` function with signature `retryN(n, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C45",
+      "kind": "execution",
+      "text": "`retryN(n, fn)` must retry a task-producing function up to `n` additional times on rejection — meaning `fn` is called at most n+1 times total.",
+      "adverse_condition": "Verification requires n ≥ 1 and a fn that rejects deterministically for the first k calls then resolves; the number of calls must be observable via a counter in fn's closure."
+    },
+    {
+      "id": "C46",
+      "kind": "execution",
+      "text": "`retryN(n, fn)` must stop retrying and propagate the rejection once `n` additional attempts have been exhausted and the most recent attempt also rejected.",
+      "adverse_condition": "Verification requires a fn that always rejects; the returned task must reject after exactly n+1 calls, not n or n+2."
+    },
+    {
+      "id": "C47",
+      "kind": "inspection",
+      "text": "`maybe` must export a `firstJust` function with signature `firstJust(maybes)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C48",
+      "kind": "execution",
+      "text": "`firstJust(maybes)` must return the first `Just` in the array.",
+      "adverse_condition": "Verification requires an array where the first Just is not at index 0 and contains a distinguishable value; a single-element or all-Nothing array cannot confirm the 'first' semantics."
+    },
+    {
+      "id": "C49",
+      "kind": "execution",
+      "text": "`firstJust(maybes)` must return `Nothing` if no `Just` exists in the array.",
+      "adverse_condition": "Verification requires an array containing only Nothing values (or empty); any Just present would mask this behavior."
+    },
+    {
+      "id": "C50",
+      "kind": "inspection",
+      "text": "`toolbelt` must export `sequenceMaybeAsResult`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C51",
+      "kind": "inspection",
+      "text": "`toolbelt` must export `traverseMaybeAsResult`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C52",
+      "kind": "inspection",
+      "text": "`toolbelt` must export `zipMaybeAsResult`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C53",
+      "kind": "execution",
+      "text": "`sequenceMaybeAsResult`, `traverseMaybeAsResult`, and `zipMaybeAsResult` must each accept a caller-supplied `errValue` that converts `Nothing` into `Err`.",
+      "adverse_condition": "Verification requires at least one Nothing in the input; without a Nothing, the errValue is never exercised."
+    },
+    {
+      "id": "C54",
+      "kind": "inspection",
+      "text": "`sequenceMaybeAsResult`, `traverseMaybeAsResult`, and `zipMaybeAsResult` must each have a curried form `fn(errValue)` that returns a function taking the remaining arguments.",
+      "adverse_condition": "Verification requires calling with only errValue and confirming the return is a callable function."
+    },
+    {
+      "id": "C55",
+      "kind": "inspection",
+      "text": "`traverseMaybeAsResult` must have the non-curried signature `traverseMaybeAsResult(errValue, items, fn)` — errValue first, then items, then function.",
+      "adverse_condition": "Argument order must be verified with three distinguishable arguments where swapping produces a detectably different result."
+    },
+    {
+      "id": "C56",
+      "kind": "execution",
+      "text": "For `traverseMaybeAsResult(errValue, items, fn)`, the errValue must reach the Err constructor for each Nothing encountered, the items must be iterated in order, and each fn result must be mapped via the Maybe-to-Result conversion.",
+      "adverse_condition": "Verification requires an items iterable containing at least one element whose fn returns Nothing, and the errValue must be distinguishable from any value fn could naturally produce, so the Err wrapper is proven to contain the supplied errValue, not a coincidence."
+    },
+    {
+      "id": "C57",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from main.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C58",
+      "kind": "delivery",
+      "text": "All changes must be committed when done.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1804,
+    "completion_tokens": 4289,
+    "total_tokens": 6093,
+    "prompt_tokens_details": {
+      "cached_tokens": 1152
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 637
+    },
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 652
+  }
+}

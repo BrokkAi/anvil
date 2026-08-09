@@ -1,0 +1,1723 @@
+{
+  "studies": [
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 96000,
+          "cachedWrite": 0,
+          "input": 9791,
+          "output": 534,
+          "thought": 86
+        },
+        "1": {
+          "cachedRead": 82176,
+          "cachedWrite": 0,
+          "input": 860,
+          "output": 372,
+          "thought": 94
+        },
+        "2": {
+          "cachedRead": 92032,
+          "cachedWrite": 0,
+          "input": 9939,
+          "output": 833,
+          "thought": 158
+        }
+      },
+      "continued_killed": [
+        1
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "All three lanes produced zero implementation \u2014 no patches, no edited files, no tests, no commits. Differences are confined to reconnaissance depth: Lane 2 listing src/ subdirectories (pg-core, mysql-core, sqlite-core, sql/, query-builders/), Lane 0 identifying more unresolved risks but stopping at root, Lane 1 performing only the shallowest root-level listing. No architectural or cosmetic implementation divergence exists to classify."
+      ],
+      "distinction_kind": "unclear",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        0,
+        2,
+        1
+      ],
+      "final_winner": 0,
+      "final_winner_probe_rank": 2,
+      "final_winner_survived": true,
+      "killed": [
+        1
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        2,
+        0,
+        1
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 290798,
+        "one_winner_oracle_continuation_raw_input": 105791,
+        "one_winner_oracle_continuation_savings_fraction": 0.6362045130984395,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.42105610531011317,
+        "top_k_continuation_raw_input": 207762,
+        "top_k_continuation_savings_fraction": 0.28554529260861494,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.18898103726091744
+      },
+      "source": "/tmp/asgard-shadow-drizzle.jsonl",
+      "study_id": "096a3ea1-3e58-4c80-8335-ec68e3791edb",
+      "survivors": [
+        2,
+        0
+      ],
+      "task": "286cc8fd-1156-482e-b54d-cbdd506e81ad",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 270208,
+          "cachedWrite": 0,
+          "input": 20590,
+          "output": 1739,
+          "thought": 338
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 36080,
+          "output": 141,
+          "thought": 1501
+        },
+        "probe_candidates": {
+          "cachedRead": 50816,
+          "cachedWrite": 0,
+          "input": 53476,
+          "output": 2397,
+          "thought": 528
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 7322,
+          "output": 219,
+          "thought": 788
+        },
+        "total": {
+          "cachedRead": 321920,
+          "cachedWrite": 0,
+          "input": 117468,
+          "output": 4496,
+          "thought": 3155
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 82176,
+          "cachedWrite": 0,
+          "input": 1222,
+          "output": 441,
+          "thought": 146
+        },
+        "1": {
+          "cachedRead": 84224,
+          "cachedWrite": 0,
+          "input": 1836,
+          "output": 601,
+          "thought": 121
+        },
+        "2": {
+          "cachedRead": 86528,
+          "cachedWrite": 0,
+          "input": 2440,
+          "output": 548,
+          "thought": 196
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-1 successfully executed git commands confirming branch (main) and commit (e8e6edfe) in the drizzle monorepo, providing concrete evidence of repository access and project identity.",
+        "Lane-0 and Lane-2 both received empty directory listings from list_files, indicating the codebase was not accessible in those worktree environments.",
+        "All three lanes produced zero implementation (0 bytes patch, 0 files changed, 0 shell commands beyond exploration), but Lane-1's git confirmation is a materially better launch point for subsequent implementation than the fully blocked discovery in the other two lanes.",
+        "Lane-0 made two distinct exploration attempts (list_files and a malformed list_directory call), while Lane-2 made only one (list_files), giving Lane-0 a marginal edge in exploration effort despite the same empty result."
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        1,
+        0,
+        2
+      ],
+      "final_winner": 1,
+      "final_winner_probe_rank": 1,
+      "final_winner_survived": true,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": true,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 258426,
+        "one_winner_oracle_continuation_raw_input": 86060,
+        "one_winner_oracle_continuation_savings_fraction": 0.6669839722009395,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.44079092057549396,
+        "top_k_continuation_raw_input": 169458,
+        "top_k_continuation_savings_fraction": 0.3442687655266885,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.2275175302656008
+      },
+      "source": "/tmp/asgard-shadow-g2-drizzle.jsonl",
+      "study_id": "28607b93-e86c-4ce6-ae0e-4a0e62316c69",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "c58dc6d1-151e-49c9-92fc-053c59de1ea1",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 252928,
+          "cachedWrite": 0,
+          "input": 5498,
+          "output": 1590,
+          "thought": 463
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 14959,
+          "output": 137,
+          "thought": 801
+        },
+        "probe_candidates": {
+          "cachedRead": 57216,
+          "cachedWrite": 0,
+          "input": 53450,
+          "output": 3007,
+          "thought": 618
+        },
+        "probe_review": {
+          "cachedRead": 1024,
+          "cachedWrite": 0,
+          "input": 5579,
+          "output": 300,
+          "thought": 570
+        },
+        "total": {
+          "cachedRead": 311552,
+          "cachedWrite": 0,
+          "input": 79486,
+          "output": 5034,
+          "thought": 2452
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 140416,
+          "cachedWrite": 0,
+          "input": 25414,
+          "output": 762,
+          "thought": 580
+        },
+        "1": {
+          "cachedRead": 164224,
+          "cachedWrite": 0,
+          "input": 31880,
+          "output": 617,
+          "thought": 156
+        },
+        "2": {
+          "cachedRead": 88704,
+          "cachedWrite": 0,
+          "input": 10163,
+          "output": 286,
+          "thought": 73
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-1 uncovered direct integration seams: PropertySymbol.ts symbols (bodyBuffer, asyncTaskManager, destroyed, aborted) and Fetch.ts onAsyncTaskManagerAbort method \u2014 the closest known latch point for wiring shutdown \u2192 AbortError into in-flight reads.",
+        "Lane-0 mapped the browser-close hierarchy (Browser \u2192 BrowserContext \u2192 BrowserPage \u2192 BrowserFrame) but did not reach the async-task wiring; the close chain alone is insufficient without the body-consumption abort path.",
+        "Lane-2 performed only a root-directory listing with zero source files read, yielding no architectural or contractual evidence.",
+        "Both Lane-0 and Lane-1 are early exploration but Lane-1's discovered symbols are more directly actionable for the core abort-rejection contracts (C1\u2013C8) than Lane-0's close-chain mapping."
+      ],
+      "distinction_kind": "architecture-contract",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        0,
+        1,
+        2
+      ],
+      "final_winner": 0,
+      "final_winner_probe_rank": 2,
+      "final_winner_survived": true,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 460801,
+        "one_winner_oracle_continuation_raw_input": 165830,
+        "one_winner_oracle_continuation_savings_fraction": 0.6401266490307096,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.4298390058230696,
+        "top_k_continuation_raw_input": 361934,
+        "top_k_continuation_savings_fraction": 0.21455465591437517,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.1440714273223789
+      },
+      "source": "/tmp/asgard-shadow-g2-happy.jsonl",
+      "study_id": "ca76e0b5-6b51-4db3-9067-1d5adb1245d1",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "7cf20033-60f8-47fa-8d91-fbba3a7483ee",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 393344,
+          "cachedWrite": 0,
+          "input": 67457,
+          "output": 1665,
+          "thought": 809
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 69785,
+          "output": 145,
+          "thought": 1062
+        },
+        "probe_candidates": {
+          "cachedRead": 77056,
+          "cachedWrite": 0,
+          "input": 73624,
+          "output": 2885,
+          "thought": 1092
+        },
+        "probe_review": {
+          "cachedRead": 768,
+          "cachedWrite": 0,
+          "input": 3818,
+          "output": 303,
+          "thought": 637
+        },
+        "total": {
+          "cachedRead": 471552,
+          "cachedWrite": 0,
+          "input": 214684,
+          "output": 4998,
+          "thought": 3600
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 185984,
+          "cachedWrite": 0,
+          "input": 28682,
+          "output": 815,
+          "thought": 195
+        },
+        "1": {
+          "cachedRead": 145536,
+          "cachedWrite": 0,
+          "input": 29396,
+          "output": 858,
+          "thought": 216
+        },
+        "2": {
+          "cachedRead": 129536,
+          "cachedWrite": 0,
+          "input": 21142,
+          "output": 850,
+          "thought": 281
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "All three lanes produced zero bytes of patch, zero file edits, and zero shell commands \u2014 none began implementation.",
+        "Lane-1 identified the BlendRange terminology key (b'Blnd'), the full line range of LayerBlendingRanges (421-480), and the composite module directory, giving marginally richer reconnaissance.",
+        "Lane-0 located the Layer class at line 147 specifically but missed the terminology key.",
+        "Lane-2 had the least detailed reconnaissance summary and the vaguest next-step plan.",
+        "All three lanes ended in the discovery phase with identical implementation progress: none."
+      ],
+      "distinction_kind": "cosmetic",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        2,
+        1,
+        0
+      ],
+      "final_winner": 2,
+      "final_winner_probe_rank": 3,
+      "final_winner_survived": false,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": true,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": false,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 540276,
+        "one_winner_oracle_continuation_raw_input": 150678,
+        "one_winner_oracle_continuation_savings_fraction": 0.7211092108477889,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.5095361967426659,
+        "top_k_continuation_raw_input": 389598,
+        "top_k_continuation_savings_fraction": 0.2788907891522111,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.19706439728333155
+      },
+      "source": "/tmp/asgard-shadow-g2-psd.jsonl",
+      "study_id": "108c4510-a516-434b-ae65-295c34511ba1",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "ef35274e-0daa-447c-a646-c8444a749f6f",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 461056,
+          "cachedWrite": 0,
+          "input": 79220,
+          "output": 2523,
+          "thought": 692
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 75313,
+          "output": 147,
+          "thought": 725
+        },
+        "probe_candidates": {
+          "cachedRead": 57856,
+          "cachedWrite": 0,
+          "input": 82727,
+          "output": 3199,
+          "thought": 1114
+        },
+        "probe_review": {
+          "cachedRead": 1280,
+          "cachedWrite": 0,
+          "input": 6777,
+          "output": 252,
+          "thought": 913
+        },
+        "total": {
+          "cachedRead": 520576,
+          "cachedWrite": 0,
+          "input": 244037,
+          "output": 6121,
+          "thought": 3444
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 121088,
+          "cachedWrite": 0,
+          "input": 14987,
+          "output": 811,
+          "thought": 1483
+        },
+        "1": {
+          "cachedRead": 115200,
+          "cachedWrite": 0,
+          "input": 17132,
+          "output": 894,
+          "thought": 159
+        },
+        "2": {
+          "cachedRead": 120960,
+          "cachedWrite": 0,
+          "input": 18435,
+          "output": 825,
+          "thought": 229
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-0 read two key reference files (returns/result.py and returns/interfaces/specific/result.py) and concretely identified the interface hierarchy (ResultLikeN \u2192 UnwrappableResult \u2192 ResultBasedN), the container pattern (BaseContainer + SupportsKind2 + TYPE_CHECKING guard), and the architectural constraint that ValidatedLikeN must extend FailableN directly without DiverseFailableN. Lanes 1 and 2 only performed directory exploration without reading any source files.",
+        "Lane-0's unresolved risks show specific technical understanding (e.g., 'The exact tuple-wrapping semantics for swap need careful implementation to ensure single-element and multi-element cases work correctly with immutable tuples'), while Lane-1 and Lane-2 risks are generic placeholders about unread files.",
+        "Lanes 1 and 2 are essentially identical: both performed only directory listing, read zero source files, created zero files, and executed zero edits. Their window briefs differ only in phrasing, not substance \u2014 both identify the same reference files without examining them."
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        1,
+        2,
+        0
+      ],
+      "final_winner": 1,
+      "final_winner_probe_rank": 2,
+      "final_winner_survived": true,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        0,
+        1,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 407802,
+        "one_winner_oracle_continuation_raw_input": 132332,
+        "one_winner_oracle_continuation_savings_fraction": 0.6754993845052255,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.45133046394615556,
+        "top_k_continuation_raw_input": 268407,
+        "top_k_continuation_savings_fraction": 0.3418202951432313,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.22838497847959616
+      },
+      "source": "/tmp/asgard-shadow-g2-returns.jsonl",
+      "study_id": "174c2ee5-e276-40bc-b9ae-ef1a1fd6b4cb",
+      "survivors": [
+        0,
+        1
+      ],
+      "task": "840c6168-4212-4c49-ba0a-d9980bf311f6",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 357248,
+          "cachedWrite": 0,
+          "input": 50554,
+          "output": 2530,
+          "thought": 1871
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 68586,
+          "output": 148,
+          "thought": 1219
+        },
+        "probe_candidates": {
+          "cachedRead": 65024,
+          "cachedWrite": 0,
+          "input": 61113,
+          "output": 3858,
+          "thought": 1019
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 6930,
+          "output": 344,
+          "thought": 660
+        },
+        "total": {
+          "cachedRead": 423168,
+          "cachedWrite": 0,
+          "input": 187183,
+          "output": 6880,
+          "thought": 4769
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 83968,
+          "cachedWrite": 0,
+          "input": 2072,
+          "output": 683,
+          "thought": 123
+        },
+        "1": {
+          "cachedRead": 98048,
+          "cachedWrite": 0,
+          "input": 14228,
+          "output": 584,
+          "thought": 132
+        },
+        "2": {
+          "cachedRead": 88064,
+          "cachedWrite": 0,
+          "input": 3605,
+          "output": 408,
+          "thought": 78
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "All three lanes pursued identical reconnaissance-first strategies with zero implementation code written and no feature branches created.",
+        "Lane 0 executed an actual shell command (git branch/log) producing concrete output logged in the execution ledger, confirming branch state and repository identity.",
+        "Lane 1 and Lane 2 have empty execution ledgers (0 shell commands); Lane 1 claims directory listing but provides no ledger evidence; Lane 2 had a tool-parameter error on list_directory.",
+        "Lane 0 documented five specific evidence checks (passed/failed) while Lanes 1-2 only documented one each, giving Lane 0 the most trustworthy reconnaissance.",
+        "No lane differs in architectural approach \u2014 all intend to trace existing SQL function builder patterns before implementing, and none reached that stage."
+      ],
+      "distinction_kind": "cosmetic",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        2,
+        1,
+        0
+      ],
+      "final_winner": 2,
+      "final_winner_probe_rank": 3,
+      "final_winner_survived": false,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": true,
+      "probe_ranking": [
+        0,
+        1,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": false,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 289985,
+        "one_winner_oracle_continuation_raw_input": 91669,
+        "one_winner_oracle_continuation_savings_fraction": 0.6838836491542666,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.4523971923069027,
+        "top_k_continuation_raw_input": 198316,
+        "top_k_continuation_savings_fraction": 0.3161163508457334,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.20911473719508997
+      },
+      "source": "/tmp/asgard-shadow-g3-drizzle.jsonl",
+      "study_id": "0df3b584-63ed-4828-b71a-6e9a0b60c007",
+      "survivors": [
+        0,
+        1
+      ],
+      "task": "77fea9a6-51fd-407c-b078-7e1980c8f654",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 270080,
+          "cachedWrite": 0,
+          "input": 19905,
+          "output": 1675,
+          "thought": 333
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 34949,
+          "output": 150,
+          "thought": 3303
+        },
+        "probe_candidates": {
+          "cachedRead": 51840,
+          "cachedWrite": 0,
+          "input": 53841,
+          "output": 2616,
+          "thought": 500
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 6856,
+          "output": 288,
+          "thought": 664
+        },
+        "total": {
+          "cachedRead": 322816,
+          "cachedWrite": 0,
+          "input": 115551,
+          "output": 4729,
+          "thought": 4800
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 81152,
+          "cachedWrite": 0,
+          "input": 952,
+          "output": 441,
+          "thought": 70
+        },
+        "1": {
+          "cachedRead": 113408,
+          "cachedWrite": 0,
+          "input": 20196,
+          "output": 745,
+          "thought": 136
+        },
+        "2": {
+          "cachedRead": 79616,
+          "cachedWrite": 0,
+          "input": 827,
+          "output": 498,
+          "thought": 135
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-1 read actual source files and traced the full disposal chain through 5 classes (happyDOM.close() \u2192 Window.close() \u2192 BrowserPage.close() \u2192 BrowserContext.close() \u2192 Browser.dispose()), while Lane-0 only partially traced 3 classes (Browser \u2192 Page \u2192 Window) and Lane-2 read no source files at all.",
+        "Lane-1 discovered the key architectural insight that body consumption delegates to readBodyStream() which accepts an AbortSignal parameter \u2014 a critical injection point for the required AbortError. Neither Lane-0 nor Lane-2 found this.",
+        "Lane-1 identified that AsyncTaskManager.abort() currently rejects with a generic Error rather than the required DOMException named AbortError \u2014 a direct contract gap. Neither other lane reached this implementation detail.",
+        "Lane-1 discovered the multipart formData() parser is a skeleton (not fully implemented), which is a significant architectural finding for the formData() abort requirement (C5). Other lanes did not inspect form-data internals.",
+        "Lane-2 only examined top-level directory structure and never inspected any source files, making its exploration effectively empty; Lane-0 located files but didn't read their internals."
+      ],
+      "distinction_kind": "architecture-contract",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        1,
+        2,
+        0
+      ],
+      "final_winner": 1,
+      "final_winner_probe_rank": 1,
+      "final_winner_survived": true,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": true,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 296151,
+        "one_winner_oracle_continuation_raw_input": 133604,
+        "one_winner_oracle_continuation_savings_fraction": 0.5488652748091345,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.36621479440450416,
+        "top_k_continuation_raw_input": 215708,
+        "top_k_continuation_savings_fraction": 0.2716283247397443,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.18123629907830674
+      },
+      "source": "/tmp/asgard-shadow-g3-happy.jsonl",
+      "study_id": "63a8ea50-e1d8-4fbd-b27c-9b971a056ecf",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "89e817b7-8670-4eff-9ff0-f59ff2a6baac",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 274176,
+          "cachedWrite": 0,
+          "input": 21975,
+          "output": 1684,
+          "thought": 341
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 38630,
+          "output": 142,
+          "thought": 941
+        },
+        "probe_candidates": {
+          "cachedRead": 49152,
+          "cachedWrite": 0,
+          "input": 54043,
+          "output": 3715,
+          "thought": 493
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 4985,
+          "output": 379,
+          "thought": 760
+        },
+        "total": {
+          "cachedRead": 324224,
+          "cachedWrite": 0,
+          "input": 119633,
+          "output": 5920,
+          "thought": 2535
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 118784,
+          "cachedWrite": 0,
+          "input": 17436,
+          "output": 738,
+          "thought": 121
+        },
+        "1": {
+          "cachedRead": 199168,
+          "cachedWrite": 0,
+          "input": 34675,
+          "output": 714,
+          "thought": 126
+        },
+        "2": {
+          "cachedRead": 172544,
+          "cachedWrite": 0,
+          "input": 30098,
+          "output": 968,
+          "thought": 182
+        }
+      },
+      "continued_killed": [
+        0
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane 2 found LayerBlendingRanges at line 421-486 with detailed field structure (composite_ranges default, channel_ranges default 4-sublist layout, uint16 encoding), additionally located LayerRecord at line 509 with its blending_ranges field, and surveyed the api/ directory to confirm no existing blend_range module \u2014 the most complete architecture reading.",
+        "Lane 1 located LayerBlendingRanges at line 421-476 and Layer at line 147 but did not find LayerRecord, provided less detail on field defaults, and did not survey the api/ directory structure.",
+        "Lane 0 failed to locate LayerBlendingRanges entirely (read layer_and_mask.py only to line 100, missing the class at line 421), did not locate the Layer class definition, and left all four core integration seams as unresolved risks \u2014 the weakest contract reading."
+      ],
+      "distinction_kind": "architecture-contract",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        0,
+        1,
+        2
+      ],
+      "final_winner": 0,
+      "final_winner_probe_rank": 3,
+      "final_winner_survived": false,
+      "killed": [
+        0
+      ],
+      "late_bloomer_killed": true,
+      "probe_ranking": [
+        2,
+        1,
+        0
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": false,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 572705,
+        "one_winner_oracle_continuation_raw_input": 136220,
+        "one_winner_oracle_continuation_savings_fraction": 0.7621463056896657,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.5487505908857755,
+        "top_k_continuation_raw_input": 436485,
+        "top_k_continuation_savings_fraction": 0.23785369431033432,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.171256298590926
+      },
+      "source": "/tmp/asgard-shadow-g3-psd.jsonl",
+      "study_id": "03870db0-60d1-45d9-b654-9acedc107b53",
+      "survivors": [
+        2,
+        1
+      ],
+      "task": "f1fa0619-f108-4b45-add2-074a3d6fc6c2",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 490496,
+          "cachedWrite": 0,
+          "input": 82209,
+          "output": 2420,
+          "thought": 429
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 64236,
+          "output": 136,
+          "thought": 1426
+        },
+        "probe_candidates": {
+          "cachedRead": 57984,
+          "cachedWrite": 0,
+          "input": 93171,
+          "output": 3428,
+          "thought": 877
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 6424,
+          "output": 314,
+          "thought": 652
+        },
+        "total": {
+          "cachedRead": 549376,
+          "cachedWrite": 0,
+          "input": 246040,
+          "output": 6298,
+          "thought": 3384
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 125952,
+          "cachedWrite": 0,
+          "input": 21798,
+          "output": 950,
+          "thought": 279
+        },
+        "1": {
+          "cachedRead": 117504,
+          "cachedWrite": 0,
+          "input": 11961,
+          "output": 710,
+          "thought": 613
+        },
+        "2": {
+          "cachedRead": 123904,
+          "cachedWrite": 0,
+          "input": 18033,
+          "output": 910,
+          "thought": 321
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-1 read and analyzed two critical source files (returns/interfaces/specific/result.py, returns/result.py), extracting the concrete container pattern (BaseContainer + SupportsKind2 + ABC with @final subclasses and TYPE_CHECKING guard) and the interface pattern (ResultLikeN extends DiverseFailableN), and identified the key architectural constraint that ValidatedLikeN must extend FailableN directly rather than DiverseFailableN because Validated's swap violates SwappableN's double_swap_law \u2014 a non-obvious design insight absent from the other lanes.",
+        "Lane-0 explored directory structure, confirmed file existence, and created a 9-step plan, but inspected zero source files and gained no understanding of the interface pattern, base class hierarchy, or law constraints needed to implement Validated correctly.",
+        "Lane-2 explored directory structure and confirmed target update files exist, but also inspected zero source files and produced no plan, leaving it with the shallowest understanding of all three lanes."
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        2,
+        0,
+        1
+      ],
+      "final_winner": 2,
+      "final_winner_probe_rank": 3,
+      "final_winner_survived": false,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": true,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": false,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 419152,
+        "one_winner_oracle_continuation_raw_input": 141937,
+        "one_winner_oracle_continuation_savings_fraction": 0.6613710539374738,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.4524910143281068,
+        "top_k_continuation_raw_input": 277215,
+        "top_k_continuation_savings_fraction": 0.33862894606252625,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.2316801655779395
+      },
+      "source": "/tmp/asgard-shadow-g3-returns.jsonl",
+      "study_id": "d16b8471-24f4-4725-a7f0-3978a28c1daf",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "f85b161f-3fc9-4778-ad96-f854f002a791",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 367360,
+          "cachedWrite": 0,
+          "input": 51792,
+          "output": 2570,
+          "thought": 1213
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 62383,
+          "output": 146,
+          "thought": 1704
+        },
+        "probe_candidates": {
+          "cachedRead": 60032,
+          "cachedWrite": 0,
+          "input": 63629,
+          "output": 4295,
+          "thought": 593
+        },
+        "probe_review": {
+          "cachedRead": 1280,
+          "cachedWrite": 0,
+          "input": 5782,
+          "output": 334,
+          "thought": 716
+        },
+        "total": {
+          "cachedRead": 429056,
+          "cachedWrite": 0,
+          "input": 183586,
+          "output": 7345,
+          "thought": 4226
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 133632,
+          "cachedWrite": 0,
+          "input": 4314,
+          "output": 1229,
+          "thought": 356
+        },
+        "1": {
+          "cachedRead": 79488,
+          "cachedWrite": 0,
+          "input": 8657,
+          "output": 440,
+          "thought": 191
+        },
+        "2": {
+          "cachedRead": 198528,
+          "cachedWrite": 0,
+          "input": 48666,
+          "output": 664,
+          "thought": 309
+        }
+      },
+      "continued_killed": [
+        0
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane-2 identified 10+ concrete source files spanning all four shutdown paths (Browser.close, BrowserPage.close, DetachedBrowser variants, BrowserFrameNavigator), the body-consumption pipeline (FetchBodyUtility, Request, Response), the async-task manager for timer/rAF, and the multipart parser \u2014 yielding an actionable next-step plan for implementation.",
+        "Lane-1 produced only a top-level directory listing (packages/, integration-test/, docs/) with no source-file inspection and no mapping of any relevant subsystem.",
+        "Lane-0 found an empty working directory \u2014 no repository checkout at all, yielding zero codebase knowledge.",
+        "All three lanes share the same model and the same intended exploratory direction; they differ only in depth-of-progress achieved within the fixed turn budget, not in architectural interpretation of the task contract."
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        2,
+        0,
+        1
+      ],
+      "final_winner": 2,
+      "final_winner_probe_rank": 1,
+      "final_winner_survived": true,
+      "killed": [
+        0
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        2,
+        1,
+        0
+      ],
+      "probe_recall": {
+        "top1": true,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 473285,
+        "one_winner_oracle_continuation_raw_input": 247194,
+        "one_winner_oracle_continuation_savings_fraction": 0.47770582207338075,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.3042120446392771,
+        "top_k_continuation_raw_input": 335339,
+        "top_k_continuation_savings_fraction": 0.29146497353603007,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.18561037241557476
+      },
+      "source": "/tmp/asgard-shadow-happy.jsonl",
+      "study_id": "9d8d87c1-e4c4-4d34-807c-ea61c1aaaa7a",
+      "survivors": [
+        2,
+        1
+      ],
+      "task": "a3805cb5-56c5-4a3e-902a-3de573f40c76",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 411648,
+          "cachedWrite": 0,
+          "input": 61637,
+          "output": 2333,
+          "thought": 856
+        },
+        "end_review": {
+          "cachedRead": 76416,
+          "cachedWrite": 0,
+          "input": 76603,
+          "output": 290,
+          "thought": 2933
+        },
+        "probe_candidates": {
+          "cachedRead": 48640,
+          "cachedWrite": 0,
+          "input": 63220,
+          "output": 2456,
+          "thought": 791
+        },
+        "probe_review": {
+          "cachedRead": 0,
+          "cachedWrite": 0,
+          "input": 5038,
+          "output": 298,
+          "thought": 516
+        },
+        "total": {
+          "cachedRead": 536704,
+          "cachedWrite": 0,
+          "input": 206498,
+          "output": 5377,
+          "thought": 5096
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 118528,
+          "cachedWrite": 0,
+          "input": 14605,
+          "output": 902,
+          "thought": 104
+        },
+        "1": {
+          "cachedRead": 116736,
+          "cachedWrite": 0,
+          "input": 9773,
+          "output": 581,
+          "thought": 149
+        },
+        "2": {
+          "cachedRead": 126848,
+          "cachedWrite": 0,
+          "input": 18502,
+          "output": 782,
+          "thought": 152
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "Lane 1 confirmed all four critical locations (LayerBlendingRanges src, Layer src, blend_range module absence, compositing engine location) with clean passed checks; Lane 0 had inconclusive results due to get_summaries budget limits on layers.py and composite/__init__.py.",
+        "Lane 1 identified a key architectural detail \u2014 that Layer uses attrs \u2014 which directly affects how a blend_ranges property must be wired for save persistence; Lane 0 did not surface this.",
+        "Lane 2 performed only a directory listing with zero file content reads; both Lane 0 and Lane 1 read and understood the LayerBlendingRanges raw data structure, composite_ranges default values, and channel_ranges layout.",
+        "Lane 1 enumerated concrete unresolved risks (compositing engine location unknown, channel-to-RGB mapping unclear, validation enforcement point undetermined) that demonstrate deeper integration planning than Lane 0's more generic risks."
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        2,
+        0,
+        1
+      ],
+      "final_winner": 2,
+      "final_winner_probe_rank": 3,
+      "final_winner_survived": false,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": true,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": false,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 404992,
+        "one_winner_oracle_continuation_raw_input": 145350,
+        "one_winner_oracle_continuation_savings_fraction": 0.6411040218078381,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.441299344956642,
+        "top_k_continuation_raw_input": 259642,
+        "top_k_continuation_savings_fraction": 0.3588959781921618,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.24704346673283953
+      },
+      "source": "/tmp/asgard-shadow-psd.jsonl",
+      "study_id": "89ce697c-1b6b-4a23-a088-1ad976d679de",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "68779162-46ff-461b-bf74-f8c08c491112",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 362112,
+          "cachedWrite": 0,
+          "input": 42880,
+          "output": 2265,
+          "thought": 405
+        },
+        "end_review": {
+          "cachedRead": 384,
+          "cachedWrite": 0,
+          "input": 52297,
+          "output": 140,
+          "thought": 715
+        },
+        "probe_candidates": {
+          "cachedRead": 57728,
+          "cachedWrite": 0,
+          "input": 65479,
+          "output": 3113,
+          "thought": 758
+        },
+        "probe_review": {
+          "cachedRead": 512,
+          "cachedWrite": 0,
+          "input": 6966,
+          "output": 325,
+          "thought": 912
+        },
+        "total": {
+          "cachedRead": 420736,
+          "cachedWrite": 0,
+          "input": 167622,
+          "output": 5843,
+          "thought": 2790
+        }
+      },
+      "window": 1
+    },
+    {
+      "candidate_count": 3,
+      "complete_ground_truth": true,
+      "continuation_steps": 5,
+      "continuation_usage_by_lane": {
+        "0": {
+          "cachedRead": 116224,
+          "cachedWrite": 0,
+          "input": 16389,
+          "output": 896,
+          "thought": 117
+        },
+        "1": {
+          "cachedRead": 152576,
+          "cachedWrite": 0,
+          "input": 21789,
+          "output": 856,
+          "thought": 349
+        },
+        "2": {
+          "cachedRead": 116864,
+          "cachedWrite": 0,
+          "input": 17883,
+          "output": 1083,
+          "thought": 246
+        }
+      },
+      "continued_killed": [
+        2
+      ],
+      "continued_lanes": [
+        0,
+        1,
+        2
+      ],
+      "distinction_evidence": [
+        "lane-1 read all seven reference files (result.py, interfaces/specific/result.py, failable.py, cond.py, pointfree/__init__.py, hypothesis/containers.py, converters.py) and verified the core architectural constraint that ValidatedLikeN cannot extend DiverseFailableN due to double_swap_law violation; all other lanes read zero source files",
+        "lane-1 has concrete implementation patterns extracted (TYPE_CHECKING guard, BaseContainer usage, __match_args__ placement, swap/alt/apply pattern) and a detailed 8-step next-step plan; lane-0 and lane-2 have only generic 'read reference files' as next step",
+        "lane-0 completed directory listings showing awareness of file locations but read no source code; lane-2's evidence checks all show 'failed' with zero files read and zero files created",
+        "lane-2 has five unresolved risks vs lane-0's four, but the substantive difference is that lane-2 attempted to read interfaces/specific/result.py and failed while lane-0 never attempted any file reads at all"
+      ],
+      "distinction_kind": "mixed",
+      "eligible_for_gate": true,
+      "final_ranking": [
+        0,
+        1,
+        2
+      ],
+      "final_winner": 0,
+      "final_winner_probe_rank": 2,
+      "final_winner_survived": true,
+      "killed": [
+        2
+      ],
+      "late_bloomer_killed": false,
+      "probe_ranking": [
+        1,
+        0,
+        2
+      ],
+      "probe_recall": {
+        "top1": false,
+        "top2": true,
+        "top3": true
+      },
+      "probe_steps": 2,
+      "protocol_violations": [],
+      "public_outcome": {
+        "partial": null,
+        "reward": null,
+        "stop_reason": null
+      },
+      "savings": {
+        "all_lane_continuation_raw_input": 441725,
+        "one_winner_oracle_continuation_raw_input": 132613,
+        "one_winner_oracle_continuation_savings_fraction": 0.6997838021393401,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.4738002176545424,
+        "top_k_continuation_raw_input": 306978,
+        "top_k_continuation_savings_fraction": 0.30504725790933274,
+        "top_k_total_savings_after_measured_overhead_fraction": 0.2065373001640073
+      },
+      "source": "/tmp/asgard-shadow-returns.jsonl",
+      "study_id": "9c2ae552-d150-4d55-88d8-76b498187231",
+      "survivors": [
+        1,
+        0
+      ],
+      "task": "41ab55f8-7a8c-4061-98ae-ce63f7b8108e",
+      "top_k": 2,
+      "usage": {
+        "continuations": {
+          "cachedRead": 385664,
+          "cachedWrite": 0,
+          "input": 56061,
+          "output": 2835,
+          "thought": 712
+        },
+        "end_review": {
+          "cachedRead": 0,
+          "cachedWrite": 0,
+          "input": 67653,
+          "output": 472,
+          "thought": 1902
+        },
+        "probe_candidates": {
+          "cachedRead": 64128,
+          "cachedWrite": 0,
+          "input": 71400,
+          "output": 5279,
+          "thought": 1160
+        },
+        "probe_review": {
+          "cachedRead": 0,
+          "cachedWrite": 0,
+          "input": 7504,
+          "output": 352,
+          "thought": 437
+        },
+        "total": {
+          "cachedRead": 449792,
+          "cachedWrite": 0,
+          "input": 202618,
+          "output": 8938,
+          "thought": 4211
+        }
+      },
+      "window": 1
+    }
+  ],
+  "summary": {
+    "by_probe_steps": {
+      "1": {
+        "architecture_or_contract_distinction_fraction": null,
+        "eligible_studies": 0,
+        "late_bloomer_kill_rate": null,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": null,
+        "probe_distinction_counts": {
+          "architecture-contract": 0,
+          "cosmetic": 0,
+          "mixed": 0,
+          "unclear": 0
+        },
+        "recall": {
+          "top1": {
+            "hits": 0,
+            "opportunities": 0,
+            "rate": null,
+            "wilson_95": null
+          },
+          "top2": {
+            "hits": 0,
+            "opportunities": 0,
+            "rate": null,
+            "wilson_95": null
+          },
+          "top3": {
+            "hits": 0,
+            "opportunities": 0,
+            "rate": null,
+            "wilson_95": null
+          }
+        },
+        "shadow_total_raw_input": 0,
+        "top2_total_savings_after_measured_overhead_fraction": null
+      },
+      "2": {
+        "architecture_or_contract_distinction_fraction": 0.75,
+        "eligible_studies": 12,
+        "late_bloomer_kill_rate": 0.41666666666666663,
+        "one_winner_oracle_total_savings_after_measured_overhead_fraction": 0.44472149818905654,
+        "probe_distinction_counts": {
+          "architecture-contract": 3,
+          "cosmetic": 2,
+          "mixed": 6,
+          "unclear": 1
+        },
+        "recall": {
+          "top1": {
+            "hits": 3,
+            "opportunities": 12,
+            "rate": 0.25,
+            "wilson_95": {
+              "high": 0.5323053349335657,
+              "low": 0.08894166839405471
+            }
+          },
+          "top2": {
+            "hits": 7,
+            "opportunities": 12,
+            "rate": 0.5833333333333334,
+            "wilson_95": {
+              "high": 0.8067396863412435,
+              "low": 0.31951131254954973
+            }
+          },
+          "top3": {
+            "hits": 12,
+            "opportunities": 12,
+            "rate": 1.0,
+            "wilson_95": {
+              "high": 1.0,
+              "low": 0.7575059933447592
+            }
+          }
+        },
+        "shadow_total_raw_input": 7165878,
+        "top2_total_savings_after_measured_overhead_fraction": 0.19945301887640288
+      }
+    },
+    "complete_ground_truth_studies": 12,
+    "eligible_top2_studies": 12,
+    "futility_stop": true,
+    "gate_status": "fail-futility",
+    "gate_threshold": 0.9,
+    "maximum_attainable_top2_recall_at_minimum": 0.75,
+    "minimum_complete_studies": 20,
+    "protocol_invalid_studies": 0,
+    "remaining_studies_to_minimum": 8,
+    "task_outcomes": [
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "286cc8fd-1156-482e-b54d-cbdd506e81ad"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "c58dc6d1-151e-49c9-92fc-053c59de1ea1"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "7cf20033-60f8-47fa-8d91-fbba3a7483ee"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "ef35274e-0daa-447c-a646-c8444a749f6f"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "840c6168-4212-4c49-ba0a-d9980bf311f6"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "77fea9a6-51fd-407c-b078-7e1980c8f654"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "89e817b7-8670-4eff-9ff0-f59ff2a6baac"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "f1fa0619-f108-4b45-add2-074a3d6fc6c2"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "f85b161f-3fc9-4778-ad96-f854f002a791"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "a3805cb5-56c5-4a3e-902a-3de573f40c76"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "68779162-46ff-461b-bf74-f8c08c491112"
+      },
+      {
+        "partial": null,
+        "probe_steps": 2,
+        "reward": null,
+        "stop_reason": null,
+        "task": "41ab55f8-7a8c-4061-98ae-ce63f7b8108e"
+      }
+    ],
+    "top1_funding_status": "insufficient-data",
+    "top1_funding_threshold": 0.95,
+    "top2_recall": 0.5833333333333334,
+    "top2_recall_wilson_95": {
+      "high": 0.8067396863412435,
+      "low": 0.31951131254954973
+    },
+    "total_studies": 12,
+    "two_step_top2_hits": 7,
+    "two_step_top2_opportunities": 12
+  }
+}

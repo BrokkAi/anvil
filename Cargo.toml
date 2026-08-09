@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "crates/anvil-minimizer", "sdk/rust", "tests/sdk_conformance/rust"]
 # Keep `cargo build` / `cargo test` from the workspace root focused on the
 # root crate. The xtask sub-crate is dev-only and is invoked through the
 # `cargo xtask` alias (see .cargo/config.toml), which builds it on demand.
@@ -7,36 +7,41 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.21.1"
+version = "0.25.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
-license = "LGPL-3.0"
+license = "LGPL-3.0-only"
 repository = "https://github.com/BrokkAi/anvil"
 homepage = "https://github.com/BrokkAi/anvil"
 readme = "README.md"
 
 [features]
-default = ["wasm-sandbox"]
+default = ["wasm-sandbox", "http-api"]
 wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# `anvil serve` HTTP daemon (#317/#346). Default-on; all official release
+# binaries ship it. `--no-default-features --features wasm-sandbox` builds
+# an ACP-only binary without the axum dependency tree.
+http-api = ["dep:axum"]
 
 [[bin]]
 name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-agent-client-protocol = { version = "1", features = ["unstable"] }
+agent-client-protocol = { version = "2", features = ["unstable"] }
+# HTTP daemon for `anvil serve` (#317). Server-side only; LLM/MCP client
+# traffic stays on `reqwest`. Optional: gated behind the `http-api` feature.
+axum = { version = "0.8", optional = true }
+# Dependency-renamed so imports stay `anvil_minimizer::` while the published
+# crate is namespaced. The minimizer is versioned in lockstep with this crate:
+# bump this requirement, the minimizer's version, and the root version
+# together on every release (CI enforces the match).
+anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.25.0", path = "crates/anvil-minimizer" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
 # wasmtime hosts when the wasm sandbox is enabled.
 brokk-acp-sandbox = "0.1.0"
-# Anvil hosts RTK for command rewriting and dispatches rewritten commands via
-# `anvil __rtk ...`. The `hosted` feature suppresses RTK's telemetry, hook
-# warnings, integrity checks, and tracking writes for this embedded use case.
-# We intentionally do not try to compile out RTK's `src/hooks`: it is wired into
-# command parsing, filter trust checks, discovery, and analytics, while hosted
-# mode already avoids the hook installer/runtime side effects Anvil cares about.
-rtk_core = { package = "brokk-rtk", version = "0.42.4", features = ["hosted"] }
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.
@@ -44,8 +49,15 @@ wasmtime = { version = "45", optional = true, default-features = false, features
 wasmtime-wasi = { version = "45", optional = true }
 zip = "8"
 futures = "0.3"
+bytes = "1"
 regex = "1"
 reqwest = { version = "0.13", features = ["stream", "json", "cookies", "form"] }
+aws-config = { version = "1.9", default-features = false, features = ["credentials-process", "rt-tokio", "sso"] }
+aws-credential-types = "1.3"
+aws-sigv4 = "1.5"
+aws-smithy-runtime-api = "1.13"
+aws-smithy-http-client = { version = "1.2", default-features = false, features = ["rustls-ring"] }
+http = "1"
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,17 +68,15 @@ tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 walkdir = "2"
 rustls-native-certs = "0.8"
 sha2 = "0.11"
-# Codex login. We deliberately avoid single-maintainer credential crates:
-# `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
-# depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
-# Token Exchange step that converts the id_token into the OPENAI_API_KEY
-# is one POST written by hand in `codex_auth.rs`. JWT decoding for the
-# account_id is also inline (no `jsonwebtoken` dep) since we trust the
-# issuer over HTTPS and only need the unverified `chatgpt_account_id`
-# claim. `tiny_http` runs the loopback callback for ~30s during login.
+# Codex login. Browser login uses PKCE + a localhost loopback callback; device
+# authorization covers SSH/remote clients. RFC 8693 token exchange and refresh
+# are direct `reqwest` calls in `codex_auth.rs`. JWT decoding for the account_id
+# is inline (no `jsonwebtoken` dep) since we trust the issuer over HTTPS and only
+# need the unverified `chatgpt_account_id` claim.
 oauth2 = { version = "5", default-features = false }
 tiny_http = "0.12"
 webbrowser = "1"
@@ -90,6 +100,7 @@ tiktoken-rs = "0.12"
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
 [dev-dependencies]
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
 # used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.

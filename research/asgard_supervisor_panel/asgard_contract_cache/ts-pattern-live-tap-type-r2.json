@@ -1,0 +1,269 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "`matchEach` is a top-level function (not a method on an existing object or builder).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "`matchEach` is exported as a named export from the package entry point (not as a default export).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "`matchEach` exposes the same builder API as `match`, including all `.with()` overloads: single-pattern, multi-pattern, and guard variants.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "`matchEach` builder exposes a `.when()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "inspection",
+      "text": "`matchEach` builder exposes a `.returnType()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C6",
+      "kind": "inspection",
+      "text": "`matchEach` builder exposes a `.narrow()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "`matchEach` evaluates ALL registered `.with()` patterns against the input — it does NOT short-circuit on the first matching pattern.",
+      "adverse_condition": "Verification requires at least two `.with()` clauses whose patterns both match the same input, producing distinguishable handler results."
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "Matching handler results are collected into an array returned in the order the clauses were declared.",
+      "adverse_condition": "Verification requires at least two matching clauses with distinguishable outputs; a single match or homogeneous results prove nothing about ordering."
+    },
+    {
+      "id": "C9",
+      "kind": "execution",
+      "text": "Each matching clause's handler result appears at the output array position corresponding to that clause's declaration order among all clauses (not among only the matching subset).",
+      "adverse_condition": "Verification requires at least two matching clauses separated by a non-matching clause, with pairwise-distinguishable outputs and a non-commutative operation applied to the result array, so that the gap reveals whether positions reflect declaration order or are compacted."
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "Every `.with()` call must accept patterns typed against the original input type, not a progressively narrowed remainder type.",
+      "adverse_condition": "When the builder has been narrowed via `.narrow()`, subsequent `.with()` calls must still type-check with patterns written against the original (pre-narrow) input type."
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "Exhaustiveness tracking narrows the internal type so that `.exhaustive()` can verify at compile time that all input cases are handled.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "`.narrow()` updates both the internal exhaustiveness-tracking type and the input type for subsequent `.with()` calls to exclude already-handled cases (for exhaustiveness checking only).",
+      "adverse_condition": "The narrowed input type affects exhaustiveness checking but must not restrict the pattern types accepted by subsequent `.with()` calls (see C10)."
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "`.run()` returns an array of all matching handler results.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "`.run()` throws `NonExhaustiveError` when no registered pattern matches the input.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "`.exhaustive()` returns an array of all matching handler results when at least one pattern matches.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "`.exhaustive()` (called without a fallback) throws `NonExhaustiveError` when no pattern matches at runtime.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses and no fallback handler is provided."
+    },
+    {
+      "id": "C17",
+      "kind": "inspection",
+      "text": "`.exhaustive()` causes a compile-time type error if not all input cases are handled by the registered `.with()` clauses.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "inspection",
+      "text": "`.exhaustive()` accepts an optional fallback handler function argument.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "When `.exhaustive()` is called with a fallback handler and no pattern matches at runtime, the fallback is called with the input value and its return value is wrapped in a single-element array `[fallbackResult]` — no `NonExhaustiveError` is thrown.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses and a fallback handler is provided."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "`.otherwise(handler)` returns `[handler(value)]` when no registered pattern matches the input.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "`.otherwise(handler)` returns the array of all matching handler results when at least one pattern matches — the `.otherwise` handler is NOT included in the results array when any pattern matches.",
+      "adverse_condition": "At least one `.with()` clause matches the input."
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "`.otherwise()` never throws (it never raises `NonExhaustiveError` or any other exception).",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "`.tap(callback)` registers a side-effect callback and returns a new `matchEach` builder instance for continued chaining.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "Each `.tap()` point calls its registered callback once for each individual result that has been collected up to that tap point, invoked in declaration order of the collected results.",
+      "adverse_condition": "Ambigious reading #1: \"once per result\" means the callback is invoked N times (once per collected result element). Verification requires at least two matching clauses before the tap point with distinguishable outputs so that callback invocation count and argument values can be observed."
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "Each `.tap()` point calls its registered callback exactly once with the array of all results collected up to that tap point, in declaration order.",
+      "adverse_condition": "Ambigious reading #2: \"once per result that has been collected\" means one invocation receiving the entire collected-results array. Verification requires at least two matching clauses before the tap point; a single result makes the two readings indistinguishable."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "`.tap()` callbacks do not affect the final results array returned by `.run()`, `.exhaustive()`, or `.otherwise()`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "Multiple `.tap()` points can be stacked in a single `matchEach` chain, and each fires independently.",
+      "adverse_condition": "Verification requires at least two `.tap()` calls in the chain with distinguishable callbacks."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`.tap()` callbacks execute when the compiled function produced by `.toFunction()` is invoked.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C29",
+      "kind": "execution",
+      "text": "`.tap()` callbacks execute when the compiled function produced by `.toExhaustiveFunction()` is invoked.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "`.tap()` callbacks execute when the compiled function produced by `.toPartialFunction()` is invoked.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C31",
+      "kind": "inspection",
+      "text": "`matchEach` can be called without a value argument, using explicit type parameters, to build a reusable compiled matcher.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "`.toFunction()` compiles the registered clauses into a reusable function with signature `(input) => output[]`.",
+      "adverse_condition": "Verification requires type-checking a call site authored from this contract's text alone, not adapted from the implementation's own tests — a misreading that returns `output` instead of `output[]` would change what external callers write."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "The function returned by `.toFunction()` throws `NonExhaustiveError` when invoked with an input that matches zero registered patterns.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "`.toExhaustiveFunction()` compiles the registered clauses into a reusable function with signature `(input) => output[]`.",
+      "adverse_condition": "Verification requires type-checking a call site authored from this contract's text alone — same shape risk as `.toFunction()`."
+    },
+    {
+      "id": "C35",
+      "kind": "inspection",
+      "text": "`.toExhaustiveFunction()` causes a compile-time type error if not all input cases are handled by the registered `.with()` clauses.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C36",
+      "kind": "execution",
+      "text": "`.toPartialFunction()` compiles the registered clauses into a reusable function with signature `(input) => output[] | undefined`.",
+      "adverse_condition": "Verification requires type-checking a call site authored from this contract's text alone — a misreading that returns `output[]` (never undefined) or that throws would change what external callers write."
+    },
+    {
+      "id": "C37",
+      "kind": "execution",
+      "text": "The function returned by `.toPartialFunction()` returns `undefined` (not an empty array, not throwing) when no registered pattern matches the input.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    },
+    {
+      "id": "C38",
+      "kind": "execution",
+      "text": "`P.select()` selections produce independent results across multiple calls of any compiled function (`.toFunction()`, `.toExhaustiveFunction()`, `.toPartialFunction()`). Each invocation's selections are isolated.",
+      "adverse_condition": "Verification requires calling the same compiled function at least twice with different inputs that cause different selection values; shared mutable selection state would cause the second call to see the first call's selections."
+    },
+    {
+      "id": "C39",
+      "kind": "execution",
+      "text": "Named selections (`P.select('name', ...)`) from one `.with()` clause must not leak into another clause's handler. Each clause maintains independent selection state.",
+      "adverse_condition": "Verification requires at least two `.with()` clauses that both use `P.select()` with the same selection name; the handler of clause B must not receive the selection value captured by clause A."
+    },
+    {
+      "id": "C40",
+      "kind": "delivery",
+      "text": "The implementation must be developed on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C41",
+      "kind": "delivery",
+      "text": "All work must be committed on the new branch when complete.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C42",
+      "kind": "execution",
+      "text": "The function returned by `.toPartialFunction()` never throws — it returns `undefined` instead of raising `NonExhaustiveError`.",
+      "adverse_condition": "Input matches zero of the registered `.with()` clauses."
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1881,
+    "completion_tokens": 6325,
+    "total_tokens": 8206,
+    "prompt_tokens_details": {
+      "cached_tokens": 1152
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 3837
+    },
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 729
+  }
+}

@@ -22,8 +22,8 @@
 //! a pragmatic compatibility choice, not impersonation: the user *is*
 //! authenticating with their own OAuth tokens.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use futures::Stream;
@@ -37,8 +37,9 @@ use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_st
 use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
-    LlmResponse, ModelMetadata, ModelServiceTier, OpenAiClient, OutputBudgetExhaustedError,
-    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    LlmResponse, ModelDiscoveryNotice, ModelMetadata, ModelServiceTier, OpenAiClient,
+    OutputBudgetExhaustedError, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -77,24 +78,42 @@ const ORIGINATOR: &str = "codex_cli_rs";
 /// `/config` prompt and the server forwards it verbatim.
 const FALLBACK_CHATGPT_MODEL: &str = "gpt-5-codex";
 
-/// `client_version` we report to the ChatGPT backend. The server uses
-/// it to gate per-model rollout via each `ModelInfo.minimal_client_version`:
-/// any model whose minimum exceeds the value we send is filtered out
-/// of `/models` before it reaches us. Sending our own crate version
-/// (e.g. `0.1.0`) signals we're a primitive client and the server
-/// hands back only the lowest-common-denominator entry, which is what
-/// produced the "single old model" picker.
+/// Fallback `client_version` we report to the ChatGPT backend if Codex's
+/// published model catalog cannot be fetched. The server uses this to gate
+/// per-model rollout via each `ModelInfo.minimal_client_version`: any model
+/// whose minimum exceeds the value we send is filtered out of `/models`
+/// before it reaches us. Sending Anvil's own crate version signals we're a
+/// primitive client and the server hands back only older models.
 ///
-/// We pin this to a recent Codex CLI release tag so we get the same
-/// model list the official client gets. Bump it when the picker starts
-/// hiding new models that codex itself shows. (Spec lives at
-/// `codex-rs/Cargo.toml#workspace.package.version`; current GitHub
-/// releases tag e.g. `rust-v0.129.0-alpha.10` resolve to a
-/// `client_version_to_whole()` of `0.129.0`.) This is a shim, not
-/// impersonation: the user *is* authenticating with their own OAuth
-/// tokens, we're just declaring "I can handle any model Codex CLI
-/// at this version can handle."
-const CODEX_COMPAT_CLIENT_VERSION: &str = "0.129.0";
+/// This is a compatibility floor, not impersonation: the user *is*
+/// authenticating with their own OAuth tokens, we're just declaring "I can
+/// handle any model Codex CLI at this version can handle." Keep it at or
+/// above the newest model gate we have verified.
+const FALLBACK_CODEX_COMPAT_CLIENT_VERSION: &str = "0.144.0";
+
+/// Codex's checked-in model catalog. We use the maximum visible
+/// `minimal_client_version` from this manifest as the `/codex/models`
+/// client version so Anvil tracks newly published Codex model gates without
+/// depending on a locally installed Codex CLI.
+const CODEX_MODELS_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
+const CODEX_MODELS_MANIFEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_MODELS_MANIFEST_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone)]
+struct CodexCompatClientVersionCacheEntry {
+    version: String,
+    fetched_at: Instant,
+}
+
+static CODEX_COMPAT_CLIENT_VERSION_CACHE: OnceLock<
+    StdMutex<Option<CodexCompatClientVersionCacheEntry>>,
+> = OnceLock::new();
+
+fn codex_compat_client_version_cache()
+-> &'static StdMutex<Option<CodexCompatClientVersionCacheEntry>> {
+    CODEX_COMPAT_CLIENT_VERSION_CACHE.get_or_init(|| StdMutex::new(None))
+}
 
 /// LLM backend that proxies to the ChatGPT subscription via the
 /// Responses API. Reads `~/.codex/auth.json` on every request and
@@ -106,6 +125,7 @@ pub struct CodexClient {
     /// endpoint and one of the resulting `refresh_token` values gets
     /// invalidated by the server's rotation policy.
     refresh_lock: Arc<Mutex<()>>,
+    discovery_notices: Arc<StdMutex<Vec<ModelDiscoveryNotice>>>,
 }
 
 impl std::fmt::Debug for CodexClient {
@@ -156,6 +176,7 @@ impl CodexClient {
         Self {
             http,
             refresh_lock: Arc::new(Mutex::new(())),
+            discovery_notices: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -301,6 +322,7 @@ impl CodexClient {
                     .json(body)
             },
             Some(&cancel),
+            Some(idle_timeouts.first_progress),
         )
         .await?;
         let status = resp.status();
@@ -326,6 +348,7 @@ impl CodexClient {
     /// *something*; the user can override via `--default-model` or the
     /// `/config` model picker.
     async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        self.clear_discovery_notices();
         let creds = match self.load_credentials().await {
             Ok(c) => c,
             Err(e) => {
@@ -334,7 +357,12 @@ impl CodexClient {
             }
         };
         match fetch_chatgpt_models(&self.http, &creds).await {
-            Ok(models) if !models.is_empty() => Ok(models),
+            Ok((models, notice)) if !models.is_empty() => {
+                if let Some(notice) = notice {
+                    self.push_discovery_notice(notice);
+                }
+                Ok(models)
+            }
             Ok(_) => {
                 tracing::warn!(
                     "ChatGPT /models endpoint returned no slugs; falling back to {FALLBACK_CHATGPT_MODEL}"
@@ -348,6 +376,23 @@ impl CodexClient {
                 Ok(vec![ModelMetadata::id_only(FALLBACK_CHATGPT_MODEL)])
             }
         }
+    }
+
+    fn clear_discovery_notices(&self) {
+        self.discovery_notices
+            .lock()
+            .expect("Codex discovery notice lock poisoned")
+            .clear();
+    }
+
+    fn push_discovery_notice(&self, message: impl Into<String>) {
+        self.discovery_notices
+            .lock()
+            .expect("Codex discovery notice lock poisoned")
+            .push(ModelDiscoveryNotice {
+                source: "Codex".to_string(),
+                message: message.into(),
+            });
     }
 }
 
@@ -365,10 +410,11 @@ impl CodexClient {
 async fn fetch_chatgpt_models(
     http: &reqwest::Client,
     creds: &ChatGptCredentials,
-) -> Result<Vec<ModelMetadata>> {
+) -> Result<(Vec<ModelMetadata>, Option<String>)> {
+    let (client_version, notice) = resolve_codex_compat_client_version(http).await;
     let url = format!(
         "{CHATGPT_MODELS_URL}?client_version={}",
-        urlencode(CODEX_COMPAT_CLIENT_VERSION)
+        urlencode(&client_version)
     );
     let resp = crate::http_retry::send_with_retries(
         "GET /models",
@@ -379,6 +425,7 @@ async fn fetch_chatgpt_models(
                 .header("originator", ORIGINATOR)
                 .header("Accept", "application/json")
         },
+        None,
         None,
     )
     .await?;
@@ -435,7 +482,7 @@ async fn fetch_chatgpt_models(
         models.len(),
         models.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>()
     );
-    Ok(models
+    let metadata = models
         .into_iter()
         .map(|m| ModelMetadata {
             id: m.slug,
@@ -456,7 +503,8 @@ async fn fetch_chatgpt_models(
             context_length: None,
             pricing: None,
         })
-        .collect())
+        .collect();
+    Ok((metadata, notice))
 }
 
 /// Render up to `limit` bytes of `body` as a debug-safe string. Used
@@ -477,10 +525,179 @@ fn body_excerpt(body: &[u8], limit: usize) -> String {
     }
 }
 
+async fn resolve_codex_compat_client_version(http: &reqwest::Client) -> (String, Option<String>) {
+    if let Some(version) = cached_codex_compat_client_version() {
+        tracing::debug!(
+            client_version = %version,
+            "using cached Codex models manifest client_version for ChatGPT model discovery"
+        );
+        return (version, None);
+    }
+
+    match tokio::time::timeout(
+        CODEX_MODELS_MANIFEST_TIMEOUT,
+        fetch_codex_models_manifest_client_version(http),
+    )
+    .await
+    {
+        Ok(Ok(Some(version))) => {
+            store_codex_compat_client_version(version.clone());
+            tracing::info!(
+                client_version = %version,
+                "using Codex models manifest client_version for ChatGPT model discovery"
+            );
+            (version, None)
+        }
+        Ok(Ok(None)) => fallback_codex_compat_client_version(Some(
+            "Codex models manifest did not advertise any visible minimal_client_version",
+        )),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                ?e,
+                fallback = FALLBACK_CODEX_COMPAT_CLIENT_VERSION,
+                "failed to fetch Codex models manifest; using fallback client_version"
+            );
+            fallback_codex_compat_client_version(Some("Could not fetch Codex models manifest"))
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CODEX_MODELS_MANIFEST_TIMEOUT.as_secs_f32(),
+                fallback = FALLBACK_CODEX_COMPAT_CLIENT_VERSION,
+                "timed out fetching Codex models manifest; using fallback client_version"
+            );
+            fallback_codex_compat_client_version(Some("Timed out fetching Codex models manifest"))
+        }
+    }
+}
+
+fn cached_codex_compat_client_version() -> Option<String> {
+    let cache = codex_compat_client_version_cache()
+        .lock()
+        .expect("Codex compat client version cache lock poisoned");
+    let entry = cache.as_ref()?;
+    if entry.fetched_at.elapsed() < CODEX_MODELS_MANIFEST_CACHE_TTL {
+        Some(entry.version.clone())
+    } else {
+        None
+    }
+}
+
+fn store_codex_compat_client_version(version: String) {
+    *codex_compat_client_version_cache()
+        .lock()
+        .expect("Codex compat client version cache lock poisoned") =
+        Some(CodexCompatClientVersionCacheEntry {
+            version,
+            fetched_at: Instant::now(),
+        });
+}
+
+fn fallback_codex_compat_client_version(reason: Option<&str>) -> (String, Option<String>) {
+    let message = reason.map(|reason| {
+        format!("{reason}; using fallback client_version {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}.")
+    });
+    if let Some(message) = &message {
+        tracing::warn!(message);
+    }
+    (FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(), message)
+}
+
+async fn fetch_codex_models_manifest_client_version(
+    http: &reqwest::Client,
+) -> Result<Option<String>> {
+    let resp = crate::http_retry::send_with_retries(
+        "GET Codex models manifest",
+        || {
+            http.get(CODEX_MODELS_MANIFEST_URL)
+                .header("Accept", "application/json")
+        },
+        None,
+        None,
+    )
+    .await?;
+    let status = resp.status();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .context("reading Codex models manifest response body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Codex models manifest returned HTTP {status}: {}",
+            body_excerpt(&body_bytes, 256)
+        );
+    }
+    let parsed: CodexModelsManifest = serde_json::from_slice(&body_bytes).with_context(|| {
+        format!(
+            "parsing Codex models manifest JSON (excerpt: {})",
+            body_excerpt(&body_bytes, 256)
+        )
+    })?;
+    Ok(latest_visible_minimal_client_version(&parsed.models))
+}
+
+fn latest_visible_minimal_client_version(models: &[CodexManifestModelEntry]) -> Option<String> {
+    let mut listed_versions = models
+        .iter()
+        .filter(|m| m.visibility.as_deref() == Some("list"))
+        .filter_map(|m| m.minimal_client_version.as_deref())
+        .filter_map(parse_version_triple)
+        .peekable();
+    if listed_versions.peek().is_some() {
+        return listed_versions.max().map(format_version_triple);
+    }
+
+    // Be tolerant if Codex changes the manifest's visibility vocabulary: a
+    // newer gate on an unknown visible-looking entry is safer than silently
+    // falling back to an older hardcoded client_version.
+    models
+        .iter()
+        .filter(|m| {
+            m.visibility.as_deref() != Some("hide") && m.visibility.as_deref() != Some("none")
+        })
+        .filter_map(|m| m.minimal_client_version.as_deref())
+        .filter_map(parse_version_triple)
+        .max()
+        .map(format_version_triple)
+}
+
+fn parse_version_triple(input: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = input.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch_part = parts.next()?;
+    let patch_digits = patch_part
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if patch_digits.is_empty() {
+        return None;
+    }
+    let patch = patch_digits.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn format_version_triple((major, minor, patch): (u64, u64, u64)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatGptModelsResponse {
     #[serde(default)]
     models: Vec<ChatGptModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsManifest {
+    #[serde(default)]
+    models: Vec<CodexManifestModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexManifestModelEntry {
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    minimal_client_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,6 +778,15 @@ impl LlmBackend for CodexClient {
         Box::pin(self.list_model_metadata_impl())
     }
 
+    fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        std::mem::take(
+            &mut *self
+                .discovery_notices
+                .lock()
+                .expect("Codex discovery notice lock poisoned"),
+        )
+    }
+
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
         Box::pin(self.stream_chat_impl(request))
     }
@@ -638,8 +864,14 @@ fn chatgpt_http_error(status: reqwest::StatusCode, body: String) -> anyhow::Erro
             .context(message);
     }
     if crate::http_retry::contains_standard_transient_marker(&body) {
+        // Same tier as the Responses path and the status path: these markers
+        // are body-borne 5xx/429 equivalents. Keeping this on Fast was the
+        // tier inconsistency where one error string meant different patience
+        // depending on which provider path produced it.
         return error
-            .context(RetryableLlmError::fast("standard transient response body"))
+            .context(RetryableLlmError::gateway_transient(
+                "standard transient response body",
+            ))
             .context(message);
     }
     error
@@ -681,7 +913,8 @@ pub(crate) struct ResponsesRequest {
     pub(crate) tools: Option<Vec<ResponsesToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_choice: Option<String>,
-    pub(crate) parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) stream: bool,
     /// Don't ask the server to retain this request; brokk owns its own
     /// session/turn persistence and we don't want a side-channel copy
@@ -870,6 +1103,7 @@ pub(crate) fn build_responses_request(
             })
             .collect()
     });
+    let parallel_tool_calls = tools.as_ref().map(|_| true);
     let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
     let instructions = if instructions_parts.is_empty() {
@@ -897,7 +1131,7 @@ pub(crate) fn build_responses_request(
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: true,
+        parallel_tool_calls,
         stream: true,
         store: false,
         reasoning,
@@ -1411,6 +1645,12 @@ mod tests {
         }
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
+        assert!(req.parallel_tool_calls.is_none());
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert!(serialized.get("tools").is_none());
+        assert!(serialized.get("tool_choice").is_none());
+        assert!(serialized.get("parallel_tool_calls").is_none());
+        assert!(serialized.get("max_output_tokens").is_none());
         assert!(!req.store);
         assert!(req.stream);
     }
@@ -1480,6 +1720,7 @@ mod tests {
         assert_eq!(tools[0]["description"], "check liveness");
         assert!(tools[0].get("function").is_none());
         assert_eq!(serialized.get("tool_choice").unwrap(), "auto");
+        assert_eq!(serialized.get("parallel_tool_calls").unwrap(), true);
     }
 
     #[test]
@@ -2030,6 +2271,81 @@ mod tests {
 
         assert_eq!(text.lock().unwrap().as_str(), "hello");
         assert_eq!(thought.lock().unwrap().as_str(), "weigh options");
+    }
+
+    #[test]
+    fn fallback_codex_compat_client_version_meets_current_model_gate() {
+        // Keep this at or above the newest `minimal_client_version` we
+        // have verified. If manifest fetch fails and this drifts low,
+        // ChatGPT /codex/models silently hides newly rolled-out models.
+        assert_eq!(FALLBACK_CODEX_COMPAT_CLIENT_VERSION, "0.144.0");
+    }
+
+    #[test]
+    fn extracts_latest_visible_minimal_client_version_from_manifest() {
+        let models = vec![
+            CodexManifestModelEntry {
+                visibility: Some("list".to_string()),
+                minimal_client_version: Some("0.143.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("hide".to_string()),
+                minimal_client_version: Some("0.200.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("list".to_string()),
+                minimal_client_version: Some("0.144.0-alpha.10".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("none".to_string()),
+                minimal_client_version: Some("0.300.0".to_string()),
+            },
+        ];
+        assert_eq!(
+            latest_visible_minimal_client_version(&models),
+            Some("0.144.0".to_string())
+        );
+    }
+
+    #[test]
+    fn manifest_version_tolerates_unknown_visible_states_when_list_is_absent() {
+        let models = vec![
+            CodexManifestModelEntry {
+                visibility: Some("public".to_string()),
+                minimal_client_version: Some("0.145.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("hide".to_string()),
+                minimal_client_version: Some("0.200.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("none".to_string()),
+                minimal_client_version: Some("0.300.0".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            latest_visible_minimal_client_version(&models),
+            Some("0.145.0".to_string())
+        );
+    }
+
+    #[test]
+    fn manifest_version_cache_expires_old_entries() {
+        let stale = Instant::now() - CODEX_MODELS_MANIFEST_CACHE_TTL - Duration::from_secs(1);
+        *codex_compat_client_version_cache().lock().unwrap() =
+            Some(CodexCompatClientVersionCacheEntry {
+                version: "0.999.0".to_string(),
+                fetched_at: stale,
+            });
+        assert_eq!(cached_codex_compat_client_version(), None);
+
+        store_codex_compat_client_version("0.145.0".to_string());
+        assert_eq!(
+            cached_codex_compat_client_version(),
+            Some("0.145.0".to_string())
+        );
+        *codex_compat_client_version_cache().lock().unwrap() = None;
     }
 
     #[test]

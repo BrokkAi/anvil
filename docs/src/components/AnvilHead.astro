@@ -1,0 +1,48 @@
+---
+import { Font } from 'astro:assets';
+import Default from '@astrojs/starlight/components/Head.astro';
+---
+
+{/*
+  Emits the @font-face rules for the self-hosted families declared in astro.config.mjs.
+  `preload` is set only on the two faces the first viewport actually paints with --
+  the display face for the hero headline and the body face for everything around it.
+  JetBrains Mono is used for small labels and can arrive on the normal CSS path
+  without holding up anything above the fold.
+*/}
+<Font cssVariable="--font-staatliches" preload />
+<Font cssVariable="--font-rajdhani" preload />
+<Font cssVariable="--font-jetbrains-mono" />
+
+<Default><slot /></Default>
+
+{/*
+  Drops transitions for the frame a theme flip lands on. Without this, anything with a
+  transition whose value comes from a custom property keeps the old palette when
+  data-theme changes -- see the guard rule in src/styles/anvil.css. Inline and in <head>
+  so the observer is attached before the theme selector can be used.
+*/}
+<script is:inline>
+  (() => {
+    const root = document.documentElement;
+    let frame = 0;
+    let timer = 0;
+    const clear = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      root.removeAttribute('data-theme-switching');
+    };
+    new MutationObserver(() => {
+      root.setAttribute('data-theme-switching', '');
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      // Two frames: one for the new palette to be computed, one for it to paint.
+      frame = requestAnimationFrame(() => requestAnimationFrame(clear));
+      // Backstop: rAF never fires in a background tab, and a theme can change there
+      // (OS-level flip, or a toggle immediately before switching away). Without this the
+      // guard would latch and every transition on the page would stay dead until the tab
+      // came back to the foreground.
+      timer = setTimeout(clear, 250);
+    }).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  })();
+</script>

@@ -4,8 +4,8 @@
 //!
 //! Why a separate type? `OpenAiClient` and `CodexClient` already implement
 //! `LlmBackend` for one transport each. Wrapping the configured sources
-//! (Bedrock, Codex, hosted DeepSeek, OpenRouter, Ollama) in a single routing
-//! backend lets `agent.rs` stay
+//! (Bedrock, Codex, hosted DeepSeek, Kimi, generic OpenAI profiles,
+//! OpenRouter, Ollama) in a single routing backend lets `agent.rs` stay
 //! oblivious to which model it's talking to -- it just hands the wire id
 //! back to the backend the same way it always has, and the backend strips
 //! the prefix and routes.
@@ -21,17 +21,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::discovery::{
-    DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discover_ollama_model_metadata,
-    discovery_http_client, split_wire_id,
+    ModelSource, OLLAMA_DEFAULT_URL, discover_ollama_model_metadata, discovery_http_client,
+    split_wire_id,
 };
 #[cfg(test)]
 use crate::llm_client::IdleTimeouts;
 use crate::llm_client::{
-    LlmBackend, LlmResponse, ModelMetadata, ResolvedModelInfo, StreamChatRequest,
+    LlmBackend, LlmResponse, ModelDiscoveryNotice, ModelMetadata, ResolvedModelInfo,
+    StreamChatRequest,
 };
 
 const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -42,14 +43,10 @@ const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ollama on the default port); calls for a source whose backend isn't
 /// configured return a clear error rather than silently falling through.
 ///
-/// The Codex, hosted DeepSeek, and OpenRouter slots are held behind
-/// `RwLock`s so a runtime install can update them without a server
-/// restart. The lock is only ever held for the duration of a synchronous
-/// `Option<Arc<...>>` clone -- we never hold it across an `.await`.
-///
-/// Ollama stays a plain `Option<Arc<...>>`: there's no login flow for
-/// it (the daemon either listens on the default port or it doesn't),
-/// so the slot is set once at construction and never mutated.
+/// Every registered source uses the same small `RwLock` slot. Runtime setup
+/// flows replace selected slots, while startup-only providers simply leave
+/// their slots unchanged. The lock is held only for a synchronous
+/// `Option<Arc<...>>` clone, never across an `.await`.
 ///
 /// ds4 is behind an `RwLock` like Codex/OpenRouter, but for a different
 /// reason: ds4-server has no fixed port, so each discovery refresh
@@ -57,32 +54,72 @@ const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// and reinstalls a backend pointed at it. That keeps `ds4::*` chat
 /// routing aimed at the same port discovery just found, and lets ds4 come
 /// online when it's started after Anvil.
+pub struct BackendRegistration {
+    source: String,
+    label: String,
+    backend: Option<Arc<dyn LlmBackend>>,
+}
+
+impl BackendRegistration {
+    pub fn new(
+        source: impl Into<String>,
+        label: impl Into<String>,
+        backend: Option<Arc<dyn LlmBackend>>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            label: label.into(),
+            backend,
+        }
+    }
+}
+
+struct BackendSlot {
+    source: String,
+    label: String,
+    backend: RwLock<Option<Arc<dyn LlmBackend>>>,
+}
+
 pub struct MultiBackend {
-    bedrock: RwLock<Option<Arc<dyn LlmBackend>>>,
-    codex: RwLock<Option<Arc<dyn LlmBackend>>>,
-    deepseek: RwLock<Option<Arc<dyn LlmBackend>>>,
-    openrouter: RwLock<Option<Arc<dyn LlmBackend>>>,
-    ollama: Option<Arc<dyn LlmBackend>>,
-    ds4: RwLock<Option<Arc<dyn LlmBackend>>>,
+    /// Ordered by discovery/default/fallback priority.
+    backends: Vec<BackendSlot>,
 }
 
 impl MultiBackend {
-    pub fn new(
-        bedrock: Option<Arc<dyn LlmBackend>>,
-        codex: Option<Arc<dyn LlmBackend>>,
-        deepseek: Option<Arc<dyn LlmBackend>>,
-        openrouter: Option<Arc<dyn LlmBackend>>,
-        ollama: Option<Arc<dyn LlmBackend>>,
-    ) -> Self {
-        Self {
-            bedrock: RwLock::new(bedrock),
-            codex: RwLock::new(codex),
-            deepseek: RwLock::new(deepseek),
-            openrouter: RwLock::new(openrouter),
-            ollama,
-            // Resolved on the first discovery refresh (the eager startup
-            // probe), then on every refresh thereafter.
-            ds4: RwLock::new(None),
+    pub fn new(registrations: Vec<BackendRegistration>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let backends = registrations
+            .into_iter()
+            .map(|registration| {
+                assert!(
+                    seen.insert(registration.source.clone()),
+                    "duplicate LLM backend source {}",
+                    registration.source
+                );
+                BackendSlot {
+                    source: registration.source,
+                    label: registration.label,
+                    backend: RwLock::new(registration.backend),
+                }
+            })
+            .collect();
+        Self { backends }
+    }
+
+    fn slot(&self, source: &str) -> Option<&BackendSlot> {
+        self.backends.iter().find(|slot| slot.source == source)
+    }
+
+    fn install(&self, source: &str, backend: Arc<dyn LlmBackend>) {
+        let slot = self
+            .slot(source)
+            .unwrap_or_else(|| panic!("LLM backend source {source} is not registered"));
+        *slot.backend.write().unwrap() = Some(backend);
+    }
+
+    fn uninstall(&self, source: &str) {
+        if let Some(slot) = self.slot(source) {
+            *slot.backend.write().unwrap() = None;
         }
     }
 
@@ -91,19 +128,19 @@ impl MultiBackend {
     /// Bedrock credentials picks up the new key on the next discovery
     /// refresh.
     pub fn install_bedrock(&self, backend: Arc<dyn LlmBackend>) {
-        *self.bedrock.write().unwrap() = Some(backend);
+        self.install(ModelSource::BEDROCK, backend);
     }
 
     /// Drop the currently-installed Bedrock backend, if any. Called
     /// from `/setup bedrock disconnect` after the on-disk credentials
     /// are wiped.
     pub fn uninstall_bedrock(&self) {
-        *self.bedrock.write().unwrap() = None;
+        self.uninstall(ModelSource::BEDROCK);
     }
 
     /// Install (or replace) the Codex backend at runtime. Called from
-    /// the `/codex-login` handler so the next discovery refresh and any
-    /// subsequent `codex::*` route picks it up without a server restart.
+    /// `/setup codex` so the next discovery refresh and any subsequent
+    /// `codex::*` route picks it up without a server restart.
     ///
     /// Replacing an existing backend is safe: any in-flight request
     /// holding a clone of the old `Arc<CodexClient>` finishes against
@@ -116,18 +153,18 @@ impl MultiBackend {
         // unwrap: the only way the lock gets poisoned is a panic while
         // holding it, and the only sites that hold it are tiny clones of
         // an Option<Arc> -- not panickable in practice.
-        *self.codex.write().unwrap() = Some(backend);
+        self.install(ModelSource::CODEX, backend);
     }
 
     /// Drop the currently-installed Codex backend, if any. Called from
-    /// `/codex-login disconnect` after the on-disk credentials are
+    /// `/setup codex disconnect` after the on-disk credentials are
     /// wiped so a subsequent `codex::*` request fails with the same
     /// "backend not configured" error a fresh-no-auth.json startup
     /// would give, instead of firing requests with credentials that
     /// will now 401. In-flight requests holding an `Arc` to the old
     /// backend complete against that captured instance.
     pub fn uninstall_codex(&self) {
-        *self.codex.write().unwrap() = None;
+        self.uninstall(ModelSource::CODEX);
     }
 
     /// Install (or replace) the hosted DeepSeek backend at runtime.
@@ -135,7 +172,7 @@ impl MultiBackend {
     /// without `DEEPSEEK_API_KEY` or a stored key picks up the new key on
     /// the next discovery refresh.
     pub fn install_deepseek(&self, backend: Arc<dyn LlmBackend>) {
-        *self.deepseek.write().unwrap() = Some(backend);
+        self.install(ModelSource::DEEPSEEK, backend);
     }
 
     /// Drop the currently-installed DeepSeek backend, if any. Called from
@@ -143,7 +180,7 @@ impl MultiBackend {
     /// wiped so a subsequent `deepseek::*` request fails with "backend
     /// not configured" instead of firing 401-bound requests.
     pub fn uninstall_deepseek(&self) {
-        *self.deepseek.write().unwrap() = None;
+        self.uninstall(ModelSource::DEEPSEEK);
     }
 
     /// Install (or replace) the OpenRouter backend at runtime. Called
@@ -151,7 +188,7 @@ impl MultiBackend {
     /// `OPENROUTER_API_KEY` or an on-disk credential file picks up the
     /// new key on the next discovery refresh.
     pub fn install_openrouter(&self, backend: Arc<dyn LlmBackend>) {
-        *self.openrouter.write().unwrap() = Some(backend);
+        self.install(ModelSource::OPENROUTER, backend);
     }
 
     /// Drop the currently-installed OpenRouter backend, if any. Called
@@ -159,32 +196,15 @@ impl MultiBackend {
     /// file is wiped so a subsequent `openrouter::*` request fails with
     /// "backend not configured" instead of firing 401-bound requests.
     pub fn uninstall_openrouter(&self) {
-        *self.openrouter.write().unwrap() = None;
+        self.uninstall(ModelSource::OPENROUTER);
     }
 
     /// Snapshot the current Bedrock backend, if any. Cloning the inner Arc
     /// lets callers release the read lock immediately; they can then
     /// `.await` the backend without holding a guard.
-    fn bedrock_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
-        self.bedrock.read().unwrap().clone()
-    }
-
-    /// Snapshot the current Codex backend, if any. Cloning the inner Arc
-    /// lets callers release the read lock immediately; they can then
-    /// `.await` the backend without holding a guard.
-    fn codex_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
-        self.codex.read().unwrap().clone()
-    }
-
-    /// Snapshot the current hosted DeepSeek backend, if any.
-    fn deepseek_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
-        self.deepseek.read().unwrap().clone()
-    }
-
-    /// Snapshot the current OpenRouter backend, if any. Same shape as
-    /// `codex_snapshot` -- callers release the read lock before awaiting.
-    fn openrouter_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
-        self.openrouter.read().unwrap().clone()
+    fn snapshot(&self, source: &str) -> Option<Arc<dyn LlmBackend>> {
+        self.slot(source)
+            .and_then(|slot| slot.backend.read().unwrap().clone())
     }
 
     /// Install (or replace) the ds4 backend. Called from each discovery
@@ -192,7 +212,7 @@ impl MultiBackend {
     /// currently listening on. In-flight requests holding the old `Arc`
     /// finish against it; new `ds4::*` routes pick up the new port.
     fn install_ds4(&self, backend: Arc<dyn LlmBackend>) {
-        *self.ds4.write().unwrap() = Some(backend);
+        self.install(ModelSource::DS4, backend);
     }
 
     /// Drop the ds4 backend. Called from a discovery refresh that no longer
@@ -200,13 +220,7 @@ impl MultiBackend {
     /// with the standard "backend not configured" error instead of hitting
     /// a now-dead port.
     fn uninstall_ds4(&self) {
-        *self.ds4.write().unwrap() = None;
-    }
-
-    /// Snapshot the current ds4 backend, if any. Same shape as
-    /// `codex_snapshot` -- callers release the read lock before awaiting.
-    fn ds4_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
-        self.ds4.read().unwrap().clone()
+        self.uninstall(ModelSource::DS4);
     }
 
     /// Re-resolve the local ds4-server URL and (re)install or drop the ds4
@@ -236,83 +250,53 @@ impl MultiBackend {
             crate::openrouter_auth::append_refresh_log("Snapshotting configured backends...");
             let _ = tx.send("Snapshotting configured backends...\n".to_string());
         }
-        let bedrock = self.bedrock_snapshot();
-        let codex = self.codex_snapshot();
-        let deepseek = self.deepseek_snapshot();
-        let openrouter = self.openrouter_snapshot();
         if let Some(tx) = &progress {
             crate::openrouter_auth::append_refresh_log("Building discovery HTTP client...");
             let _ = tx.send("Building discovery HTTP client...\n".to_string());
         }
         let http = discovery_http_client();
+
+        // Re-resolve ds4-server's port and update its registry slot before
+        // snapshotting providers for this discovery round.
+        self.refresh_ds4_backend().await;
+
         if let Some(tx) = &progress {
             crate::openrouter_auth::append_refresh_log("Launching provider checks...");
             let _ = tx.send("Launching provider checks...\n".to_string());
         }
 
-        let (
-            bedrock_metadata,
-            codex_metadata,
-            deepseek_metadata,
-            openrouter_metadata,
-            ollama_metadata,
-        ) = tokio::join!(
-            discover_backend_metadata("Bedrock", bedrock, progress.clone()),
-            discover_backend_metadata("Codex", codex, progress.clone()),
-            discover_backend_metadata("DeepSeek", deepseek, progress.clone()),
-            discover_backend_metadata("OpenRouter", openrouter, progress.clone()),
-            discover_ollama_metadata(&http, progress.clone()),
-        );
+        let checks = self.backends.iter().map(|slot| {
+            let source = slot.source.clone();
+            let label = slot.label.clone();
+            let backend = slot.backend.read().unwrap().clone();
+            let progress = progress.clone();
+            let http = http.clone();
+            async move {
+                let metadata = if source == ModelSource::OLLAMA {
+                    discover_ollama_metadata(&http, progress)
+                        .await
+                        .into_values()
+                        .collect()
+                } else {
+                    discover_backend_metadata(label, backend, progress).await
+                };
+                metadata
+                    .into_iter()
+                    .map(|mut model| {
+                        model.id = format!("{source}::{}", model.id);
+                        model
+                    })
+                    .collect::<Vec<_>>()
+            }
+        });
+        let catalogs = join_all(checks).await;
         if let Some(tx) = &progress {
             crate::openrouter_auth::append_refresh_log(
                 "Provider checks finished. Merging catalogs...",
             );
             let _ = tx.send("Provider checks finished. Merging catalogs...\n".to_string());
         }
-
-        let bedrock_by_id: HashMap<String, ModelMetadata> = bedrock_metadata
-            .iter()
-            .map(|m| (m.id.clone(), m.clone()))
-            .collect();
-        let bedrock_ids: Vec<String> = bedrock_metadata.iter().map(|m| m.id.clone()).collect();
-        let bedrock_lookup = || async move { Ok::<_, anyhow::Error>(bedrock_ids) };
-
-        let codex_by_id: HashMap<String, ModelMetadata> = codex_metadata
-            .iter()
-            .map(|m| (m.id.clone(), m.clone()))
-            .collect();
-        let codex_ids: Vec<String> = codex_metadata.iter().map(|m| m.id.clone()).collect();
-        let codex_lookup = || async move { Ok::<_, anyhow::Error>(codex_ids) };
-
-        let deepseek_by_id: HashMap<String, ModelMetadata> = deepseek_metadata
-            .iter()
-            .map(|m| (m.id.clone(), m.clone()))
-            .collect();
-        let deepseek_ids: Vec<String> = deepseek_metadata.iter().map(|m| m.id.clone()).collect();
-        let deepseek_lookup = move || async move { Ok::<_, anyhow::Error>(deepseek_ids) };
-
-        let openrouter_by_id: HashMap<String, ModelMetadata> = openrouter_metadata
-            .iter()
-            .map(|m| (m.id.clone(), m.clone()))
-            .collect();
-        let openrouter_ids: Vec<String> =
-            openrouter_metadata.iter().map(|m| m.id.clone()).collect();
-        let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
-
-        // Re-resolve ds4-server's port and (re)install its chat backend, so
-        // discovery and `ds4::*` routing agree on the same port this round.
-        let ds4_url = self.refresh_ds4_backend().await;
-
-        let discovered: Vec<DiscoveredModel> = discover_all(
-            &http,
-            OLLAMA_DEFAULT_URL,
-            ds4_url.as_deref(),
-            bedrock_lookup,
-            codex_lookup,
-            deepseek_lookup,
-            openrouter_lookup,
-        )
-        .await;
+        let discovered = catalogs.into_iter().flatten().collect::<Vec<_>>();
         if let Some(tx) = &progress {
             crate::openrouter_auth::append_refresh_log(&format!(
                 "Merged discovery results: {} model(s).",
@@ -323,79 +307,7 @@ impl MultiBackend {
                 discovered.len()
             ));
         }
-        Ok(discovered
-            .into_iter()
-            .map(|m| {
-                let wire = m.wire_id();
-                match m.source {
-                    ModelSource::Bedrock => bedrock_by_id
-                        .get(&m.id)
-                        .map(|meta| ModelMetadata {
-                            id: wire.clone(),
-                            default_reasoning_level: meta.default_reasoning_level.clone(),
-                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                            service_tiers: meta.service_tiers.clone(),
-                            supports_images: meta.supports_images,
-                            context_length: meta.context_length,
-                            pricing: meta.pricing,
-                        })
-                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                    ModelSource::Codex => codex_by_id
-                        .get(&m.id)
-                        .map(|meta| ModelMetadata {
-                            id: wire.clone(),
-                            default_reasoning_level: meta.default_reasoning_level.clone(),
-                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                            service_tiers: meta.service_tiers.clone(),
-                            supports_images: meta.supports_images,
-                            context_length: meta.context_length,
-                            pricing: meta.pricing,
-                        })
-                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                    ModelSource::DeepSeek => deepseek_by_id
-                        .get(&m.id)
-                        .map(|meta| ModelMetadata {
-                            id: wire.clone(),
-                            default_reasoning_level: meta.default_reasoning_level.clone(),
-                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                            service_tiers: meta.service_tiers.clone(),
-                            supports_images: meta.supports_images,
-                            context_length: meta.context_length,
-                            pricing: meta.pricing,
-                        })
-                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                    ModelSource::Ollama => ollama_metadata
-                        .get(&m.id)
-                        .map(|meta| ModelMetadata {
-                            id: wire.clone(),
-                            default_reasoning_level: meta.default_reasoning_level.clone(),
-                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                            service_tiers: meta.service_tiers.clone(),
-                            supports_images: meta.supports_images,
-                            context_length: meta.context_length,
-                            pricing: meta.pricing,
-                        })
-                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                    // ds4-server's OpenAI shim only reports model ids (no
-                    // capability/context metadata like Ollama's /api/show),
-                    // so we expose ids alone and let the compression layer
-                    // fall back to its default context window.
-                    ModelSource::Ds4 => ModelMetadata::id_only(wire),
-                    ModelSource::OpenRouter => openrouter_by_id
-                        .get(&m.id)
-                        .map(|meta| ModelMetadata {
-                            id: wire.clone(),
-                            default_reasoning_level: meta.default_reasoning_level.clone(),
-                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                            service_tiers: meta.service_tiers.clone(),
-                            supports_images: meta.supports_images,
-                            context_length: meta.context_length,
-                            pricing: meta.pricing,
-                        })
-                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                }
-            })
-            .collect())
+        Ok(discovered)
     }
 
     pub async fn list_model_metadata_with_progress(
@@ -405,15 +317,18 @@ impl MultiBackend {
         self.list_model_metadata_inner(progress).await
     }
 
-    fn pick(&self, source: ModelSource) -> Option<Arc<dyn LlmBackend>> {
-        match source {
-            ModelSource::Bedrock => self.bedrock_snapshot(),
-            ModelSource::Codex => self.codex_snapshot(),
-            ModelSource::DeepSeek => self.deepseek_snapshot(),
-            ModelSource::OpenRouter => self.openrouter_snapshot(),
-            ModelSource::Ollama => self.ollama.clone(),
-            ModelSource::Ds4 => self.ds4_snapshot(),
+    pub fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        let mut notices = Vec::new();
+        for slot in &self.backends {
+            if let Some(backend) = slot.backend.read().unwrap().clone() {
+                notices.extend(backend.take_model_discovery_notices());
+            }
         }
+        notices
+    }
+
+    fn pick(&self, source: &str) -> Option<Arc<dyn LlmBackend>> {
+        self.snapshot(source)
     }
 
     /// Source to use when a chat request arrives with no `<source>::` prefix.
@@ -421,35 +336,20 @@ impl MultiBackend {
     /// login or Bedrock key paste mid-session promotes it to the preferred
     /// fallback.
     ///
-    /// Priority is Bedrock > Codex > Ollama > ds4 > DeepSeek > OpenRouter. Bedrock wins
-    /// when configured because its model ids are otherwise easy to type
+    /// Priority follows registry order. Bedrock wins when configured because
+    /// its model ids are otherwise easy to type
     /// bare from the environment-driven setup. ds4 sits after Ollama so an
     /// existing Ollama user's bare-id fallback is unchanged, and direct
-    /// DeepSeek beats OpenRouter when both expose the same family.
-    fn fallback_source(&self) -> Option<ModelSource> {
-        let bedrock_present = self.bedrock.read().unwrap().is_some();
-        if bedrock_present {
-            return Some(ModelSource::Bedrock);
-        }
-        let codex_present = self.codex.read().unwrap().is_some();
-        if codex_present {
-            return Some(ModelSource::Codex);
-        }
-        if self.ollama.is_some() {
-            return Some(ModelSource::Ollama);
-        }
-        if self.ds4.read().unwrap().is_some() {
-            return Some(ModelSource::Ds4);
-        }
-        let deepseek_present = self.deepseek.read().unwrap().is_some();
-        if deepseek_present {
-            return Some(ModelSource::DeepSeek);
-        }
-        let openrouter_present = self.openrouter.read().unwrap().is_some();
-        if openrouter_present {
-            return Some(ModelSource::OpenRouter);
-        }
-        None
+    /// DeepSeek beats generic OpenAI-compatible profiles and OpenRouter
+    /// when both expose the same family.
+    fn fallback_source(&self) -> Option<&str> {
+        self.backends.iter().find_map(|slot| {
+            slot.backend
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|_| slot.source.as_str())
+        })
     }
 
     /// Resolve a wire-form model id to (backend, bare id). Bare ids (no
@@ -458,16 +358,14 @@ impl MultiBackend {
         if let Some((source, bare)) = split_wire_id(wire_model) {
             let backend = self.pick(source).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "model {wire_model} requires the {} backend, which is not configured",
-                    source.as_str()
+                    "model {wire_model} requires the {source} backend, which is not configured"
                 )
             })?;
             return Ok((backend, bare.to_string()));
         }
         let source = self.fallback_source().ok_or_else(|| {
             anyhow::anyhow!(
-                "no LLM backend is configured (none of Bedrock, Codex, DeepSeek, OpenRouter, or Ollama \
-                 discovered any models, and no `<source>::<id>` wire prefix was provided)"
+                "no LLM backend is configured and no `<source>::<id>` wire prefix was provided"
             )
         })?;
         let backend = self
@@ -498,21 +396,23 @@ impl LlmBackend for MultiBackend {
 
     fn resolve_model_info(&self, configured_model: &str) -> ResolvedModelInfo {
         match self.resolve(configured_model) {
-            Ok((_backend, bare)) => {
-                let provider = split_wire_id(configured_model)
+            Ok((backend, bare)) => {
+                let source = split_wire_id(configured_model)
                     .map(|(source, _)| source)
-                    .or_else(|| self.fallback_source())
-                    .map(|source| source.as_str().to_string());
+                    .or_else(|| self.fallback_source());
+                let info = backend.resolve_model_info(&bare);
                 ResolvedModelInfo {
                     configured_model: configured_model.to_string(),
-                    resolved_provider: provider,
-                    resolved_model: bare,
+                    resolved_provider: info
+                        .resolved_provider
+                        .or_else(|| source.map(str::to_string)),
+                    resolved_model: info.resolved_model,
                 }
             }
             Err(_) => ResolvedModelInfo {
                 configured_model: configured_model.to_string(),
                 resolved_provider: split_wire_id(configured_model)
-                    .map(|(source, _)| source.as_str().to_string()),
+                    .map(|(source, _)| source.to_string()),
                 resolved_model: configured_model.to_string(),
             },
         }
@@ -530,7 +430,7 @@ impl LlmBackend for MultiBackend {
 }
 
 async fn discover_backend_metadata(
-    label: &'static str,
+    label: String,
     backend: Option<Arc<dyn LlmBackend>>,
     progress: Option<UnboundedSender<String>>,
 ) -> Vec<ModelMetadata> {
@@ -624,6 +524,26 @@ mod tests {
     use super::*;
     use futures::future::FutureExt;
     use std::sync::Mutex;
+
+    fn test_multi(
+        bedrock: Option<Arc<dyn LlmBackend>>,
+        codex: Option<Arc<dyn LlmBackend>>,
+        deepseek: Option<Arc<dyn LlmBackend>>,
+        openai: Option<Arc<dyn LlmBackend>>,
+        openrouter: Option<Arc<dyn LlmBackend>>,
+        ollama: Option<Arc<dyn LlmBackend>>,
+    ) -> MultiBackend {
+        MultiBackend::new(vec![
+            BackendRegistration::new(ModelSource::BEDROCK, "Bedrock", bedrock),
+            BackendRegistration::new(ModelSource::CODEX, "Codex", codex),
+            BackendRegistration::new(ModelSource::OLLAMA, "Local models", ollama),
+            BackendRegistration::new(ModelSource::DS4, "ds4", None),
+            BackendRegistration::new(ModelSource::DEEPSEEK, "DeepSeek", deepseek),
+            BackendRegistration::new(ModelSource::KIMI, "Kimi", None),
+            BackendRegistration::new(ModelSource::OPENAI, "OpenAI-compatible", openai),
+            BackendRegistration::new(ModelSource::OPENROUTER, "OpenRouter", openrouter),
+        ])
+    }
 
     fn chat_request(model: &str, reasoning_effort: Option<&str>) -> StreamChatRequest {
         chat_request_with_service_tier(model, reasoning_effort, None)
@@ -731,7 +651,14 @@ mod tests {
     async fn stream_chat_routes_by_wire_prefix() {
         let (codex_backend, codex_handles) = recording("codex");
         let (ollama_backend, ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, Some(ollama_backend));
+        let multi = test_multi(
+            None,
+            Some(codex_backend),
+            None,
+            None,
+            None,
+            Some(ollama_backend),
+        );
 
         let _ = multi
             .stream_chat(chat_request("codex::gpt-5-codex", None))
@@ -761,7 +688,14 @@ mod tests {
     async fn bare_id_routes_to_codex_fallback_when_both_configured() {
         let (codex_backend, codex_handles) = recording("codex");
         let (ollama_backend, ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, Some(ollama_backend));
+        let multi = test_multi(
+            None,
+            Some(codex_backend),
+            None,
+            None,
+            None,
+            Some(ollama_backend),
+        );
 
         let _ = multi
             .stream_chat(chat_request("gpt-5-codex", None))
@@ -780,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn bare_id_routes_to_ollama_when_codex_absent() {
         let (ollama_backend, ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(None, None, None, None, Some(ollama_backend));
+        let multi = test_multi(None, None, None, None, None, Some(ollama_backend));
 
         let _ = multi
             .stream_chat(chat_request("llama3", None))
@@ -800,7 +734,7 @@ mod tests {
     async fn wire_id_for_absent_backend_returns_error() {
         // Only Ollama is configured; a `codex::` wire id must error.
         let (ollama_backend, _ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(None, None, None, None, Some(ollama_backend));
+        let multi = test_multi(None, None, None, None, None, Some(ollama_backend));
 
         let err = multi
             .stream_chat(chat_request("codex::gpt-5", None))
@@ -812,11 +746,11 @@ mod tests {
 
     /// When neither backend is configured, every chat request errors
     /// rather than panics. `MultiBackend` is constructible empty (the
-    /// server still starts -- the user can run `/codex-login` mid-session
+    /// server still starts -- the user can run `/setup codex` mid-session
     /// or start Ollama and re-discover) but no model can be routed.
     #[tokio::test]
     async fn empty_multi_backend_errors_on_chat() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
         let err = multi
             .stream_chat(chat_request("anything", None))
             .await
@@ -828,16 +762,16 @@ mod tests {
         );
     }
 
-    /// Regression for the `/codex-login` lifecycle (issue #3555): the
+    /// Regression for the `/setup codex` lifecycle (issue #3555): the
     /// server starts with no Codex backend (auth.json absent), the user
-    /// runs `/codex-login`, and the new backend is installed at
+    /// runs `/setup codex`, and the new backend is installed at
     /// runtime. Subsequent `codex::*` routing must succeed -- previously
     /// it kept returning the "backend not configured" error because the
     /// `None` was captured permanently at construction.
     #[tokio::test]
     async fn codex_installed_after_login_is_routable() {
         // Start with no Codex (mirrors the empty-auth.json startup path).
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
 
         // Pre-install: a `codex::*` request must fail loudly.
         let err = multi
@@ -846,7 +780,7 @@ mod tests {
             .expect_err("codex route must fail before install");
         assert!(format!("{err:#}").contains("codex"));
 
-        // User runs `/codex-login` successfully -- the handler installs
+        // User runs `/setup codex` successfully -- the handler installs
         // a freshly-built Codex backend.
         let (codex_backend, codex_handles) = recording("codex");
         multi.install_codex(codex_backend);
@@ -871,7 +805,7 @@ mod tests {
     /// fallback was still `None`.
     #[tokio::test]
     async fn bare_id_falls_back_to_codex_after_install() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
 
         let (codex_backend, codex_handles) = recording("codex");
         multi.install_codex(codex_backend);
@@ -888,22 +822,17 @@ mod tests {
 
     /// `list_models` must consult the currently-installed Codex backend,
     /// not the one captured at construction. Without this, a successful
-    /// `/codex-login` followed by a discovery refresh (e.g. on
+    /// `/setup codex` followed by a discovery refresh (e.g. on
     /// `session/new`) would keep returning an empty Codex list and the
     /// model picker would never show Codex models.
     #[tokio::test]
     async fn list_models_reflects_installed_codex() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
         let (codex_backend, _codex_handles) = recording("codex");
         multi.install_codex(codex_backend);
 
-        // RecordingBackend::list_models returns ["codex-stub"].
-        // `discover_all` delegates Codex discovery entirely to the
-        // closure (the only Codex source it has -- there is no separate
-        // native probe), so the "codex-stub" id surfacing through it
-        // proves the freshly-installed backend was consulted by the
-        // refresh path rather than the empty `None` captured at
-        // construction.
+        // RecordingBackend::list_models returns ["codex-stub"], so that id
+        // surfacing proves the freshly-installed registry slot was consulted.
         let models = multi.list_models().await.expect("discovery must succeed");
         assert!(
             models.iter().any(|m| m.contains("codex-stub")),
@@ -911,7 +840,7 @@ mod tests {
         );
     }
 
-    /// `/codex-login disconnect` calls `uninstall_codex` after wiping
+    /// `/setup codex disconnect` calls `uninstall_codex` after wiping
     /// auth.json. Subsequent `codex::*` routing must fail with the same
     /// "backend not configured" error a fresh-no-auth.json startup
     /// gives -- otherwise a wire id picked from a stale `availableModels`
@@ -919,7 +848,7 @@ mod tests {
     /// exist on disk.
     #[tokio::test]
     async fn codex_uninstall_unroutes_codex_requests() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
         let (codex_backend, _codex_handles) = recording("codex");
         multi.install_codex(codex_backend);
 
@@ -944,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_installed_after_setup_is_routable() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
 
         let err = multi
             .stream_chat(chat_request(
@@ -974,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn bare_id_falls_back_to_bedrock_after_install() {
         let (codex_backend, codex_handles) = recording("codex");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, None);
+        let multi = test_multi(None, Some(codex_backend), None, None, None, None);
 
         let (bedrock_backend, bedrock_handles) = recording("bedrock");
         multi.install_bedrock(bedrock_backend);
@@ -992,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_uninstall_unroutes_bedrock_requests() {
-        let multi = MultiBackend::new(None, None, None, None, None);
+        let multi = test_multi(None, None, None, None, None, None);
         let (bedrock_backend, _bedrock_handles) = recording("bedrock");
         multi.install_bedrock(bedrock_backend);
 
@@ -1027,9 +956,10 @@ mod tests {
         let (codex_backend, codex_handles) = recording("codex");
         let (openrouter_backend, openrouter_handles) = recording("openrouter");
         let (ollama_backend, ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(
+        let multi = test_multi(
             None,
             Some(codex_backend),
+            None,
             None,
             Some(openrouter_backend),
             Some(ollama_backend),
@@ -1057,10 +987,11 @@ mod tests {
         let (codex_backend, codex_handles) = recording("codex");
         let (deepseek_backend, deepseek_handles) = recording("deepseek");
         let (openrouter_backend, openrouter_handles) = recording("openrouter");
-        let multi = MultiBackend::new(
+        let multi = test_multi(
             None,
             Some(codex_backend),
             Some(deepseek_backend),
+            None,
             Some(openrouter_backend),
             None,
         );
@@ -1078,9 +1009,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_routes_kimi_and_preserves_discovery_order() {
+        let (deepseek_backend, _) = recording("deepseek");
+        let (kimi_backend, kimi_handles) = recording("k3");
+        let (openai_backend, _) = recording("openai");
+        let multi = MultiBackend::new(vec![
+            BackendRegistration::new(ModelSource::DEEPSEEK, "DeepSeek", Some(deepseek_backend)),
+            BackendRegistration::new(ModelSource::KIMI, "Kimi", Some(kimi_backend)),
+            BackendRegistration::new(ModelSource::OPENAI, "OpenAI", Some(openai_backend)),
+        ]);
+
+        multi
+            .stream_chat(chat_request("kimi::k3", Some("max")))
+            .await
+            .expect("Kimi route");
+        assert_eq!(
+            kimi_handles.last_model.lock().unwrap().as_deref(),
+            Some("k3")
+        );
+        assert_eq!(
+            kimi_handles
+                .last_reasoning_effort
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("max")
+        );
+
+        assert_eq!(
+            multi.list_models().await.unwrap(),
+            vec![
+                "deepseek::deepseek-stub",
+                "kimi::k3-stub",
+                "openai::openai-stub",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn bare_id_routes_to_deepseek_when_only_deepseek_configured() {
         let (deepseek_backend, deepseek_handles) = recording("deepseek");
-        let multi = MultiBackend::new(None, None, Some(deepseek_backend), None, None);
+        let multi = test_multi(None, None, Some(deepseek_backend), None, None, None);
 
         let _ = multi
             .stream_chat(chat_request("deepseek-v4-flash", None))
@@ -1092,13 +1061,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn openai_wire_id_routes_to_profile_and_strips_profile_prefix() {
+        let (openai_backend, openai_handles) = recording("openai");
+        let multi = test_multi(None, None, None, Some(openai_backend), None, None);
+
+        let _ = multi
+            .stream_chat(chat_request("openai::deca/deca-model", None))
+            .await
+            .expect("openai profile route");
+        assert_eq!(
+            openai_handles.last_model.lock().unwrap().as_deref(),
+            Some("deca/deca-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_id_routes_to_openai_before_openrouter() {
+        let (openai_backend, openai_handles) = recording("openai");
+        let (openrouter_backend, openrouter_handles) = recording("openrouter");
+        let multi = test_multi(
+            None,
+            None,
+            None,
+            Some(openai_backend),
+            Some(openrouter_backend),
+            None,
+        );
+
+        let _ = multi
+            .stream_chat(chat_request("some-model", None))
+            .await
+            .expect("bare id falls back to openai-compatible provider");
+        assert_eq!(
+            openai_handles.last_model.lock().unwrap().as_deref(),
+            Some("some-model")
+        );
+        assert!(openrouter_handles.last_model.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_model_info_reports_openai_profile_provider() {
+        let openai_backend =
+            crate::openai_providers::build_backend(crate::openai_providers::OpenAiProviderConfig {
+                profiles: vec![crate::openai_providers::OpenAiProviderProfile {
+                    name: "deca".to_string(),
+                    base_url: "https://api.genlabs.dev/deca/v1".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                }],
+            })
+            .expect("non-empty openai config builds a backend");
+        let multi = test_multi(None, None, None, Some(openai_backend), None, None);
+
+        let info = multi.resolve_model_info("openai::deca/deca-model");
+
+        assert_eq!(info.configured_model, "openai::deca/deca-model");
+        assert_eq!(info.resolved_provider.as_deref(), Some("openai/deca"));
+        assert_eq!(info.resolved_model, "deca-model");
+    }
+
     /// A bare id with only OpenRouter configured falls back to
     /// OpenRouter rather than erroring -- the same fallback contract
     /// Ollama gets when it's the only backend.
     #[tokio::test]
     async fn bare_id_routes_to_openrouter_when_only_openrouter_configured() {
         let (openrouter_backend, openrouter_handles) = recording("openrouter");
-        let multi = MultiBackend::new(None, None, None, Some(openrouter_backend), None);
+        let multi = test_multi(None, None, None, None, Some(openrouter_backend), None);
 
         let _ = multi
             .stream_chat(chat_request("anthropic/claude-3.5-sonnet", None))
@@ -1113,7 +1142,7 @@ mod tests {
     #[test]
     fn resolve_model_info_reports_wire_provider_and_bare_model() {
         let (openrouter_backend, _openrouter_handles) = recording("openrouter");
-        let multi = MultiBackend::new(None, None, None, Some(openrouter_backend), None);
+        let multi = test_multi(None, None, None, None, Some(openrouter_backend), None);
 
         let info = multi.resolve_model_info("openrouter::google/gemini-3.1-pro-preview");
 
@@ -1128,7 +1157,7 @@ mod tests {
     #[test]
     fn resolve_model_info_reports_bare_model_fallback_provider() {
         let (openrouter_backend, _openrouter_handles) = recording("openrouter");
-        let multi = MultiBackend::new(None, None, None, Some(openrouter_backend), None);
+        let multi = test_multi(None, None, None, None, Some(openrouter_backend), None);
 
         let info = multi.resolve_model_info("gemini-3.1-pro-preview");
 
@@ -1137,16 +1166,17 @@ mod tests {
         assert_eq!(info.resolved_model, "gemini-3.1-pro-preview");
     }
 
-    /// Fallback priority: Codex > Ollama > OpenRouter. With all three
-    /// configured, a bare id routes to Codex (most capable, most likely
-    /// intent). With Codex absent, Ollama wins over OpenRouter so a free
+    /// Registry order defines fallback priority. With these providers
+    /// configured, a bare id routes to Codex. With Codex absent, Ollama wins
+    /// over OpenRouter so a free
     /// local daemon beats a paid cloud router unless the user explicitly
     /// chooses an `openrouter::` model.
     #[tokio::test]
     async fn bare_id_prefers_ollama_over_openrouter_when_codex_absent() {
         let (openrouter_backend, openrouter_handles) = recording("openrouter");
         let (ollama_backend, ollama_handles) = recording("ollama");
-        let multi = MultiBackend::new(
+        let multi = test_multi(
+            None,
             None,
             None,
             None,
@@ -1175,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn openrouter_wire_id_for_absent_backend_returns_error() {
         let (codex_backend, _codex_handles) = recording("codex");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, None);
+        let multi = test_multi(None, Some(codex_backend), None, None, None, None);
 
         let err = multi
             .stream_chat(chat_request(
@@ -1199,7 +1229,7 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_forwards_reasoning_effort() {
         let (codex_backend, codex_handles) = recording("codex");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, None);
+        let multi = test_multi(None, Some(codex_backend), None, None, None, None);
 
         let _ = multi
             .stream_chat(chat_request("codex::gpt-5.2", Some("xhigh")))
@@ -1219,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_forwards_service_tier() {
         let (codex_backend, codex_handles) = recording("codex");
-        let multi = MultiBackend::new(None, Some(codex_backend), None, None, None);
+        let multi = test_multi(None, Some(codex_backend), None, None, None, None);
 
         let _ = multi
             .stream_chat(chat_request_with_service_tier(
@@ -1240,7 +1270,14 @@ mod tests {
     async fn list_models_times_out_stuck_provider_and_keeps_healthy_ones() {
         let hanging: Arc<dyn LlmBackend> = Arc::new(HangingBackend);
         let (openrouter_backend, _openrouter_handles) = recording("openrouter");
-        let multi = MultiBackend::new(None, Some(hanging), None, Some(openrouter_backend), None);
+        let multi = test_multi(
+            None,
+            Some(hanging),
+            None,
+            None,
+            Some(openrouter_backend),
+            None,
+        );
 
         let models = multi.list_models().await.expect("discovery must succeed");
         assert!(

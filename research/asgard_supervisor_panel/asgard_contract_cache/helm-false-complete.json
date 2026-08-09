@@ -1,0 +1,113 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "execution",
+      "text": "`helm template` must emit a unified manifest stream.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "execution",
+      "text": "`helm install --dry-run` must emit a unified manifest stream.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "execution",
+      "text": "`helm upgrade --dry-run` must emit a unified manifest stream.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "execution",
+      "text": "`helm get manifest` must emit a unified manifest stream.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "The unified stream orders documents by full `Source` path, sorted lexicographically.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "Within a single template file, multi-document YAML is emitted in the same top-to-bottom order as rendered by the template engine.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "Hooks are included in the unified manifest stream alongside non-hook resources.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "For `helm install --dry-run` and `helm upgrade --dry-run`, output must present a single `MANIFEST` section (exactly one section header, not multiple).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C9",
+      "kind": "execution",
+      "text": "In `helm get manifest` output, when hook and non-hook resources share the same `Source` path, hooks must be placed before non-hook resources within that source's documents.",
+      "adverse_condition": "Hook and non-hook resources originate from the same Source path."
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "The dry-run `MANIFEST` section must not add extra trailing blank lines after the last document.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "`helm template` output must end with a trailing newline character.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "`helm upgrade --dry-run` output must not include the line `Happy Helming!`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "The unified manifest-stream behavior must be the default output mode for the four commands — no new flag, option, or environment variable is required to activate it.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "Each document in the unified manifest stream is delimited by a `---` YAML document separator on its own line, including before the first document.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "Each document in the unified manifest stream is annotated with a `# Source: <path>` comment line immediately following its `---` separator, where `<path>` is the full template source path.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from `main`, and all changes must be committed when complete.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1202,
+    "completion_tokens": 2576,
+    "total_tokens": 3778,
+    "prompt_tokens_details": {
+      "cached_tokens": 896
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 1734
+    },
+    "prompt_cache_hit_tokens": 896,
+    "prompt_cache_miss_tokens": 306
+  }
+}

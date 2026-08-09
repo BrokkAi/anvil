@@ -3,7 +3,7 @@ pub(crate) mod announce;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     Diff, PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
@@ -19,13 +19,19 @@ use tokio_util::sync::CancellationToken;
 use crate::llm_client::{
     ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
     StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
-    is_retryable_llm_error, llm_retry_tier, messages_include_images,
-    rewrite_image_prompt_provider_error, stream_chat_no_visible_output_with_retry,
+    is_output_budget_exhausted_error, is_retryable_llm_error, llm_retry_tier,
+    messages_include_images, rewrite_image_prompt_provider_error,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
+use crate::runtime::{
+    EventSink, PermissionBroker, PermissionDecision, PermissionOption as RuntimePermissionOption,
+    PermissionOptionKind as RuntimePermissionOptionKind, PermissionPrompt, RuntimeEvent,
+    ToolCallPhase,
+};
+
 use crate::semantic_rerank;
 use crate::session::{
-    PermissionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
+    PermissionMode, SessionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
     ToolExchangeStatus, TurnReplayEvent,
 };
 use crate::structured_output::StructuredOutputRequest;
@@ -33,15 +39,40 @@ use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::tools::sandbox::SandboxPolicy;
-use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots};
+use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots, tool_result_failed};
 use crate::trace_logging::append_trace_record;
 use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+/// Injected as a plain user message one turn before a trajectory-window run's
+/// step budget is exhausted -- see `trajectory_window_budget_notice`.
+pub(crate) const TRAJECTORY_WINDOW_PENULTIMATE_NOTICE: &str = "Budget notice: this step and \
+    one more remain. This is your last step that may call tools - your final step must be your \
+    report.";
+/// Injected on a trajectory-window run's last turn -- see
+/// `trajectory_window_budget_notice`.
+pub(crate) const TRAJECTORY_WINDOW_FINAL_NOTICE: &str = "Budget notice: this is your final \
+    step. Hand off now: report exact state - what is done, what you verified with real command \
+    output, what remains, and precisely where you stopped. Unfinished is normal and expected; \
+    the supervisor can continue this trajectory from its checkpoint, and only your report tells \
+    it where to resume. Do not call tools; results from this step would never be seen.";
+/// Injected after a response that spent its entire output allowance on
+/// thinking without emitting a tool call -- see
+/// [`should_recover_output_budget`].
+pub(crate) const OUTPUT_BUDGET_RECOVERY_NOTICE: &str = "Your previous response reached the \
+    output token limit before it produced a tool call, so it was discarded and you are seeing \
+    none of its work. Respond more concisely and end this response with a tool call. If you \
+    need to think further, do so briefly, and take the next concrete step rather than planning \
+    the whole remaining task in one response.";
+/// How many consecutive output-budget recoveries a turn will attempt before
+/// giving up and failing. A model in a deliberation spiral usually breaks out
+/// after one nudge; an unbounded retry would instead spend the whole turn
+/// budget on responses that are never seen.
+const MAX_OUTPUT_BUDGET_RECOVERIES: usize = 3;
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
-const MAX_PARALLEL_READ_ONLY_SUBAGENTS: usize = 6;
+const MAX_PARALLEL_SAFE_TOOL_CALLS: usize = 6;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TaskPermissionMode {
@@ -309,14 +340,6 @@ fn record_tool_result(
     tool_exchanges.push(exchange);
 }
 
-fn tool_exchange_diff_from_acp(diff: &Diff) -> ToolExchangeDiff {
-    ToolExchangeDiff {
-        path: diff.path.clone(),
-        old_text: diff.old_text.clone(),
-        new_text: diff.new_text.clone(),
-    }
-}
-
 #[derive(Clone, Copy)]
 struct ToolCatalogRestrictions<'a> {
     depth: usize,
@@ -492,6 +515,9 @@ pub(crate) enum LoopStop {
     /// The loop used its entire `max_turns` budget without the model ending the
     /// turn -- the dominant "it just stopped" case for agentic work.
     MaxTurns { max_turns: usize },
+    /// A trajectory-window wall-clock lease expired. The loop gives the model
+    /// one final tool-free handoff turn after any in-flight tool batch returns.
+    TimeLimit,
     /// The session was cancelled (`session/cancel`) mid-turn.
     Cancelled,
     /// The turn ended because the LLM call or loop setup failed. Carries the
@@ -523,6 +549,12 @@ pub(crate) struct LoopOutcome {
     pub replay_events: Vec<TurnReplayEvent>,
     pub usage: TokenUsage,
     pub stop: LoopStop,
+    /// Most recently published task plan. This is model state rather than a
+    /// completion gate; callers retain it across turns and compaction.
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
+    /// Present when this invocation compacted active model history. The
+    /// caller anchors it to the completed raw turn for reload.
+    pub compaction_checkpoint: Option<crate::session::CompactionCheckpoint>,
 }
 
 impl LoopOutcome {
@@ -540,6 +572,8 @@ impl LoopOutcome {
             tool_exchanges: Vec::new(),
             replay_events: Vec::new(),
             usage: TokenUsage::default(),
+            current_plan: None,
+            compaction_checkpoint: None,
         }
     }
 }
@@ -629,7 +663,7 @@ fn permission_options(
     tool_name: &str,
     shell_sandboxed: bool,
     always_allow_label: Option<&str>,
-) -> Vec<PermissionOption> {
+) -> Vec<RuntimePermissionOption> {
     permission_options_for_request(tool_name, shell_sandboxed, false, always_allow_label)
 }
 
@@ -646,51 +680,51 @@ fn permission_options_for_request(
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
     always_allow_label: Option<&str>,
-) -> Vec<PermissionOption> {
+) -> Vec<RuntimePermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
         if shell_sandboxed && sandbox_escalation_requested {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_outside_sandbox"),
-                "Run outside sandbox",
-                PermissionOptionKind::AllowOnce,
-            ));
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("reject"),
-                "No",
-                PermissionOptionKind::RejectOnce,
-            ));
+            options.push(RuntimePermissionOption {
+                id: "allow_outside_sandbox".to_string(),
+                label: "Run outside sandbox".to_string(),
+                kind: RuntimePermissionOptionKind::AllowOnce,
+            });
+            options.push(RuntimePermissionOption {
+                id: "reject".to_string(),
+                label: "No".to_string(),
+                kind: RuntimePermissionOptionKind::RejectOnce,
+            });
             return options;
         }
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow"),
-            "Allow",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(RuntimePermissionOption {
+            id: "allow".to_string(),
+            label: "Allow".to_string(),
+            kind: RuntimePermissionOptionKind::AllowOnce,
+        });
         if let Some(label) = always_allow_label {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_always"),
-                format!("Always allow {label}"),
-                PermissionOptionKind::AllowAlways,
-            ));
+            options.push(RuntimePermissionOption {
+                id: "allow_always".to_string(),
+                label: format!("Always allow {label}"),
+                kind: RuntimePermissionOptionKind::AllowAlways,
+            });
         }
     } else {
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow_always"),
-            format!("Always allow {tool_name}"),
-            PermissionOptionKind::AllowAlways,
-        ));
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow"),
-            "Allow",
-            PermissionOptionKind::AllowOnce,
-        ));
+        options.push(RuntimePermissionOption {
+            id: "allow_always".to_string(),
+            label: format!("Always allow {tool_name}"),
+            kind: RuntimePermissionOptionKind::AllowAlways,
+        });
+        options.push(RuntimePermissionOption {
+            id: "allow".to_string(),
+            label: "Allow".to_string(),
+            kind: RuntimePermissionOptionKind::AllowOnce,
+        });
     }
-    options.push(PermissionOption::new(
-        PermissionOptionId::new("reject"),
-        "Reject",
-        PermissionOptionKind::RejectOnce,
-    ));
+    options.push(RuntimePermissionOption {
+        id: "reject".to_string(),
+        label: "Reject".to_string(),
+        kind: RuntimePermissionOptionKind::RejectOnce,
+    });
     options
 }
 
@@ -707,10 +741,7 @@ fn permission_grant_for_selection(
         sandbox_escalation_requested,
         always_allow_label,
     );
-    if !valid_options
-        .iter()
-        .any(|option| option.option_id.0.as_ref() == option_id)
-    {
+    if !valid_options.iter().any(|option| option.id == option_id) {
         tracing::warn!(
             "request_permission returned unknown option id '{option_id}'; treating as reject"
         );
@@ -823,6 +854,68 @@ impl<'a> SpawnedCx<'a> {
     }
 }
 
+impl PermissionBroker for SpawnedCx<'_> {
+    fn request_permission(
+        &self,
+        prompt: PermissionPrompt,
+    ) -> futures::future::BoxFuture<'_, Result<PermissionDecision, String>> {
+        Box::pin(async move {
+            let PermissionPrompt {
+                session_id,
+                tool_name,
+                tool_call_id,
+                raw_input,
+                permission_notice,
+                options,
+                ..
+            } = prompt;
+
+            let title = announce::permission_prompt_title(&tool_name, &raw_input);
+            let fields = ToolCallUpdateFields::new()
+                .kind(ToolRegistry::tool_kind(&tool_name))
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(announce::permission_request_content(
+                    &tool_name,
+                    &raw_input,
+                    permission_notice.as_deref(),
+                ))
+                .raw_input(raw_input);
+            let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
+            let options = options
+                .into_iter()
+                .map(|option| {
+                    let kind = match option.kind {
+                        RuntimePermissionOptionKind::AllowOnce => PermissionOptionKind::AllowOnce,
+                        RuntimePermissionOptionKind::AllowAlways => {
+                            PermissionOptionKind::AllowAlways
+                        }
+                        RuntimePermissionOptionKind::RejectOnce => PermissionOptionKind::RejectOnce,
+                    };
+                    PermissionOption::new(PermissionOptionId::new(option.id), option.label, kind)
+                })
+                .collect();
+            let request = RequestPermissionRequest::new(session_id, tool_call, options);
+            emit_terminal_notification(TerminalNotificationEvent::Prompt);
+
+            // ACP's blocking request must remain alive until the client answers,
+            // including when prompt cancellation is in progress. Dropping it
+            // early leaves the client's required response without a receiver.
+            let response = self.cx().send_request(request).block_task().await;
+            match response {
+                Ok(resp) => match resp.outcome {
+                    RequestPermissionOutcome::Selected(selected) => Ok(
+                        PermissionDecision::Selected(selected.option_id.0.to_string()),
+                    ),
+                    RequestPermissionOutcome::Cancelled => Ok(PermissionDecision::Cancelled),
+                    _ => Ok(PermissionDecision::Unsupported),
+                },
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    }
+}
+
 /// Result of the non-prompting portion of the gate. Pure (no I/O) so the
 /// state-machine matrix can be unit-tested without a live ACP `cx` or store.
 #[derive(Debug, PartialEq, Eq)]
@@ -883,6 +976,12 @@ enum PermissionScopeClassifierOutcome {
         usage: TokenUsage,
     },
     Unavailable(String),
+}
+
+struct PermissionScopeClassifierResult {
+    outcome: PermissionScopeClassifierOutcome,
+    attempts: u64,
+    usage: TokenUsage,
 }
 
 /// Pure permission-gate logic. Given the snapshot of mode + kind + name +
@@ -1736,9 +1835,9 @@ fn resolve_execution_policy(
 /// the session's `PermissionMode` and the tool's `ToolKind`, a call is auto-allowed,
 /// auto-rejected, or escalated to the client via `session/request_permission`.
 ///
-/// SAFETY: this function calls `SentRequest::block_task().await`, which is only
-/// safe inside `ConnectionTo::spawn`. The `SpawnedCx<'_>` parameter encodes
-/// that requirement -- callers must construct it inside a spawned task.
+/// Interactive permission decisions are delegated to `permission_broker`.
+/// ACP callers construct their broker inside `ConnectionTo::spawn`; other
+/// transports can provide their own implementation without an ACP connection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     llm: &Arc<dyn LlmBackend>,
@@ -1753,7 +1852,8 @@ pub(crate) async fn run(
     cancel: CancellationToken,
     on_text: TextSink,
     on_thought: TextSink,
-    spawned_cx: SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
+    permission_broker: &dyn PermissionBroker,
     session_id: String,
     sessions: SessionStore,
     original_user_request: String,
@@ -1761,8 +1861,16 @@ pub(crate) async fn run(
     depth: usize,
     tool_allowlist: Option<Arc<HashSet<String>>>,
     permission_override: Option<PermissionMode>,
+    trajectory_window: bool,
+    trajectory_window_lease: Option<Duration>,
+    turn_progress: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    context_length: Option<u32>,
+    context_prefix_len: usize,
+    initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
+    let mut current_plan = initial_plan;
+    let mut history_compacted = false;
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
         Err(error) => {
@@ -1826,6 +1934,13 @@ pub(crate) async fn run(
         registry.set_builtin_tools(builtin_tools).await;
     }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
+    if sessions
+        .snapshot(&session_id, registry.cwd())
+        .await
+        .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan)
+    {
+        tools.retain(|tool| tool.function.name != "update_plan");
+    }
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
     // catalog at deeper levels prevents an unbounded recursion of
@@ -1859,6 +1974,11 @@ pub(crate) async fn run(
     let mut clean_exit: Option<LoopStop> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
+    // Consecutive output-budget recoveries. Reset by any usable response, so
+    // the cap bounds a spiral rather than the whole turn.
+    let mut output_budget_recovery_count = 0usize;
+    let loop_started = Instant::now();
+    let mut time_limit_final_turn_used = false;
     if let Some(config) = p2t_config.as_ref() {
         p2t::append_prefix_messages(&mut messages, &prefix_steps);
         match p2t::reset_window_session_if_stale(
@@ -1924,6 +2044,9 @@ pub(crate) async fn run(
         p2t_stop_reason = Some(P2tStopReason::WindowEnd);
     }
     'outer: for turn in 0..turn_limit {
+        if let Some(turn_progress) = &turn_progress {
+            turn_progress.store(turn.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         if p2t_stop_reason.is_some() {
             if let Some(config) = p2t_config.as_ref() {
                 p2t::append_debug_trace(
@@ -1952,6 +2075,13 @@ pub(crate) async fn run(
             clean_exit = Some(LoopStop::Cancelled);
             break;
         }
+        let time_limit_final_turn = trajectory_window_time_limit_notice(
+            trajectory_window,
+            p2t_config.is_some(),
+            time_limit_final_turn_used,
+            loop_started.elapsed(),
+            trajectory_window_lease,
+        );
         if let Some((config, forced_step)) = p2t_config
             .as_ref()
             .and_then(|config| config.forced_first_step.as_ref().map(|step| (config, step)))
@@ -1983,10 +2113,12 @@ pub(crate) async fn run(
                 &mut tool_exchanges,
                 &mut replay_events,
                 &mut turn_usage,
+                &mut current_plan,
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                &spawned_cx,
+                event_sink,
+                permission_broker,
                 &session_id,
                 &sessions,
                 notifications,
@@ -2032,6 +2164,43 @@ pub(crate) async fn run(
                 break;
             }
             continue;
+        }
+        if !trajectory_window
+            && p2t_config.is_none()
+            && context_prefix_len <= messages.len()
+            && crate::tokens::approximate_tokens_messages(&messages)
+                > crate::context_manager::context_budget(context_length)
+        {
+            match crate::context_manager::compact_history(
+                llm.as_ref(),
+                model,
+                &messages,
+                context_prefix_len,
+                Some(&tools),
+                current_plan.as_ref(),
+                reasoning_effort.map(str::to_string),
+                context_length,
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await
+            {
+                Ok(compaction) => {
+                    tracing::info!(
+                        session_id,
+                        before_tokens = compaction.before_tokens,
+                        after_tokens = compaction.after_tokens,
+                        "compacted active model history"
+                    );
+                    turn_usage.add(compaction.usage);
+                    messages.truncate(context_prefix_len);
+                    messages.extend(compaction.checkpoint_messages);
+                    history_compacted = true;
+                }
+                Err(error) => {
+                    tracing::warn!(session_id, "active history compaction failed: {error:#}");
+                }
+            }
         }
         let permission_mode =
             effective_permission_mode(&sessions, &session_id, permission_override)
@@ -2083,14 +2252,31 @@ pub(crate) async fn run(
             }
         }
 
+        // Trajectory-window runs can't rely on `force_text_response` below
+        // (withholding tools would perturb the cached prefix), so a step
+        // budget running out is instead flagged in-band as a harness user
+        // message, one turn ahead of the deadline and again on it.
+        if time_limit_final_turn {
+            messages.push(ChatMessage::user(TRAJECTORY_WINDOW_FINAL_NOTICE));
+            time_limit_final_turn_used = true;
+        } else if let Some(notice) = trajectory_window_budget_notice(
+            trajectory_window,
+            p2t_config.is_some(),
+            turn,
+            max_turns,
+        ) {
+            messages.push(ChatMessage::user(notice));
+        }
+
         // For the last turn, normally force a text response. If no file
         // change has succeeded yet, keep tools available so a hard task does
         // not end with a false "I cannot edit" answer solely because the
         // harness withheld edit/write tools on the final turn.
-        let force_text_response = p2t_config.is_none()
+        let force_text_response = !trajectory_window
+            && p2t_config.is_none()
             && turn >= max_turns - 1
             && has_successful_file_change(&tool_exchanges);
-        let turn_tools = if !force_text_response && !tools.is_empty() {
+        let turn_tools = if !time_limit_final_turn && !force_text_response && !tools.is_empty() {
             Some(tools.clone())
         } else {
             None
@@ -2150,6 +2336,9 @@ pub(crate) async fn run(
                 reasoning_content,
                 usage,
             }) => {
+                // A usable response ends any spiral, so the recovery budget
+                // bounds consecutive failures rather than the whole turn.
+                output_budget_recovery_count = 0;
                 trace_llm_text_response(turn, &text, usage);
                 let assistant_message =
                     ChatMessage::assistant_with_reasoning(text.clone(), reasoning_content);
@@ -2280,14 +2469,19 @@ pub(crate) async fn run(
                 }
                 full_response.push_str(&text);
                 if !text.is_empty() && !replay_events.is_empty() {
-                    replay_events.push(TurnReplayEvent::AssistantText { text });
+                    replay_events.push(TurnReplayEvent::AssistantText { text: text.clone() });
                 }
+                messages.push(assistant_message);
                 // Final text response -- we're done. `had_text` reflects the
                 // whole turn's visible output, not just this message, so a turn
                 // that streamed text before an earlier tool call isn't reported
                 // as a silent "empty completion".
-                clean_exit = Some(LoopStop::Completed {
-                    had_text: !full_response.trim().is_empty(),
+                clean_exit = Some(if time_limit_final_turn {
+                    LoopStop::TimeLimit
+                } else {
+                    LoopStop::Completed {
+                        had_text: !full_response.trim().is_empty(),
+                    }
                 });
                 break;
             }
@@ -2297,6 +2491,7 @@ pub(crate) async fn run(
                 calls,
                 usage,
             }) => {
+                output_budget_recovery_count = 0;
                 let calls = normalize_llm_tool_calls(calls);
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 if let Some(config) = p2t_config.as_ref() {
@@ -2350,10 +2545,12 @@ pub(crate) async fn run(
                     &mut tool_exchanges,
                     &mut replay_events,
                     &mut turn_usage,
+                    &mut current_plan,
                     max_turns,
                     idle_timeout,
                     cancel.clone(),
-                    &spawned_cx,
+                    event_sink,
+                    permission_broker,
                     &session_id,
                     &sessions,
                     notifications,
@@ -2486,6 +2683,38 @@ pub(crate) async fn run(
                     clean_exit = Some(LoopStop::Cancelled);
                     break;
                 }
+                // The model spent its whole output allowance on thinking and
+                // never reached a tool call, so the response was discarded.
+                // That is a deliberation spiral, not an outage: the request
+                // was well-formed and the provider was healthy, and a plain
+                // retry would reproduce it exactly (which is why the backends
+                // classify it non-retryable). Tell the model its work was
+                // thrown away and ask for a terser step, then spend another
+                // turn -- the same recovery mini-swe-agent performs on
+                // `finish_reason == "length"`. Bounded, so a model that never
+                // converges fails the turn instead of burning every turn on
+                // responses no one ever sees.
+                if should_recover_output_budget(&e, output_budget_recovery_count) {
+                    output_budget_recovery_count += 1;
+                    append_trace_record(serde_json::json!({
+                        "type": "output_budget_recovery",
+                        "turn": turn,
+                        "recovery_count": output_budget_recovery_count,
+                        "max_recoveries": MAX_OUTPUT_BUDGET_RECOVERIES,
+                    }));
+                    if let Some(config) = p2t_config.as_ref() {
+                        p2t::append_debug_trace(
+                            &config.step_trace_out,
+                            "output_budget_recovery",
+                            serde_json::json!({
+                                "turn": turn,
+                                "recovery_count": output_budget_recovery_count,
+                            }),
+                        );
+                    }
+                    messages.push(ChatMessage::user(OUTPUT_BUDGET_RECOVERY_NOTICE));
+                    continue;
+                }
                 trace_llm_error(turn, &e);
                 if let Some(config) = p2t_config.as_ref() {
                     p2t::append_debug_trace(
@@ -2529,6 +2758,9 @@ pub(crate) async fn run(
             p2t_steps_executed,
         );
     }
+    if time_limit_final_turn_used && clean_exit.is_none() && llm_failure.is_none() {
+        clean_exit = Some(LoopStop::TimeLimit);
+    }
     if let Some(config) = p2t_config.as_ref() {
         p2t::append_debug_trace(
             &config.step_trace_out,
@@ -2557,7 +2789,8 @@ pub(crate) async fn run(
     //   (`Live`) turns do this; planning and subagent runs are `Silent` and must
     //   not splice the notice into the plan/`task` result, so they suppress it.
     let resolve_max_turns = !train_bifrost && p2t_config.is_none();
-    let surface_notice = resolve_max_turns && matches!(notifications, NotificationMode::Live);
+    let surface_notice =
+        resolve_max_turns && !trajectory_window && matches!(notifications, NotificationMode::Live);
     let stop = resolve_loop_stop(
         llm_failure,
         clean_exit,
@@ -2595,12 +2828,18 @@ pub(crate) async fn run(
         full_response.push_str(&notice);
     }
 
+    let compaction_checkpoint = history_compacted.then(|| crate::session::CompactionCheckpoint {
+        messages: messages[context_prefix_len.min(messages.len())..].to_vec(),
+        current_plan: current_plan.clone(),
+    });
     LoopOutcome {
         response: full_response,
         tool_exchanges,
         replay_events,
         usage: turn_usage,
         stop,
+        current_plan,
+        compaction_checkpoint,
     }
 }
 
@@ -2710,10 +2949,12 @@ async fn execute_step_tool_calls(
     tool_exchanges: &mut Vec<ToolExchange>,
     replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
+    current_plan: &mut Option<crate::plan::UpdatePlanArgs>,
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -2721,7 +2962,7 @@ async fn execute_step_tool_calls(
     permission_override: Option<PermissionMode>,
 ) -> ExecutedStepOutcome {
     let mut step_results = Vec::new();
-    let ordered_indices = ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name));
+    let ordered_indices = ordered_tool_call_indices(calls, registry);
     let mut ordered_position = 0usize;
 
     while ordered_position < ordered_indices.len() {
@@ -2734,9 +2975,9 @@ async fn execute_step_tool_calls(
             };
         }
 
-        let batch_len = read_only_task_batch_len(calls, &ordered_indices[ordered_position..]);
+        let batch_len = parallel_batch_len(registry, calls, &ordered_indices[ordered_position..]);
         if batch_len > 1 {
-            let outcome = execute_parallel_read_only_task_calls(
+            let outcome = execute_parallel_safe_calls(
                 llm,
                 registry,
                 model,
@@ -2754,7 +2995,8 @@ async fn execute_step_tool_calls(
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
-                spawned_cx,
+                event_sink,
+                permission_broker,
                 session_id,
                 sessions,
                 notifications,
@@ -2795,26 +3037,31 @@ async fn execute_step_tool_calls(
                         "Error: tool arguments are not valid JSON ({e}). \
                      Please retry with a valid JSON object matching the tool schema."
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCall(announce::initial_tool_call(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &Value::String(call.function.arguments.clone()),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Started {
+                                input: Value::String(call.function.arguments.clone()),
+                            },
+                        },
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCallUpdate(announce::update_failed(
-                            &call.id,
-                            &reason,
-                            Some(Value::String(reason.clone())),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Failed {
+                                reason: reason.clone(),
+                                permission_notice: None,
+                                input: None,
+                            },
+                        },
                     );
                     messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
                     step_results.push(p2t::PrefixToolResult {
@@ -2857,26 +3104,31 @@ async fn execute_step_tool_calls(
                     .count(),
                 "rejecting tool call: rendered permission card would hide input",
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
-                    &call.id,
-                    &tool_name,
-                    kind,
-                    &parsed_input,
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::StartedOversized {
+                        input: parsed_input.clone(),
+                    },
+                },
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &reason,
-                    Some(Value::String(reason.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: reason.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
             step_results.push(p2t::PrefixToolResult {
@@ -2919,19 +3171,18 @@ async fn execute_step_tool_calls(
                     "denied outside-sandbox escalation request (preflight)"
                 );
             }
-            let (blocked_call, failed_update) =
-                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(blocked_call),
-            );
-            maybe_send_session_update(
-                notifications,
-                spawned_cx.cx(),
-                session_id,
-                SessionUpdate::ToolCallUpdate(failed_update),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Blocked {
+                        input: parsed_input.clone(),
+                        reason: message.clone(),
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
             step_results.push(p2t::PrefixToolResult {
@@ -2954,29 +3205,34 @@ async fn execute_step_tool_calls(
             continue;
         }
 
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCall(announce::initial_tool_call(
-                &call.id,
-                &tool_name,
-                kind,
-                &parsed_input,
-            )),
+            RuntimeEvent::ToolCall {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                phase: ToolCallPhase::Started {
+                    input: parsed_input.clone(),
+                },
+            },
         );
 
         if !advertised_this_request.contains(tool_name.as_str()) {
             let message = tool_unavailable_message(&tool_name);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &message,
-                    Some(Value::String(message.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: message.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
             step_results.push(p2t::PrefixToolResult {
@@ -3001,7 +3257,7 @@ async fn execute_step_tool_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3037,16 +3293,19 @@ async fn execute_step_tool_calls(
                         "denied outside-sandbox escalation request"
                     );
                 }
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
-                        &call.id,
-                        &message,
-                        permission_notice.as_deref(),
-                        Some(Value::String(message.clone())),
-                    )),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::Failed {
+                            reason: message.clone(),
+                            permission_notice: permission_notice.clone(),
+                            input: None,
+                        },
+                    },
                 );
                 (message, ToolExchangeStatus::Failed, None, permission_notice)
             }
@@ -3056,15 +3315,19 @@ async fn execute_step_tool_calls(
                 shell_sandboxed,
                 permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::InProgress,
+                    },
                 );
 
                 let pre_write: Option<Option<String>> =
-                    if matches!(tool_name.as_str(), "write_file" | "edit") {
+                    if matches!(tool_name.as_str(), "write_file" | "edit" | "delete_file") {
                         capture_pre_write_text(
                             registry.cwd(),
                             registry.additional_roots(),
@@ -3134,7 +3397,8 @@ async fn execute_step_tool_calls(
                             max_turns,
                             idle_timeout,
                             cancel.clone(),
-                            spawned_cx,
+                            event_sink,
+                            permission_broker,
                             session_id,
                             sessions,
                             depth + 1,
@@ -3143,6 +3407,39 @@ async fn execute_step_tool_calls(
                         .await;
                         turn_usage.add(nested_usage);
                         exec
+                    } else if tool_name == "update_plan" {
+                        match serde_json::from_value::<crate::plan::UpdatePlanArgs>(
+                            parsed_input.clone(),
+                        ) {
+                            Err(error) => ToolExecution {
+                                output: format!("Invalid update_plan arguments: {error}"),
+                                failed: true,
+                            },
+                            Ok(_plan)
+                                if sessions
+                                    .snapshot(session_id, registry.cwd())
+                                    .await
+                                    .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
+                            {
+                                ToolExecution {
+                                    output: "update_plan is unavailable in Plan mode.".to_string(),
+                                    failed: true,
+                                }
+                            }
+                            Ok(plan) => {
+                                maybe_emit_runtime_event(
+                                    notifications,
+                                    event_sink,
+                                    session_id,
+                                    RuntimeEvent::Plan(plan.clone()),
+                                );
+                                *current_plan = Some(plan);
+                                ToolExecution {
+                                    output: "Plan updated".to_string(),
+                                    failed: false,
+                                }
+                            }
+                        }
                     } else if tool_name == "semantic_search"
                         && registry.is_bifrost_tool("semantic_search")
                     {
@@ -3185,42 +3482,40 @@ async fn execute_step_tool_calls(
                     exec
                 };
 
-                let (update, status, replay_diff) = if exec.failed {
+                let (phase, status, replay_diff) = if exec.failed {
                     let clean = strip_sandbox_escalation_hint(&exec.output);
                     (
-                        announce::update_failed_with_input(
-                            &call.id,
-                            &tool_name,
-                            &parsed_input,
-                            clean,
-                            permission_notice.as_deref(),
-                            Some(Value::String(clean.to_string())),
-                        ),
+                        ToolCallPhase::Failed {
+                            reason: clean.to_string(),
+                            permission_notice: permission_notice.clone(),
+                            input: Some(parsed_input.clone()),
+                        },
                         ToolExchangeStatus::Failed,
                         None,
                     )
                 } else {
                     let diff = pre_write
                         .and_then(|prior| build_editing_diff(&tool_name, &parsed_input, prior));
-                    let replay_diff = diff.as_ref().map(tool_exchange_diff_from_acp);
                     (
-                        announce::update_completed(
-                            &call.id,
-                            &tool_name,
-                            &parsed_input,
-                            &exec.output,
-                            diff,
-                            permission_notice.as_deref(),
-                        ),
+                        ToolCallPhase::Completed {
+                            input: parsed_input.clone(),
+                            output: exec.output.clone(),
+                            diff: diff.clone(),
+                            permission_notice: permission_notice.clone(),
+                        },
                         ToolExchangeStatus::Completed,
-                        replay_diff,
+                        diff,
                     )
                 };
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(update),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase,
+                    },
                 );
                 (exec.output, status, replay_diff, permission_notice)
             }
@@ -3256,16 +3551,19 @@ async fn execute_step_tool_calls(
     }
 }
 
-struct ParallelTaskReady {
+struct ParallelJobReady {
     call_id: String,
     tool_name: String,
     parsed_input: Value,
     normalized_arguments: String,
+    sandbox_policy_override: Option<SandboxPolicy>,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
     permission_notice: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_parallel_read_only_task_calls(
+async fn execute_parallel_safe_calls(
     llm: &Arc<dyn LlmBackend>,
     registry: &ToolRegistry,
     model: &str,
@@ -3283,7 +3581,8 @@ async fn execute_parallel_read_only_task_calls(
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
@@ -3307,7 +3606,7 @@ async fn execute_parallel_read_only_task_calls(
                             session_id,
                             tool_call_id = %call.id,
                             tool_name = %tool_name,
-                            "repaired malformed tool-call arguments at parallel subagent dispatch"
+                            "repaired malformed tool-call arguments at parallel safe-tool dispatch"
                         );
                     }
                     normalized
@@ -3317,26 +3616,31 @@ async fn execute_parallel_read_only_task_calls(
                         "Error: tool arguments are not valid JSON ({e}). \
                      Please retry with a valid JSON object matching the tool schema."
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCall(announce::initial_tool_call(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &Value::String(call.function.arguments.clone()),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Started {
+                                input: Value::String(call.function.arguments.clone()),
+                            },
+                        },
                     );
-                    maybe_send_session_update(
+                    maybe_emit_runtime_event(
                         notifications,
-                        spawned_cx.cx(),
+                        event_sink,
                         session_id,
-                        SessionUpdate::ToolCallUpdate(announce::update_failed(
-                            &call.id,
-                            &reason,
-                            Some(Value::String(reason.clone())),
-                        )),
+                        RuntimeEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            phase: ToolCallPhase::Failed {
+                                reason: reason.clone(),
+                                permission_notice: None,
+                                input: None,
+                            },
+                        },
                     );
                     records.push(Some(ToolCallRecord {
                         call_id: call.id.clone(),
@@ -3362,28 +3666,33 @@ async fn execute_parallel_read_only_task_calls(
                 title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
                     .chars()
                     .count(),
-                "rejecting parallel subagent call: rendered permission card would hide input",
+                "rejecting parallel safe-tool call: rendered permission card would hide input",
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
-                    &call.id,
-                    &tool_name,
-                    kind,
-                    &parsed_input,
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::StartedOversized {
+                        input: parsed_input.clone(),
+                    },
+                },
             );
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &reason,
-                    Some(Value::String(reason.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: reason.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3408,19 +3717,18 @@ async fn execute_parallel_read_only_task_calls(
         )
         .await
         {
-            let (blocked_call, failed_update) =
-                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCall(blocked_call),
-            );
-            maybe_send_session_update(
-                notifications,
-                spawned_cx.cx(),
-                session_id,
-                SessionUpdate::ToolCallUpdate(failed_update),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Blocked {
+                        input: parsed_input.clone(),
+                        reason: message.clone(),
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3434,29 +3742,34 @@ async fn execute_parallel_read_only_task_calls(
             continue;
         }
 
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCall(announce::initial_tool_call(
-                &call.id,
-                &tool_name,
-                kind,
-                &parsed_input,
-            )),
+            RuntimeEvent::ToolCall {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                phase: ToolCallPhase::Started {
+                    input: parsed_input.clone(),
+                },
+            },
         );
 
         if !advertised_this_request.contains(tool_name.as_str()) {
             let message = tool_unavailable_message(&tool_name);
-            maybe_send_session_update(
+            maybe_emit_runtime_event(
                 notifications,
-                spawned_cx.cx(),
+                event_sink,
                 session_id,
-                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                    &call.id,
-                    &message,
-                    Some(Value::String(message.clone())),
-                )),
+                RuntimeEvent::ToolCall {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    phase: ToolCallPhase::Failed {
+                        reason: message.clone(),
+                        permission_notice: None,
+                        input: None,
+                    },
+                },
             );
             records.push(Some(ToolCallRecord {
                 call_id: call.id.clone(),
@@ -3472,7 +3785,7 @@ async fn execute_parallel_read_only_task_calls(
 
         let decision = consult_gate(
             sessions,
-            spawned_cx,
+            permission_broker,
             &cancel,
             GateCheck {
                 llm,
@@ -3498,16 +3811,19 @@ async fn execute_parallel_read_only_task_calls(
                 message,
                 permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
-                        &call.id,
-                        &message,
-                        permission_notice.as_deref(),
-                        Some(Value::String(message.clone())),
-                    )),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::Failed {
+                            reason: message.clone(),
+                            permission_notice: permission_notice.clone(),
+                            input: None,
+                        },
+                    },
                 );
                 records.push(Some(ToolCallRecord {
                     call_id: call.id.clone(),
@@ -3520,27 +3836,37 @@ async fn execute_parallel_read_only_task_calls(
                 }));
             }
             GateDecision::Allow {
-                permission_notice, ..
+                sandbox_policy_override,
+                sandbox_mode,
+                shell_sandboxed,
+                permission_notice,
             } => {
-                maybe_send_session_update(
+                maybe_emit_runtime_event(
                     notifications,
-                    spawned_cx.cx(),
+                    event_sink,
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                    RuntimeEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        phase: ToolCallPhase::InProgress,
+                    },
                 );
                 tracing::info!(
-                    "executing read-only subagent {} with args: {} (parallel_batch=true)",
+                    "executing concurrency-safe tool {} with args: {} (parallel_batch=true)",
                     tool_name,
                     normalized_arguments,
                 );
                 records.push(None);
                 ready_jobs.push((
                     slot_index,
-                    ParallelTaskReady {
+                    ParallelJobReady {
                         call_id: call.id.clone(),
                         tool_name,
                         parsed_input,
                         normalized_arguments,
+                        sandbox_policy_override,
+                        sandbox_mode,
+                        shell_sandboxed,
                         permission_notice,
                     },
                 ));
@@ -3548,38 +3874,95 @@ async fn execute_parallel_read_only_task_calls(
         }
     }
 
+    let prior_messages = messages.clone();
+    let prior_tool_exchanges = tool_exchanges.clone();
     let completed = futures::stream::iter(ready_jobs.into_iter().map(|(slot_index, ready)| {
         let cancel = cancel.clone();
+        let prior_messages = prior_messages.clone();
+        let prior_tool_exchanges = prior_tool_exchanges.clone();
         async move {
-            // Mirror the serial `task` dispatch path (see the `tool_name ==
-            // "task"` arm in `execute_step_tool_calls`): PreToolUse plugin
-            // hooks may veto the lane before the subagent runs, and PostToolUse
-            // hooks post-process its result. Skipping them here would let a
-            // batch of >=2 read-only `task` calls bypass a hook that a single
-            // (serially dispatched) `task` call honors.
             let (exec, nested_usage) = if let Some(blocked) =
                 run_pre_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input).await
             {
                 (blocked, TokenUsage::default())
             } else {
-                let (mut exec, nested_usage) = execute_subagent(
-                    llm,
-                    registry,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    structured_output,
-                    &ready.parsed_input,
-                    max_turns,
-                    idle_timeout,
-                    cancel,
-                    spawned_cx,
-                    session_id,
-                    sessions,
-                    depth + 1,
-                    permission_override,
-                )
-                .await;
+                let (mut exec, nested_usage) = if ready.tool_name == "task" {
+                    execute_subagent(
+                        llm,
+                        registry,
+                        model,
+                        reasoning_effort,
+                        service_tier,
+                        structured_output,
+                        &ready.parsed_input,
+                        max_turns,
+                        idle_timeout,
+                        cancel,
+                        event_sink,
+                        permission_broker,
+                        session_id,
+                        sessions,
+                        depth + 1,
+                        permission_override,
+                    )
+                    .await
+                } else if ready.tool_name == "semantic_search"
+                    && registry.is_bifrost_tool("semantic_search")
+                {
+                    let outcome = semantic_rerank::rerank_semantic_search(
+                        llm,
+                        model,
+                        registry,
+                        &prior_messages,
+                        &ready.parsed_input,
+                        idle_timeout,
+                        &cancel,
+                    )
+                    .await;
+                    (
+                        ToolExecution {
+                            output: outcome.output,
+                            failed: outcome.failed,
+                        },
+                        outcome.usage,
+                    )
+                } else {
+                    let permission_mode =
+                        effective_permission_mode(sessions, session_id, permission_override).await;
+                    if permission_mode.is_none() {
+                        tracing::warn!(
+                            session_id,
+                            tool_name = ready.tool_name,
+                            outside_sandbox_once = ready.sandbox_policy_override.is_some(),
+                            "session vanished between gate-accept and parallel exec; falling back to ReadOnly sandbox"
+                        );
+                    }
+                    let (policy, outside_sandbox_once) = resolve_execution_policy(
+                        permission_mode,
+                        ready.sandbox_mode,
+                        ready.sandbox_policy_override,
+                    );
+                    trace_bifrost_context_shadow(
+                        &ready.tool_name,
+                        &ready.parsed_input,
+                        &prior_tool_exchanges,
+                    );
+                    let exec = execute_tool(
+                        registry,
+                        ToolExecRequest {
+                            tool_name: &ready.tool_name,
+                            args: ready.parsed_input.clone(),
+                            policy,
+                            outside_sandbox_once,
+                            sandbox_mode: ready.sandbox_mode,
+                            shell_sandboxed: ready.sandbox_policy_override.is_none()
+                                && ready.shell_sandboxed,
+                            cancel: &cancel,
+                        },
+                    )
+                    .await;
+                    (exec, TokenUsage::default())
+                };
                 run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
                     .await;
                 (exec, nested_usage)
@@ -3587,43 +3970,42 @@ async fn execute_parallel_read_only_task_calls(
             (slot_index, ready, exec, nested_usage)
         }
     }))
-    .buffered(MAX_PARALLEL_READ_ONLY_SUBAGENTS)
+    .buffered(MAX_PARALLEL_SAFE_TOOL_CALLS)
     .collect::<Vec<_>>()
     .await;
 
     for (slot_index, ready, exec, nested_usage) in completed {
         turn_usage.add(nested_usage);
-        let (update, status) = if exec.failed {
+        let (phase, status) = if exec.failed {
             let clean = strip_sandbox_escalation_hint(&exec.output);
             (
-                announce::update_failed_with_input(
-                    &ready.call_id,
-                    &ready.tool_name,
-                    &ready.parsed_input,
-                    clean,
-                    ready.permission_notice.as_deref(),
-                    Some(Value::String(clean.to_string())),
-                ),
+                ToolCallPhase::Failed {
+                    reason: clean.to_string(),
+                    permission_notice: ready.permission_notice.clone(),
+                    input: Some(ready.parsed_input.clone()),
+                },
                 ToolExchangeStatus::Failed,
             )
         } else {
             (
-                announce::update_completed(
-                    &ready.call_id,
-                    &ready.tool_name,
-                    &ready.parsed_input,
-                    &exec.output,
-                    None,
-                    ready.permission_notice.as_deref(),
-                ),
+                ToolCallPhase::Completed {
+                    input: ready.parsed_input.clone(),
+                    output: exec.output.clone(),
+                    diff: None,
+                    permission_notice: ready.permission_notice.clone(),
+                },
                 ToolExchangeStatus::Completed,
             )
         };
-        maybe_send_session_update(
+        maybe_emit_runtime_event(
             notifications,
-            spawned_cx.cx(),
+            event_sink,
             session_id,
-            SessionUpdate::ToolCallUpdate(update),
+            RuntimeEvent::ToolCall {
+                call_id: ready.call_id.clone(),
+                tool_name: ready.tool_name.clone(),
+                phase,
+            },
         );
         records[slot_index] = Some(ToolCallRecord {
             call_id: ready.call_id,
@@ -3652,23 +4034,6 @@ async fn execute_parallel_read_only_task_calls(
         results: step_results,
         cancelled: cancel.is_cancelled(),
     }
-}
-
-fn blocked_tool_call_updates(
-    tool_call_id: &str,
-    tool_name: &str,
-    kind: ToolKind,
-    raw_input: &Value,
-    reason: &str,
-) -> (agent_client_protocol::schema::v1::ToolCall, ToolCallUpdate) {
-    (
-        announce::blocked_tool_call(tool_call_id, tool_name, kind, raw_input, reason),
-        announce::update_failed(
-            tool_call_id,
-            reason,
-            Some(Value::String(reason.to_string())),
-        ),
-    )
 }
 
 struct PureGateEvaluation {
@@ -3828,7 +4193,7 @@ async fn deterministic_gate_rejection(
 /// execute, or `Reject` to feed the LLM a denial message instead.
 async fn consult_gate(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
 ) -> GateOutcome {
@@ -3875,7 +4240,7 @@ async fn consult_gate(
             GateOutcome::without_usage(
                 request_user_permission_or_reject(
                     sessions,
-                    spawned_cx,
+                    permission_broker,
                     cancel,
                     request,
                     evaluation,
@@ -3893,15 +4258,17 @@ async fn classify_gate_or_reject(
     evaluation: PureGateEvaluation,
     cancel: &CancellationToken,
 ) -> GateOutcome {
+    let start = Instant::now();
     let escalation_requested = evaluation.shell_sandbox_escalation_requested;
-    match classify_permission_scope_with_model(
+    let classifier = classify_permission_scope_with_model(
         &request,
         escalation_requested,
         evaluation.shell_sandboxed,
         cancel,
     )
-    .await
-    {
+    .await;
+
+    match classifier.outcome {
         PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
@@ -3916,6 +4283,14 @@ async fn classify_gate_or_reject(
                 let notice = auto_permission_notice(
                     "did not approve this tool call",
                     &classification.rationale,
+                );
+                trace_permission_classifier_decision(
+                    request.tool_name,
+                    "reject",
+                    classifier.attempts,
+                    start.elapsed(),
+                    request.model,
+                    classifier.usage,
                 );
                 return GateOutcome {
                     decision: GateDecision::Reject {
@@ -3939,6 +4314,14 @@ async fn classify_gate_or_reject(
                             classifier_rationale = %classification.rationale,
                             "permission gate: auto-classifier approved only normal sandbox execution; denying escalation without prompting"
                         );
+                        trace_permission_classifier_decision(
+                            request.tool_name,
+                            "reject",
+                            classifier.attempts,
+                            start.elapsed(),
+                            request.model,
+                            classifier.usage,
+                        );
                         return GateOutcome {
                             decision: GateDecision::Reject {
                                 message: format!(
@@ -3958,6 +4341,14 @@ async fn classify_gate_or_reject(
                     if request.tool_name != "run_shell_command" {
                         let rationale =
                             "outside-sandbox execution is only valid for shell commands.";
+                        trace_permission_classifier_decision(
+                            request.tool_name,
+                            "reject",
+                            classifier.attempts,
+                            start.elapsed(),
+                            request.model,
+                            classifier.usage,
+                        );
                         return GateOutcome {
                             decision: GateDecision::Reject {
                                 message: format!(
@@ -3993,6 +4384,14 @@ async fn classify_gate_or_reject(
                     &classification.rationale,
                 ))
             };
+            trace_permission_classifier_decision(
+                request.tool_name,
+                "allow",
+                classifier.attempts,
+                start.elapsed(),
+                request.model,
+                classifier.usage,
+            );
             GateOutcome {
                 decision: GateDecision::Allow {
                     sandbox_policy_override,
@@ -4010,6 +4409,14 @@ async fn classify_gate_or_reject(
                 rationale = %rationale,
                 "permission gate: auto-classifier unavailable; denying without prompting"
             );
+            trace_permission_classifier_decision(
+                request.tool_name,
+                "unavailable",
+                classifier.attempts,
+                start.elapsed(),
+                request.model,
+                classifier.usage,
+            );
             GateOutcome::without_usage(GateDecision::Reject {
                 message: format!(
                     "Tool use denied: auto permissions could not evaluate this tool call ({rationale})."
@@ -4023,9 +4430,47 @@ async fn classify_gate_or_reject(
     }
 }
 
+fn trace_permission_classifier_decision(
+    tool_name: &str,
+    decision: &str,
+    attempts: u64,
+    elapsed: Duration,
+    model: &str,
+    usage: TokenUsage,
+) {
+    append_trace_record(permission_classifier_trace_record(
+        tool_name, decision, attempts, elapsed, model, usage,
+    ));
+}
+
+fn permission_classifier_trace_record(
+    tool_name: &str,
+    decision: &str,
+    attempts: u64,
+    elapsed: Duration,
+    model: &str,
+    usage: TokenUsage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "permission_classifier",
+        "tool": tool_name,
+        "decision": decision,
+        "attempts": attempts,
+        "elapsed_millis": elapsed.as_millis(),
+        "model": model,
+        "usage": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "thought": usage.thought_tokens,
+            "cached_read": usage.cached_read_tokens,
+            "cached_write": usage.cached_write_tokens,
+        },
+    })
+}
+
 async fn request_user_permission_or_reject(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4035,7 +4480,7 @@ async fn request_user_permission_or_reject(
     let rejected_permission_notice = permission_notice.clone();
     match request_user_permission_with_evaluation(
         sessions,
-        spawned_cx,
+        permission_broker,
         cancel,
         request,
         evaluation,
@@ -4093,7 +4538,7 @@ fn sanitize_permission_rationale(rationale: &str) -> String {
 
 async fn request_user_permission_with_evaluation(
     sessions: &SessionStore,
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
@@ -4135,12 +4580,11 @@ async fn request_user_permission_with_evaluation(
         None => None,
     };
     let grant = request_user_permission(
-        spawned_cx,
+        permission_broker,
         cancel,
         PermissionRequest {
             session_id: request.session_id,
             tool_name: request.tool_name,
-            kind: request.kind,
             tool_call_id: request.tool_call_id,
             raw_input: request.raw_input,
             shell_sandboxed: evaluation.shell_sandboxed,
@@ -4193,11 +4637,15 @@ async fn classify_permission_scope_with_model(
     escalation_requested: bool,
     shell_sandboxed: bool,
     cancel: &CancellationToken,
-) -> PermissionScopeClassifierOutcome {
+) -> PermissionScopeClassifierResult {
     if request.original_user_request.trim().is_empty() {
-        return PermissionScopeClassifierOutcome::Unavailable(
-            "the original user request is empty.".to_string(),
-        );
+        return PermissionScopeClassifierResult {
+            outcome: PermissionScopeClassifierOutcome::Unavailable(
+                "the original user request is empty.".to_string(),
+            ),
+            attempts: 0,
+            usage: TokenUsage::default(),
+        };
     }
 
     let classifier_input =
@@ -4239,7 +4687,7 @@ async fn classify_permission_scope_with_model(
         ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
         ChatMessage::user(prompt),
     ];
-    let result = stream_chat_no_visible_output_with_retry(
+    let (result, attempts, trace_usage) = stream_permission_classifier_with_retry(
         request.llm.as_ref(),
         "classifying permission scope",
         cancel,
@@ -4275,9 +4723,13 @@ async fn classify_permission_scope_with_model(
                 tool_name = request.tool_name,
                 "permission auto-classifier failed; denying without prompting: {detail}"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(format!(
-                "the auto-classifier request failed: {detail}"
-            ));
+            return PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(format!(
+                    "the auto-classifier request failed: {detail}"
+                )),
+                attempts,
+                usage: trace_usage,
+            };
         }
     };
     let usage = response.usage();
@@ -4289,15 +4741,24 @@ async fn classify_permission_scope_with_model(
                 tool_name = request.tool_name,
                 "permission auto-classifier returned tool calls; denying without prompting"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(
-                "the auto-classifier returned tool calls instead of a JSON decision.".to_string(),
-            );
+            return PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(
+                    "the auto-classifier returned tool calls instead of a JSON decision."
+                        .to_string(),
+                ),
+                attempts,
+                usage: trace_usage,
+            };
         }
     };
     match parse_permission_scope_classification(&text) {
-        Some(classification) => PermissionScopeClassifierOutcome::Classified {
-            classification,
-            usage,
+        Some(classification) => PermissionScopeClassifierResult {
+            outcome: PermissionScopeClassifierOutcome::Classified {
+                classification,
+                usage,
+            },
+            attempts,
+            usage: trace_usage,
         },
         None => {
             let output = truncate_for_permission_classifier(&text);
@@ -4307,9 +4768,84 @@ async fn classify_permission_scope_with_model(
                 output = %output,
                 "permission auto-classifier returned invalid JSON; denying without prompting"
             );
-            PermissionScopeClassifierOutcome::Unavailable(format!(
-                "the auto-classifier returned invalid JSON: {output}"
-            ))
+            PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Unavailable(format!(
+                    "the auto-classifier returned invalid JSON: {output}"
+                )),
+                attempts,
+                usage: trace_usage,
+            }
+        }
+    }
+}
+
+async fn stream_permission_classifier_with_retry<F>(
+    llm: &dyn LlmBackend,
+    operation: &str,
+    cancel: &CancellationToken,
+    mut build_request: F,
+) -> (anyhow::Result<LlmResponse>, u64, TokenUsage)
+where
+    F: FnMut() -> StreamChatRequest,
+{
+    let mut attempt = 1u64;
+    let mut usage = TokenUsage::default();
+    loop {
+        match llm.stream_chat(build_request()).await {
+            Ok(response)
+                if !cancel.is_cancelled()
+                    && is_degenerate_empty_completion(&response)
+                    && attempt < crate::http_retry::LlmRetryTier::Fast.max_attempts() =>
+            {
+                usage.add(response.usage());
+                tracing::warn!(
+                    attempt,
+                    max_attempts = crate::http_retry::LlmRetryTier::Fast.max_attempts(),
+                    operation,
+                    "retrying empty LLM completion with no visible output"
+                );
+                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                    operation,
+                    crate::http_retry::LlmRetryTier::Fast,
+                    attempt,
+                    EMPTY_COMPLETION_RETRY_REASON.to_string(),
+                    Some(cancel),
+                )
+                .await
+                {
+                    return (Err(error), attempt, usage);
+                }
+                attempt += 1;
+            }
+            Ok(response) => {
+                usage.add(response.usage());
+                return (Ok(response), attempt, usage);
+            }
+            Err(error)
+                if !cancel.is_cancelled()
+                    && llm_retry_tier(&error).is_some_and(|tier| attempt < tier.max_attempts()) =>
+            {
+                let tier = llm_retry_tier(&error).expect("guard checked retry tier");
+                tracing::warn!(
+                    attempt,
+                    max_attempts = tier.max_attempts(),
+                    operation,
+                    "retrying transient LLM stream failure with no visible output"
+                );
+                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                    operation,
+                    tier,
+                    attempt,
+                    format!("{error:#}"),
+                    Some(cancel),
+                )
+                .await
+                {
+                    return (Err(error), attempt, usage);
+                }
+                attempt += 1;
+            }
+            Err(error) => return (Err(error), attempt, usage),
         }
     }
 }
@@ -4456,7 +4992,6 @@ struct GateCheck<'a> {
 struct PermissionRequest<'a> {
     session_id: &'a str,
     tool_name: &'a str,
-    kind: ToolKind,
     tool_call_id: &'a str,
     raw_input: &'a Value,
     shell_sandboxed: bool,
@@ -4468,14 +5003,13 @@ struct PermissionRequest<'a> {
 }
 
 async fn request_user_permission(
-    spawned_cx: &SpawnedCx<'_>,
+    permission_broker: &dyn PermissionBroker,
     _cancel: &CancellationToken,
     request: PermissionRequest<'_>,
 ) -> Result<PermissionGrant, String> {
     let PermissionRequest {
         session_id,
         tool_name,
-        kind,
         tool_call_id,
         raw_input,
         shell_sandboxed,
@@ -4513,55 +5047,37 @@ async fn request_user_permission(
     ) {
         return Err(reason);
     }
-    let fields = ToolCallUpdateFields::new()
-        .kind(kind)
-        .status(ToolCallStatus::Pending)
-        .title(title)
-        .content(announce::permission_request_content(
-            tool_name,
-            raw_input,
-            permission_notice.as_deref(),
-        ))
-        .raw_input(raw_input.clone());
-    let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
-
     let options = permission_options_for_request(
         tool_name,
         shell_sandboxed,
         sandbox_escalation_requested,
         always_allow_label.as_deref(),
     );
+    let decision = permission_broker
+        .request_permission(PermissionPrompt {
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            raw_input: raw_input.clone(),
+            permission_notice: permission_notice.clone(),
+            options,
+        })
+        .await;
 
-    let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
-    emit_terminal_notification(TerminalNotificationEvent::Prompt);
-
-    // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
-    // on `run` above. We deliberately do not race this with the prompt
-    // cancellation token: ACP requires clients to answer pending permission
-    // requests with `RequestPermissionOutcome::Cancelled` when they cancel a
-    // prompt. Dropping this in-flight request first leaves the client's
-    // required response with no receiver, which the ACP transport treats as an
-    // internal connection error.
-    let response = spawned_cx.cx().send_request(request).block_task().await;
-
-    match response {
-        Ok(resp) => match resp.outcome {
-            RequestPermissionOutcome::Selected(selected) => {
-                let id: &str = &selected.option_id.0;
-                permission_grant_for_selection(
-                    tool_name,
-                    id,
-                    shell_sandboxed,
-                    sandbox_escalation_requested,
-                    always_allow_label.as_deref(),
-                )
-            }
-            RequestPermissionOutcome::Cancelled => Err(
-                "Tool use denied: the prompt was cancelled before the user responded.".to_string(),
-            ),
-            // Future-proof: schema is #[non_exhaustive].
-            _ => Err("Tool use denied: unknown permission outcome.".to_string()),
-        },
+    match decision {
+        Ok(PermissionDecision::Selected(id)) => permission_grant_for_selection(
+            tool_name,
+            &id,
+            shell_sandboxed,
+            sandbox_escalation_requested,
+            always_allow_label.as_deref(),
+        ),
+        Ok(PermissionDecision::Cancelled) => {
+            Err("Tool use denied: the prompt was cancelled before the user responded.".to_string())
+        }
+        Ok(PermissionDecision::Unsupported) => {
+            Err("Tool use denied: unknown permission outcome.".to_string())
+        }
         Err(err) => {
             tracing::warn!("request_permission transport error: {err}");
             Err(format!(
@@ -4606,10 +5122,59 @@ fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     })
 }
 
+/// The harness user message to inject before this turn's request, if any,
+/// for a trajectory-window run.
+///
+/// Trajectory-window runs never get the live-run `force_text_response`
+/// treatment (that gate is `!trajectory_window` further down in `run`) --
+/// their tool catalog must stay stable across turns for prefix-cache
+/// affinity, so a withheld tool list is not an option. Instead, the model
+/// is warned in-band: one step before the budget runs out, and again on the
+/// final step, telling it plainly that no further tool results will be
+/// seen and its next text is the only thing that survives.
+///
+/// `turn` and `max_turns` are the loop's own 0-indexed turn counter and its
+/// exclusive upper bound (`turn` ranges over `0..max_turns`): the final turn
+/// is turn number `max_turns` minus one, and the one before it is `max_turns`
+/// minus two. Per spec, a budget too small to have a distinct penultimate
+/// turn (fewer than three turns total) only ever gets the final notice.
+fn trajectory_window_budget_notice(
+    trajectory_window: bool,
+    p2t_config_present: bool,
+    turn: usize,
+    max_turns: usize,
+) -> Option<&'static str> {
+    if !trajectory_window || p2t_config_present {
+        return None;
+    }
+    if max_turns >= 3 && turn == max_turns - 2 {
+        Some(TRAJECTORY_WINDOW_PENULTIMATE_NOTICE)
+    } else if turn == max_turns - 1 {
+        Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+    } else {
+        None
+    }
+}
+
+fn trajectory_window_time_limit_notice(
+    trajectory_window: bool,
+    p2t_config_present: bool,
+    already_used: bool,
+    elapsed: Duration,
+    lease: Option<Duration>,
+) -> bool {
+    trajectory_window
+        && !p2t_config_present
+        && !already_used
+        && lease.is_some_and(|lease| elapsed >= lease)
+}
+
 fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     tool_exchanges.iter().any(|exchange| {
-        matches!(exchange.tool_name.as_str(), "edit" | "write_file")
-            && !tool_result_failed(&exchange.result)
+        matches!(
+            exchange.tool_name.as_str(),
+            "edit" | "write_file" | "delete_file" | "move_file"
+        ) && !tool_result_failed(&exchange.result)
     })
 }
 
@@ -4621,20 +5186,25 @@ fn has_successful_training_file_change(
         if tool_result_failed(&exchange.result) {
             return false;
         }
-        let Some(path) = file_change_target_path(exchange) else {
-            return false;
-        };
-        packet.files.iter().any(|file| file.path == path)
+        file_change_target_paths(exchange)
+            .iter()
+            .any(|path| packet.files.iter().any(|file| file.path == *path))
     })
 }
 
-fn file_change_target_path(exchange: &ToolExchange) -> Option<String> {
-    if !matches!(exchange.tool_name.as_str(), "edit" | "write_file") {
-        return None;
-    }
-    let args = serde_json::from_str::<Value>(&exchange.arguments).ok()?;
-    let path = args.get("file_path")?.as_str()?;
-    normalize_tool_path(path)
+fn file_change_target_paths(exchange: &ToolExchange) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<Value>(&exchange.arguments) else {
+        return Vec::new();
+    };
+    let keys: &[&str] = match exchange.tool_name.as_str() {
+        "edit" | "write_file" | "delete_file" => &["file_path"],
+        "move_file" => &["source_path", "destination_path"],
+        _ => return Vec::new(),
+    };
+    keys.iter()
+        .filter_map(|key| args.get(*key).and_then(Value::as_str))
+        .filter_map(normalize_tool_path)
+        .collect()
 }
 
 fn normalize_tool_path(path: &str) -> Option<String> {
@@ -4649,10 +5219,6 @@ fn normalize_tool_path(path: &str) -> Option<String> {
             .trim_start_matches("./")
             .to_string(),
     )
-}
-
-fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Internal error:")
 }
 
 fn is_bifrost_context_tool(name: &str) -> bool {
@@ -4768,6 +5334,18 @@ async fn build_train_bifrost_nudge(
         idle_timeout,
     )
     .await
+}
+
+/// Whether a failed LLM call should be recovered with a terseness nudge
+/// instead of failing the turn.
+///
+/// True only for output-budget exhaustion -- the model burned its whole
+/// output allowance on thinking and never reached a tool call -- and only
+/// while the consecutive-recovery budget remains. Every other error, including
+/// a retryable outage, is left to the existing failure path: the stream-level
+/// retry has already had its say by the time an error reaches the turn loop.
+fn should_recover_output_budget(error: &anyhow::Error, recoveries_used: usize) -> bool {
+    is_output_budget_exhausted_error(error) && recoveries_used < MAX_OUTPUT_BUDGET_RECOVERIES
 }
 
 fn should_emit_no_edit_progress_nudge(
@@ -4927,28 +5505,78 @@ async fn run_post_tool_use_hooks(
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
+    // Extract the (truncated) shell command before `args` is moved into
+    // execution; cloning the whole args value would deep-copy large
+    // payloads (e.g. write_file content) on every tool call.
+    let shell_command = shell_command_snippet(request.tool_name, &request.args);
+    let args = request.args;
+    let start = Instant::now();
     let result = registry
         .execute_with_sandbox_mode_cancellable(
             request.tool_name,
-            request.args,
+            args,
             request.policy,
             request.outside_sandbox_once,
             request.sandbox_mode,
             Some(request.cancel),
         )
         .await;
+    let duration = start.elapsed();
+    let success = matches!(&result.status, ToolStatus::Success);
+    append_trace_record(tool_timing_record(
+        request.tool_name,
+        shell_command.as_deref(),
+        duration,
+        success,
+    ));
     tool_result_to_execution(
         request.tool_name,
         request.shell_sandboxed,
         request.outside_sandbox_once,
+        // Bifrost tools bound their own responses (`----- OMITTED` elision
+        // the model can follow up on), so the harness cap would only destroy
+        // structure they already budgeted.
+        registry.is_mcp_tool(request.tool_name),
         result,
     )
+}
+
+/// First 120 chars of the `command` argument for `run_shell_command`
+/// calls; `None` for every other tool (the timing record omits the key).
+fn shell_command_snippet(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if tool_name != "run_shell_command" {
+        return None;
+    }
+    args.get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(|command| command.chars().take(120).collect())
+}
+
+fn tool_timing_record(
+    tool_name: &str,
+    shell_command: Option<&str>,
+    duration: Duration,
+    success: bool,
+) -> serde_json::Value {
+    let mut record = serde_json::Map::new();
+    record.insert("type".to_string(), serde_json::json!("tool_timing"));
+    record.insert("tool".to_string(), serde_json::json!(tool_name));
+    if let Some(command) = shell_command {
+        record.insert("command".to_string(), serde_json::json!(command));
+    }
+    record.insert(
+        "duration_ms".to_string(),
+        serde_json::json!(duration.as_millis()),
+    );
+    record.insert("success".to_string(), serde_json::json!(success));
+    serde_json::Value::Object(record)
 }
 
 fn tool_result_to_execution(
     tool_name: &str,
     shell_sandboxed: bool,
     outside_sandbox_once: bool,
+    truncation_exempt: bool,
     result: crate::tools::ToolResult,
 ) -> ToolExecution {
     let (status_prefix, failed) = match result.status {
@@ -4976,15 +5604,13 @@ fn tool_result_to_execution(
     } else {
         0
     };
-    if output.len() > MAX_TOOL_RESULT_BYTES.saturating_sub(reserved) {
-        // Truncate on a UTF-8 char boundary; otherwise an emoji or accented
-        // byte sequence could leave the slice mid-codepoint.
-        let mut cut = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
-        while !output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        output.truncate(cut);
-        output.push_str("\n... output truncated");
+    let budget = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
+    if !truncation_exempt && output.len() > budget {
+        // Keep both ends: the head carries the command and its first errors,
+        // the tail the final status lines the model usually needs.
+        output = crate::text::truncate_middle_utf8(&output, budget, |n| {
+            format!("\n[... {n} bytes elided ...]\n")
+        });
     }
     if sandbox_failure_hint {
         output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
@@ -5075,7 +5701,8 @@ async fn execute_subagent(
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
-    spawned_cx: &SpawnedCx<'_>,
+    event_sink: &dyn EventSink,
+    permission_broker: &dyn PermissionBroker,
     session_id: &str,
     sessions: &SessionStore,
     depth: usize,
@@ -5188,7 +5815,8 @@ async fn execute_subagent(
         cancel,
         noop_text,
         noop_thought,
-        SpawnedCx::new(spawned_cx.cx()),
+        event_sink,
+        permission_broker,
         session_id.to_string(),
         sessions.clone(),
         prompt.to_string(),
@@ -5196,6 +5824,12 @@ async fn execute_subagent(
         depth,
         nested_tool_allowlist,
         child_permission_override,
+        false,
+        None,
+        None,
+        None,
+        usize::MAX,
+        None,
     ))
     .await;
 
@@ -5250,6 +5884,9 @@ fn subagent_failure_message(subagent_name: &str, stop: &LoopStop) -> Option<Stri
             "Error: subagent '{subagent_name}' stopped after reaching its {max_turns}-turn \
              limit without returning a result."
         )),
+        LoopStop::TimeLimit => Some(format!(
+            "Error: subagent '{subagent_name}' stopped after reaching its time limit without returning a result."
+        )),
         LoopStop::Cancelled => Some(format!(
             "Error: subagent '{subagent_name}' was cancelled before returning a result."
         )),
@@ -5262,18 +5899,18 @@ fn subagent_failure_message(subagent_name: &str, stop: &LoopStop) -> Option<Stri
 
 /// Send a `SessionNotification` and log on failure -- there is nothing
 /// useful we can do if the channel to the client is broken.
-/// Emit a `SessionUpdate` notification only when `mode == Live`. Used so
-/// subagent runs (`mode == Silent`) don't push their internal tool-call
-/// progress cards back to the ACP client -- the parent only sees the
-/// subagent's final answer as the `task` tool's result.
-fn maybe_send_session_update(
+/// Emit a runtime event only when `mode == Live`. Used so subagent runs
+/// (`mode == Silent`) don't push their internal tool-call progress back to
+/// the client -- the parent only sees the subagent's final answer as the
+/// `task` tool's result.
+fn maybe_emit_runtime_event(
     mode: NotificationMode,
-    cx: &ConnectionTo<Client>,
+    sink: &dyn EventSink,
     session_id: &str,
-    update: SessionUpdate,
+    event: RuntimeEvent,
 ) {
     if mode == NotificationMode::Live {
-        send_session_update(cx, session_id, update);
+        sink.emit(session_id, event);
     }
 }
 
@@ -5281,6 +5918,95 @@ fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: Sess
     let notification = SessionNotification::new(session_id.to_string(), update);
     if let Err(e) = cx.send_notification(notification) {
         tracing::warn!("failed to send session update: {e}");
+    }
+}
+
+/// Render a transport-neutral runtime event into the ACP `SessionUpdate`
+/// sequence the connected client expects. This is the ACP boundary for
+/// tool-loop progress: the loop emits `RuntimeEvent`s and this adapter
+/// (via `announce`) decides how they appear on the wire.
+fn acp_updates_for_event(event: RuntimeEvent) -> Vec<SessionUpdate> {
+    match event {
+        RuntimeEvent::Plan(plan) => vec![SessionUpdate::Plan(plan.to_acp())],
+        RuntimeEvent::ToolCall {
+            call_id,
+            tool_name,
+            phase,
+        } => {
+            let kind = ToolRegistry::tool_kind(&tool_name);
+            match phase {
+                ToolCallPhase::Started { input } => vec![SessionUpdate::ToolCall(
+                    announce::initial_tool_call(&call_id, &tool_name, kind, &input),
+                )],
+                ToolCallPhase::StartedOversized { input } => vec![SessionUpdate::ToolCall(
+                    announce::rejected_initial_tool_call(&call_id, &tool_name, kind, &input),
+                )],
+                ToolCallPhase::Blocked { input, reason } => vec![
+                    SessionUpdate::ToolCall(announce::blocked_tool_call(
+                        &call_id, &tool_name, kind, &input, &reason,
+                    )),
+                    SessionUpdate::ToolCallUpdate(announce::update_failed(
+                        &call_id,
+                        &reason,
+                        Some(Value::String(reason.clone())),
+                    )),
+                ],
+                ToolCallPhase::InProgress => vec![SessionUpdate::ToolCallUpdate(
+                    announce::update_in_progress(&call_id),
+                )],
+                ToolCallPhase::Failed {
+                    reason,
+                    permission_notice,
+                    input,
+                } => {
+                    let raw_output = Some(Value::String(reason.clone()));
+                    let update = match input {
+                        Some(input) => announce::update_failed_with_input(
+                            &call_id,
+                            &tool_name,
+                            &input,
+                            &reason,
+                            permission_notice.as_deref(),
+                            raw_output,
+                        ),
+                        None => announce::update_failed_with_notice(
+                            &call_id,
+                            &reason,
+                            permission_notice.as_deref(),
+                            raw_output,
+                        ),
+                    };
+                    vec![SessionUpdate::ToolCallUpdate(update)]
+                }
+                ToolCallPhase::Completed {
+                    input,
+                    output,
+                    diff,
+                    permission_notice,
+                } => vec![SessionUpdate::ToolCallUpdate(announce::update_completed(
+                    &call_id,
+                    &tool_name,
+                    &input,
+                    &output,
+                    diff.map(acp_diff_from_exchange_diff),
+                    permission_notice.as_deref(),
+                ))],
+            }
+        }
+    }
+}
+
+fn acp_diff_from_exchange_diff(diff: ToolExchangeDiff) -> Diff {
+    let mut acp = Diff::new(diff.path, diff.new_text);
+    acp.old_text = diff.old_text;
+    acp
+}
+
+impl EventSink for SpawnedCx<'_> {
+    fn emit(&self, session_id: &str, event: RuntimeEvent) {
+        for update in acp_updates_for_event(event) {
+            send_session_update(self.cx(), session_id, update);
+        }
     }
 }
 
@@ -5312,14 +6038,14 @@ fn capture_pre_write_text(
     }
 }
 
-/// Assemble a `Diff` block for a successful write/edit call from the parsed
+/// Assemble a `Diff` block for a successful write/edit/delete call from the parsed
 /// args plus the captured prior content. Returns `None` if we couldn't
 /// pull the path/content (in which case the caller falls back to text).
 fn build_editing_diff(
     tool_name: &str,
     parsed_input: &Value,
     prior: Option<String>,
-) -> Option<Diff> {
+) -> Option<ToolExchangeDiff> {
     let path = parsed_input
         .get("file_path")
         .or_else(|| parsed_input.get("path"))
@@ -5332,58 +6058,98 @@ fn build_editing_diff(
             .to_string(),
         "edit" => {
             let prior_text = prior.as_ref()?;
-            let old = parsed_input.get("old_string").and_then(Value::as_str)?;
-            let new = parsed_input.get("new_string").and_then(Value::as_str)?;
-            let replace_all = parsed_input
+            apply_edit_args_for_diff(prior_text, parsed_input)?
+        }
+        "delete_file" => String::new(),
+        _ => return None,
+    };
+    Some(ToolExchangeDiff {
+        path: PathBuf::from(path),
+        old_text: prior,
+        new_text,
+    })
+}
+
+fn apply_edit_args_for_diff(prior_text: &str, parsed_input: &Value) -> Option<String> {
+    let mut text = prior_text.to_string();
+    if let Some(edits) = parsed_input.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            let old = edit.get("old_string").and_then(Value::as_str)?;
+            let new = edit.get("new_string").and_then(Value::as_str)?;
+            let replace_all = edit
                 .get("replace_all")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if replace_all {
-                prior_text.replace(old, new)
+            text = if replace_all {
+                text.replace(old, new)
             } else {
-                prior_text.replacen(old, new, 1)
-            }
+                text.replacen(old, new, 1)
+            };
         }
-        _ => return None,
-    };
-    let mut diff = Diff::new(PathBuf::from(path), new_text);
-    diff.old_text = prior;
-    Some(diff)
+        return Some(text);
+    }
+
+    let old = parsed_input.get("old_string").and_then(Value::as_str)?;
+    let new = parsed_input.get("new_string").and_then(Value::as_str)?;
+    let replace_all = parsed_input
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(if replace_all {
+        text.replace(old, new)
+    } else {
+        text.replacen(old, new, 1)
+    })
 }
 
-fn ordered_tool_call_indices(
-    calls: &[ToolCall],
-    is_bifrost_tool: impl Fn(&str) -> bool,
-) -> Vec<usize> {
-    let mut builtin_or_other = Vec::new();
-    let mut bifrost = Vec::new();
+/// Run same-turn mutations before reads so read/search calls observe fresh
+/// state consistently, regardless of whether a local or MCP tool handles them.
+fn ordered_tool_call_indices(calls: &[ToolCall], registry: &ToolRegistry) -> Vec<usize> {
+    let mut mutations = Vec::new();
+    let mut reads = Vec::new();
     for (index, call) in calls.iter().enumerate() {
-        if is_bifrost_tool(&call.function.name) {
-            bifrost.push(index);
+        if call_is_batch_safe(call, registry) {
+            reads.push(index);
         } else {
-            builtin_or_other.push(index);
+            mutations.push(index);
         }
     }
-    builtin_or_other.extend(bifrost);
-    builtin_or_other
+    mutations.extend(reads);
+    mutations
 }
 
-fn read_only_task_batch_len(calls: &[ToolCall], ordered_indices: &[usize]) -> usize {
+fn call_is_batch_safe(call: &ToolCall, registry: &ToolRegistry) -> bool {
+    if registry.is_concurrency_safe(&call.function.name) {
+        return true;
+    }
+    if call.function.name != "task" {
+        return false;
+    }
+    let Ok(raw_input) = serde_json::from_str::<Value>(&call.function.arguments) else {
+        return false;
+    };
+    // `task_permission_mode_from_input` already resolves a missing
+    // `permission_mode` field to `TaskPermissionMode::default()` (ReadOnly),
+    // matching how `TaskArgs` resolves it for actual subagent dispatch — a
+    // task call that omits the field really does run read-only, so it's
+    // batch-safe too. Do not require the field to be explicit here.
+    matches!(
+        task_permission_mode_from_input(&raw_input),
+        Ok(TaskPermissionMode::ReadOnly)
+    )
+}
+
+fn parallel_batch_len(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    ordered_indices: &[usize],
+) -> usize {
     ordered_indices
         .iter()
         .copied()
         .take_while(|index| {
             let call = &calls[*index];
-            if call.function.name != "task" {
-                return false;
-            }
-            let Ok(raw_input) = serde_json::from_str::<Value>(&call.function.arguments) else {
-                return false;
-            };
-            matches!(
-                task_permission_mode_from_input(&raw_input),
-                Ok(TaskPermissionMode::ReadOnly)
-            )
+            call_is_batch_safe(call, registry)
         })
         .count()
 }
@@ -5396,6 +6162,78 @@ mod tests {
     };
     use futures::future::{BoxFuture, FutureExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingPermissionBroker {
+        decision: PermissionDecision,
+        prompt: Arc<Mutex<Option<PermissionPrompt>>>,
+    }
+
+    impl PermissionBroker for RecordingPermissionBroker {
+        fn request_permission(
+            &self,
+            prompt: PermissionPrompt,
+        ) -> BoxFuture<'_, Result<PermissionDecision, String>> {
+            *self.prompt.lock().expect("prompt lock") = Some(prompt);
+            futures::future::ready(Ok(self.decision.clone())).boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_uses_transport_independent_broker() {
+        let recorded = Arc::new(Mutex::new(None));
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Selected("allow_outside_sandbox".to_string()),
+            prompt: recorded.clone(),
+        };
+        let raw_input = serde_json::json!({"command": "cargo test"});
+
+        let grant = request_user_permission(
+            &broker,
+            &CancellationToken::new(),
+            PermissionRequest {
+                session_id: "session-1",
+                tool_name: "run_shell_command",
+                tool_call_id: "call-1",
+                raw_input: &raw_input,
+                shell_sandboxed: true,
+                sandbox_escalation_requested: true,
+                always_allow_label: None,
+                permission_notice: Some("Needs network access".to_string()),
+            },
+        )
+        .await
+        .expect("permission should be granted");
+
+        assert_eq!(grant.sandbox_policy_override, Some(SandboxPolicy::None));
+        let prompt = recorded
+            .lock()
+            .expect("prompt lock")
+            .clone()
+            .expect("recorded prompt");
+        assert_eq!(prompt.session_id, "session-1");
+        assert_eq!(prompt.tool_name, "run_shell_command");
+        assert_eq!(prompt.tool_call_id, "call-1");
+        assert_eq!(prompt.raw_input, raw_input);
+        assert_eq!(
+            prompt.permission_notice.as_deref(),
+            Some("Needs network access")
+        );
+        assert_eq!(
+            prompt.options,
+            vec![
+                RuntimePermissionOption {
+                    id: "allow_outside_sandbox".to_string(),
+                    label: "Run outside sandbox".to_string(),
+                    kind: RuntimePermissionOptionKind::AllowOnce,
+                },
+                RuntimePermissionOption {
+                    id: "reject".to_string(),
+                    label: "No".to_string(),
+                    kind: RuntimePermissionOptionKind::RejectOnce,
+                },
+            ]
+        );
+    }
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -5417,6 +6255,108 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn tool_timing_record_includes_shell_command_and_omits_other_commands() {
+        let command = format!("{}{}", "é".repeat(121), "tail");
+        let shell_snippet = shell_command_snippet(
+            "run_shell_command",
+            &serde_json::json!({ "command": command }),
+        );
+        let shell = tool_timing_record(
+            "run_shell_command",
+            shell_snippet.as_deref(),
+            Duration::from_millis(42),
+            true,
+        );
+
+        assert_eq!(shell["type"], "tool_timing");
+        assert_eq!(shell["tool"], "run_shell_command");
+        assert_eq!(shell["duration_ms"], 42);
+        assert_eq!(shell["success"], true);
+        assert_eq!(shell["command"].as_str().expect("command"), "é".repeat(120));
+
+        let other_snippet =
+            shell_command_snippet("read_file", &serde_json::json!({ "command": "ignored" }));
+        assert_eq!(other_snippet, None);
+        let other = tool_timing_record(
+            "read_file",
+            other_snippet.as_deref(),
+            Duration::from_millis(7),
+            false,
+        );
+        assert_eq!(other["tool"], "read_file");
+        assert_eq!(other["duration_ms"], 7);
+        assert_eq!(other["success"], false);
+        assert!(other.get("command").is_none());
+    }
+
+    #[test]
+    fn permission_classifier_trace_record_includes_decision_model_attempts_elapsed_and_usage() {
+        let record = permission_classifier_trace_record(
+            "run_shell_command",
+            "allow",
+            2,
+            Duration::from_millis(42),
+            "test-model",
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                thought_tokens: 3,
+                cached_read_tokens: 2,
+                cached_write_tokens: 1,
+            },
+        );
+
+        assert_eq!(record["type"], "permission_classifier");
+        assert_eq!(record["tool"], "run_shell_command");
+        assert_eq!(record["decision"], "allow");
+        assert_eq!(record["attempts"], 2);
+        assert_eq!(record["elapsed_millis"], 42);
+        assert_eq!(record["model"], "test-model");
+        assert_eq!(record["usage"]["input"], 10);
+        assert_eq!(record["usage"]["output"], 4);
+        assert_eq!(record["usage"]["thought"], 3);
+        assert_eq!(record["usage"]["cached_read"], 2);
+        assert_eq!(record["usage"]["cached_write"], 1);
+    }
+
+    fn task_call_for_test(id: &str, permission_mode: Option<&str>) -> ToolCall {
+        let mut arguments = serde_json::json!({
+            "description": format!("task {id}"),
+            "prompt": format!("inspect {id}"),
+            "subagent_type": "reviewer",
+        });
+        if let Some(permission_mode) = permission_mode {
+            arguments["permission_mode"] = serde_json::json!(permission_mode);
+        }
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "task".to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    async fn empty_registry_for_test() -> (tempfile::TempDir, ToolRegistry) {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            crate::tools::ToolRegistryOptions {
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
+        )
+        .await;
+        (cwd, registry)
     }
 
     fn exchange_for_test(tool_name: &str) -> ToolExchange {
@@ -5449,8 +6389,8 @@ mod tests {
         }
     }
 
-    fn ordered_names_for_test(calls: &[ToolCall], bifrost_names: &[&str]) -> Vec<String> {
-        ordered_tool_call_indices(calls, |name| bifrost_names.contains(&name))
+    fn ordered_names_for_test(calls: &[ToolCall], registry: &ToolRegistry) -> Vec<String> {
+        ordered_tool_call_indices(calls, registry)
             .into_iter()
             .map(|index| calls[index].function.name.clone())
             .collect()
@@ -5464,11 +6404,115 @@ mod tests {
         assert_eq!(subagent_max_turns(usize::MAX, None), usize::MAX);
     }
 
+    /// `trajectory_window_budget_notice` is the exact expression `run`
+    /// evaluates every turn to decide what harness message (if any) to push
+    /// onto `messages` before building that turn's request -- so what this
+    /// function returns for a given `(turn, max_turns)` is what the model
+    /// sees in its request for that turn. With `trajectory_window: true` and
+    /// `max_turns: 3`, turns run 0, 1, 2 (0-indexed, exclusive upper bound):
+    /// turn 1 is the request a human would call "turn 2 of 3" -- one step
+    /// before the budget -- and turn 2 is "turn 3 of 3", the final request.
+    #[test]
+    fn trajectory_window_budget_notice_warns_before_the_last_two_turns() {
+        // Turn 1 of 3 ("turn 2's request"): one step remains after this one.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 1, 3),
+            Some(TRAJECTORY_WINDOW_PENULTIMATE_NOTICE)
+        );
+        // Turn 2 of 3 ("turn 3's request"): this is the final step.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 2, 3),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+        // Turn 0 of 3 is neither -- no notice yet.
+        assert_eq!(trajectory_window_budget_notice(true, false, 0, 3), None);
+
+        // `trajectory_window: false` (a live, non-worker run) never gets
+        // these in-band notices -- it has `force_text_response` instead.
+        for turn in 0..3 {
+            assert_eq!(trajectory_window_budget_notice(false, false, turn, 3), None);
+        }
+    }
+
+    #[test]
+    fn trajectory_window_budget_notice_is_final_only_under_three_turns() {
+        // A budget too small to have a distinct penultimate turn only ever
+        // gets the final notice, per spec, never the penultimate one.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 0, 1),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+        assert_eq!(trajectory_window_budget_notice(true, false, 0, 2), None);
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 1, 2),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+    }
+
+    #[test]
+    fn trajectory_window_budget_notice_skips_p2t_runs() {
+        // p2t/train_bifrost runs manage their own step budgeting and must
+        // not get this notice even when `trajectory_window` is true.
+        assert_eq!(trajectory_window_budget_notice(true, true, 1, 3), None);
+        assert_eq!(trajectory_window_budget_notice(true, true, 2, 3), None);
+    }
+
+    #[test]
+    fn trajectory_window_time_limit_notice_triggers_once_after_lease() {
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(59),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            true,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+        ));
+    }
+
+    #[test]
+    fn trajectory_window_time_limit_notice_skips_non_windows_p2t_and_absent_lease() {
+        assert!(!trajectory_window_time_limit_notice(
+            false,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            true,
+            false,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
+        ));
+        assert!(!trajectory_window_time_limit_notice(
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            None,
+        ));
+    }
+
     #[test]
     fn loop_stop_exposes_failure_only_for_failed() {
         assert!(LoopStop::Completed { had_text: true }.failure().is_none());
         assert!(LoopStop::Completed { had_text: false }.failure().is_none());
         assert!(LoopStop::MaxTurns { max_turns: 5 }.failure().is_none());
+        assert!(LoopStop::TimeLimit.failure().is_none());
         assert!(LoopStop::Cancelled.failure().is_none());
 
         let failed = LoopStop::Failed(TurnFailure {
@@ -5611,56 +6655,155 @@ mod tests {
         assert_eq!(inherited.permission_mode, TaskPermissionMode::Inherit);
     }
 
-    #[test]
-    fn read_only_task_batch_len_groups_only_read_only_lanes() {
+    #[tokio::test]
+    async fn parallel_batch_len_groups_static_safe_tools() {
+        let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
-            ToolCall {
-                id: "a".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "review a",
-                        "prompt": "inspect a",
-                        "subagent_type": "reviewer"
-                    })
-                    .to_string(),
-                },
-            },
-            ToolCall {
-                id: "b".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "review b",
-                        "prompt": "inspect b",
-                        "subagent_type": "reviewer",
-                        "permission_mode": "readOnly"
-                    })
-                    .to_string(),
-                },
-            },
-            ToolCall {
-                id: "c".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "fix c",
-                        "prompt": "edit c",
-                        "subagent_type": "worker",
-                        "permission_mode": "inherit"
-                    })
-                    .to_string(),
-                },
-            },
+            tool_call_for_test("read_file"),
+            tool_call_for_test("grep_search"),
+        ];
+        let ordered = [0, 1];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_groups_safe_tools_and_read_only_task_lanes() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("read_file"),
+            task_call_for_test("b", Some("readOnly")),
+        ];
+        let ordered = [0, 1];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_excludes_update_plan_and_edit() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("edit"),
+            tool_call_for_test("read_file"),
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("edit"),
+        ];
+        let ordered = [0, 1, 2, 3, 4];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 0);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 1);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 0);
+        assert_eq!(ToolRegistry::tool_kind("update_plan"), ToolKind::Read);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_groups_only_read_only_task_lanes() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            task_call_for_test("a", None),
+            task_call_for_test("b", Some("readOnly")),
+            task_call_for_test("c", Some("inherit")),
             tool_call_for_test("read_file"),
         ];
         let ordered = [0, 1, 2, 3];
 
-        assert_eq!(read_only_task_batch_len(&calls, &ordered), 2);
-        assert_eq!(read_only_task_batch_len(&calls, &ordered[2..]), 0);
+        // A missing `permission_mode` defaults to ReadOnly (see
+        // `task_permission_mode_from_input`), so `a` batches alongside `b`.
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 0);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_batch_record_apply_preserves_submission_order_after_out_of_order_completion()
+     {
+        let ready = vec![
+            (
+                0usize,
+                ToolCallRecord {
+                    call_id: "call-read".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments: serde_json::json!({"file_path":"slow.txt"}).to_string(),
+                    result: "slow read".to_string(),
+                    status: ToolExchangeStatus::Completed,
+                    diff: None,
+                    permission_notice: None,
+                },
+                Duration::from_millis(50),
+            ),
+            (
+                1usize,
+                ToolCallRecord {
+                    call_id: "call-grep".to_string(),
+                    tool_name: "grep_search".to_string(),
+                    arguments: serde_json::json!({"pattern":"needle"}).to_string(),
+                    result: "fast grep".to_string(),
+                    status: ToolExchangeStatus::Completed,
+                    diff: None,
+                    permission_notice: None,
+                },
+                Duration::from_millis(0),
+            ),
+        ];
+
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let completed = futures::stream::iter(ready.into_iter().map(|(slot, record, delay)| {
+            let completion_order = completion_order.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                completion_order
+                    .lock()
+                    .expect("completion order lock poisoned")
+                    .push(record.tool_name.clone());
+                (slot, record)
+            }
+        }))
+        .buffered(2)
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            *completion_order
+                .lock()
+                .expect("completion order lock poisoned"),
+            vec!["grep_search".to_string(), "read_file".to_string()]
+        );
+
+        let mut records: Vec<Option<ToolCallRecord>> = vec![None, None];
+        for (slot, record) in completed {
+            records[slot] = Some(record);
+        }
+
+        let mut messages = Vec::new();
+        let mut tool_exchanges = Vec::new();
+        let mut replay_events = Vec::new();
+        let mut step_results = Vec::new();
+        for record in records.into_iter().flatten() {
+            append_tool_call_record(
+                record,
+                &mut messages,
+                &mut tool_exchanges,
+                &mut replay_events,
+                &mut step_results,
+                true,
+            );
+        }
+
+        assert_eq!(
+            tool_exchanges
+                .iter()
+                .map(|exchange| exchange.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "grep_search"]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "grep_search"]
+        );
     }
 
     struct RetryBackend {
@@ -6037,6 +7180,7 @@ mod tests {
             usage,
         } = classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
             .await
+            .outcome
         else {
             panic!("classifier should parse valid model output");
         };
@@ -6068,6 +7212,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
             classify_permission_scope_with_model(&request, false, false, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("classifier should parse valid model output");
         };
@@ -6109,6 +7254,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("retry should recover classifier output");
         };
@@ -6176,6 +7322,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("hard transport error should yield Unavailable");
         };
@@ -6206,6 +7353,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
             classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
                 .await
+                .outcome
         else {
             panic!("non-JSON model output should yield Unavailable");
         };
@@ -6250,70 +7398,94 @@ mod tests {
         pure_gate_decision(mode, kind, tool_name, allowed, shell_auto_allow)
     }
 
-    #[test]
-    fn tool_call_order_runs_non_bifrost_before_bifrost() {
+    #[tokio::test]
+    async fn tool_call_order_runs_mutations_before_reads() {
+        let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
-            tool_call_for_test("search_symbols"),
-            tool_call_for_test("read_file"),
-            tool_call_for_test("get_summaries"),
-            tool_call_for_test("run_shell_command"),
-        ];
-
-        let names = ordered_names_for_test(&calls, &["search_symbols", "get_summaries"]);
-
-        assert_eq!(
-            names,
-            vec![
-                "read_file",
-                "run_shell_command",
-                "search_symbols",
-                "get_summaries"
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_order_preserves_relative_order_within_groups() {
-        let calls = vec![
-            tool_call_for_test("get_summaries"),
             tool_call_for_test("grep_search"),
-            tool_call_for_test("search_symbols"),
-            tool_call_for_test("read_file"),
-            tool_call_for_test("scan_usages_by_reference"),
-        ];
-
-        let names = ordered_names_for_test(
-            &calls,
-            &[
-                "get_summaries",
-                "search_symbols",
-                "scan_usages_by_reference",
-            ],
-        );
-
-        assert_eq!(
-            names,
-            vec![
-                "grep_search",
-                "read_file",
-                "get_summaries",
-                "search_symbols",
-                "scan_usages_by_reference"
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_order_leaves_non_bifrost_batch_unchanged() {
-        let calls = vec![
             tool_call_for_test("edit"),
             tool_call_for_test("read_file"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["edit", "grep_search", "read_file"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_leaves_read_only_batch_unchanged() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("grep_search"),
+            tool_call_for_test("read_file"),
+            task_call_for_test("review", Some("readOnly")),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["grep_search", "read_file", "task"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_leaves_mutation_only_batch_unchanged() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("edit"),
+            tool_call_for_test("update_plan"),
             tool_call_for_test("run_shell_command"),
         ];
 
-        let names = ordered_names_for_test(&calls, &["search_symbols"]);
+        let names = ordered_names_for_test(&calls, &registry);
 
-        assert_eq!(names, vec!["edit", "read_file", "run_shell_command"]);
+        assert_eq!(names, vec!["edit", "update_plan", "run_shell_command"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_places_read_only_tasks_in_read_group() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            task_call_for_test("default", None),
+            task_call_for_test("readonly", Some("readOnly")),
+            task_call_for_test("inherit", Some("inherit")),
+            task_call_for_test("invalid", Some("other")),
+            tool_call_for_test("read_file"),
+        ];
+
+        let ordered = ordered_tool_call_indices(&calls, &registry);
+        let ordered_ids: Vec<_> = ordered
+            .into_iter()
+            .map(|index| calls[index].id.as_str())
+            .collect();
+
+        // `default` omits `permission_mode`, which resolves to ReadOnly (see
+        // `task_permission_mode_from_input`), so it lands in the read group
+        // alongside the explicit `readonly` task. `inherit` and the
+        // unparseable `invalid` mode both stay in the mutation group.
+        assert_eq!(
+            ordered_ids,
+            vec![
+                "inherit",
+                "invalid",
+                "default",
+                "readonly",
+                "call-read_file"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_places_update_plan_in_mutation_group() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("read_file"),
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("grep_search"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["update_plan", "read_file", "grep_search"]);
+        assert_eq!(ToolRegistry::tool_kind("update_plan"), ToolKind::Read);
     }
 
     #[test]
@@ -6418,13 +7590,14 @@ mod tests {
 
         assert!(initial.contains("edit"));
         assert!(initial.contains("write_file"));
-        assert!(initial.contains("list_directory"));
+        assert!(!initial.contains("list_directory"));
         assert!(!initial.contains("read_file"));
         assert!(!initial.contains("grep_search"));
         assert!(!initial.contains("run_shell_command"));
 
         assert!(post_edit.contains("run_shell_command"));
         assert!(post_edit.contains("read_file"));
+        assert!(!post_edit.contains("list_directory"));
         assert!(!post_edit.contains("grep_search"));
     }
 
@@ -6617,6 +7790,41 @@ mod tests {
         assert!(crate::llm_client::is_output_budget_exhausted_error(&err));
         assert!(!is_retryable_llm_error(&err));
         assert!(output.lock().unwrap().is_empty());
+    }
+
+    // The stream layer refuses to retry budget exhaustion (above) because a
+    // byte-identical replay hits the identical cap. The turn loop recovers it
+    // differently: it changes the request first, by telling the model its work
+    // was discarded and asking for a terser step.
+    #[test]
+    fn output_budget_recovery_is_bounded_and_specific() {
+        let exhausted = anyhow::Error::new(OutputBudgetExhaustedError);
+        for used in 0..MAX_OUTPUT_BUDGET_RECOVERIES {
+            assert!(
+                should_recover_output_budget(&exhausted, used),
+                "recovery {used} is inside the budget and must be attempted"
+            );
+        }
+        assert!(
+            !should_recover_output_budget(&exhausted, MAX_OUTPUT_BUDGET_RECOVERIES),
+            "a model that never converges must fail the turn, not consume every turn"
+        );
+
+        // Everything else keeps the existing fail-the-turn path -- including a
+        // retryable outage, which the stream layer has already given up on by
+        // the time the error reaches the turn loop.
+        let outage = anyhow::anyhow!("error sending request: connection reset by peer");
+        assert!(!should_recover_output_budget(&outage, 0));
+    }
+
+    #[test]
+    fn output_budget_recovery_notice_asks_for_a_terser_tool_call() {
+        let notice = OUTPUT_BUDGET_RECOVERY_NOTICE.to_ascii_lowercase();
+        // Without "discarded" the model assumes its thinking carried over and
+        // resumes mid-plan, which reproduces the spiral it was nudged out of.
+        assert!(notice.contains("discarded"), "notice: {notice}");
+        assert!(notice.contains("concise"), "notice: {notice}");
+        assert!(notice.contains("tool call"), "notice: {notice}");
     }
 
     #[tokio::test]
@@ -6943,6 +8151,36 @@ mod tests {
     }
 
     #[test]
+    fn file_change_tracking_counts_delete_and_both_move_paths() {
+        let deleted = file_exchange_for_test("delete_file", "src/lib.rs");
+        let moved = ToolExchange {
+            call_id: "call-move_file".to_string(),
+            tool_name: "move_file".to_string(),
+            arguments: serde_json::json!({
+                "source_path": "src/old.rs",
+                "destination_path": "src/new.rs"
+            })
+            .to_string(),
+            result: "Moved 'src/old.rs' to 'src/new.rs'".to_string(),
+            ..ToolExchange::default()
+        };
+
+        assert!(has_successful_file_change(std::slice::from_ref(&deleted)));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&deleted),
+            &training_packet_for_test("src/lib.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/old.rs")
+        ));
+        assert!(has_successful_training_file_change(
+            std::slice::from_ref(&moved),
+            &training_packet_for_test("src/new.rs")
+        ));
+    }
+
+    #[test]
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
         let packet = training_packet_for_test("src/lib.rs");
@@ -7229,6 +8467,16 @@ mod tests {
                 serde_json::json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
             ),
             (
+                "delete_file",
+                ToolRegistry::tool_kind("delete_file"),
+                serde_json::json!({"file_path": "app.js"}),
+            ),
+            (
+                "move_file",
+                ToolRegistry::tool_kind("move_file"),
+                serde_json::json!({"source_path": "app.js", "destination_path": "moved.js"}),
+            ),
+            (
                 "run_shell_command",
                 ToolRegistry::tool_kind("run_shell_command"),
                 serde_json::json!({"command": "touch app.js"}),
@@ -7334,7 +8582,10 @@ mod tests {
                 command: command.to_string(),
                 timeout: Duration::from_secs(5),
             }],
-            crate::lsp::LspSettings::default(),
+            crate::tools::ToolRegistryOptions {
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
         )
         .await;
         (cwd, registry)
@@ -7663,13 +8914,25 @@ mod tests {
     #[test]
     fn blocked_tool_call_sequence_has_failed_card_and_terminal_update() {
         let reason = "Tool use denied: read-only mode forbids edits";
-        let (card, update) = blocked_tool_call_updates(
-            "call-write",
-            "write_file",
-            ToolRegistry::tool_kind("write_file"),
-            &serde_json::json!({"file_path": "app.js", "content": "x"}),
-            reason,
+        let updates = acp_updates_for_event(RuntimeEvent::ToolCall {
+            call_id: "call-write".to_string(),
+            tool_name: "write_file".to_string(),
+            phase: ToolCallPhase::Blocked {
+                input: serde_json::json!({"file_path": "app.js", "content": "x"}),
+                reason: reason.to_string(),
+            },
+        });
+        assert_eq!(
+            updates.len(),
+            2,
+            "blocked call renders card + terminal update"
         );
+        let SessionUpdate::ToolCall(card) = &updates[0] else {
+            panic!("expected a ToolCall card first");
+        };
+        let SessionUpdate::ToolCallUpdate(update) = &updates[1] else {
+            panic!("expected a ToolCallUpdate second");
+        };
 
         assert_eq!(card.tool_call_id.0.as_ref(), "call-write");
         assert_eq!(card.title, "Blocked Writing file");
@@ -7747,6 +9010,20 @@ mod tests {
             ),
             PureGateDecision::Prompt
         );
+    }
+
+    #[test]
+    fn accept_edits_sends_delete_and_move_to_the_client_permission_policy() {
+        for (kind, name) in [
+            (ToolKind::Delete, "delete_file"),
+            (ToolKind::Move, "move_file"),
+        ] {
+            assert_eq!(
+                decide(PermissionMode::AcceptEdits, kind, name, false, false),
+                PureGateDecision::Prompt,
+                "{name} must reach the client so headless auto can approve it"
+            );
+        }
     }
 
     #[test]
@@ -8032,7 +9309,7 @@ mod tests {
             );
             let labels: Vec<_> = options
                 .iter()
-                .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+                .map(|option| (option.id.as_str(), option.label.as_str()))
                 .collect();
 
             assert_eq!(
@@ -8051,10 +9328,7 @@ mod tests {
     fn shell_permission_prompt_hides_always_allow_without_prefix() {
         // No extractable/offerable prefix -> no "Always allow" choice.
         let options = permission_options("run_shell_command", true, None);
-        let ids: Vec<_> = options
-            .iter()
-            .map(|option| option.option_id.0.as_ref())
-            .collect();
+        let ids: Vec<_> = options.iter().map(|option| option.id.as_str()).collect();
 
         assert_eq!(ids, vec!["allow", "reject"]);
     }
@@ -8064,7 +9338,7 @@ mod tests {
         let options = permission_options_for_request("run_shell_command", true, true, None);
         let labels: Vec<_> = options
             .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .map(|option| (option.id.as_str(), option.label.as_str()))
             .collect();
 
         assert_eq!(
@@ -8347,7 +9621,7 @@ mod tests {
         let options = permission_options("write_file", false, None);
         let labels: Vec<_> = options
             .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .map(|option| (option.id.as_str(), option.label.as_str()))
             .collect();
 
         assert_eq!(
@@ -8378,7 +9652,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", false, false, result);
+        let exec = tool_result_to_execution("run_shell_command", false, false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -8390,7 +9664,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -8402,7 +9676,7 @@ mod tests {
             output: "curl: (6) Could not resolve host: example.com".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -8414,7 +9688,7 @@ mod tests {
             output: "npm ERR! request to https://registry.npmjs.org/vite failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -8428,7 +9702,7 @@ mod tests {
             output: "cargo: error[E0277]: the trait bound is not satisfied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+        let exec = tool_result_to_execution("run_shell_command", true, false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
@@ -8442,7 +9716,7 @@ mod tests {
             output: "permission denied".to_string(),
         };
 
-        let exec = tool_result_to_execution("run_shell_command", true, true, result);
+        let exec = tool_result_to_execution("run_shell_command", true, true, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }

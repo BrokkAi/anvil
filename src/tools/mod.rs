@@ -9,6 +9,7 @@ use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
 use sandbox::SandboxPolicy;
+use serde::de;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
@@ -31,6 +32,18 @@ pub enum ToolStatus {
     InternalError,
 }
 
+/// Whether a rendered tool result text represents a failure. Matches the
+/// `"Error: "` / `"Internal error: "` status prefixes `tool_result_to_execution`
+/// applies in `tool_loop.rs` for `ToolStatus::RequestError` / `InternalError`,
+/// plus the `"Tool use denied"` prefix every permission-gate rejection uses
+/// (user rejections, auto-permission denials, read-only mode, oversized
+/// permission cards -- see `tool_loop.rs` / `tool_loop/announce.rs`).
+pub(crate) fn tool_result_failed(result: &str) -> bool {
+    result.starts_with("Error:")
+        || result.starts_with("Internal error:")
+        || result.starts_with("Tool use denied")
+}
+
 #[derive(Debug, Deserialize)]
 struct ReadFileArgs {
     file_path: String,
@@ -47,12 +60,83 @@ struct WriteFileArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteFileArgs {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveFileArgs {
+    source_path: String,
+    destination_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EditEntryArgs {
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Debug)]
 struct EditFileArgs {
+    file_path: String,
+    edits: Vec<EditEntryArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchEditFileArgs {
+    file_path: String,
+    edits: Vec<EditEntryArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlatEditFileArgs {
     file_path: String,
     old_string: String,
     new_string: String,
     #[serde(default)]
     replace_all: bool,
+}
+
+impl<'de> Deserialize<'de> for EditFileArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("edits").is_some() {
+            let args: BatchEditFileArgs =
+                deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+            return Ok(Self {
+                file_path: args.file_path,
+                edits: args.edits,
+            });
+        }
+
+        if value.get("old_string").is_some()
+            || value.get("new_string").is_some()
+            || value.get("replace_all").is_some()
+        {
+            let args: FlatEditFileArgs =
+                deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+            return Ok(Self {
+                file_path: args.file_path,
+                edits: vec![EditEntryArgs {
+                    old_string: args.old_string,
+                    new_string: args.new_string,
+                    replace_all: args.replace_all,
+                }],
+            });
+        }
+
+        let args: BatchEditFileArgs =
+            deserialize_json_value_with_path(value).map_err(de::Error::custom)?;
+        Ok(Self {
+            file_path: args.file_path,
+            edits: args.edits,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,10 +168,6 @@ struct WebSearchArgs {
     query: String,
     #[serde(default = "default_web_search_limit")]
     max_results: usize,
-}
-
-fn default_shell_timeout_ms() -> u64 {
-    60_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,8 +209,18 @@ struct DiagnosticsArgs {
 #[derive(Debug, Deserialize)]
 struct RunShellCommandArgs {
     command: String,
-    #[serde(default = "default_shell_timeout_ms")]
-    timeout: u64,
+    /// The advertised timeout field, in seconds. Clamped to
+    /// `[shell::MIN_TIMEOUT_SECONDS, shell::MAX_TIMEOUT_SECONDS]`.
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    timeout_seconds: Option<u64>,
+    /// Legacy millisecond timeout. Deserialized but deliberately absent from
+    /// the advertised schema: models kept reading "timeout" as seconds and
+    /// having their commands killed at the 1s rounding floor. Kept so
+    /// in-process callers and replayed traces that still pass milliseconds
+    /// behave exactly as they did, with only the ceiling moved.
+    /// `timeout_seconds` wins when both are present.
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    timeout: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     directory: Option<String>,
     #[serde(
@@ -181,14 +271,23 @@ impl BuiltinArgsContract for WriteFileArgs {
 }
 
 #[cfg(test)]
+impl BuiltinArgsContract for DeleteFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("file_path", "string")];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for MoveFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["source_path", "destination_path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("source_path", "string"), ("destination_path", "string")];
+}
+
+#[cfg(test)]
 impl BuiltinArgsContract for EditFileArgs {
-    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "old_string", "new_string"];
-    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
-        ("file_path", "string"),
-        ("old_string", "string"),
-        ("new_string", "string"),
-        ("replace_all", "boolean"),
-    ];
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "edits"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("file_path", "string"), ("edits", "array")];
 }
 
 #[cfg(test)]
@@ -226,7 +325,7 @@ impl BuiltinArgsContract for RunShellCommandArgs {
     const REQUIRED_FIELDS: &'static [&'static str] = &["command"];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
         ("command", "string"),
-        ("timeout", "integer"),
+        ("timeout_seconds", "integer"),
         ("description", "string"),
         ("directory", "string"),
         (ShellSandboxPermissionArg::FIELD, "string"),
@@ -249,6 +348,14 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_json_value_with_path<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, String> {
+    let json = value.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| err.to_string())
 }
 
 fn parse_builtin_args<T: DeserializeOwned>(
@@ -279,6 +386,7 @@ struct ToolMeta {
     name: &'static str,
     kind: ToolKind,
     display_name: &'static str,
+    concurrency_safe: bool,
 }
 
 const TOOLS: &[ToolMeta] = &[
@@ -287,41 +395,67 @@ const TOOLS: &[ToolMeta] = &[
         name: "read_file",
         kind: ToolKind::Read,
         display_name: "Reading file",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "write_file",
         kind: ToolKind::Edit,
         display_name: "Writing file",
+        concurrency_safe: false,
+    },
+    ToolMeta {
+        name: "delete_file",
+        kind: ToolKind::Delete,
+        display_name: "Deleting file",
+        concurrency_safe: false,
+    },
+    ToolMeta {
+        name: "move_file",
+        kind: ToolKind::Move,
+        display_name: "Moving file",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "edit",
         kind: ToolKind::Edit,
         display_name: "Editing file",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "list_directory",
         kind: ToolKind::Read,
         display_name: "Listing directory",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "grep_search",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "web_search",
         kind: ToolKind::Search,
         display_name: "Searching the web",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "diagnostics",
         kind: ToolKind::Read,
         display_name: "Getting diagnostics",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "run_shell_command",
         kind: ToolKind::Execute,
         display_name: "Running shell command",
+        concurrency_safe: false,
+    },
+    ToolMeta {
+        name: "update_plan",
+        kind: ToolKind::Read,
+        display_name: "Updating plan",
+        concurrency_safe: false,
     },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
@@ -332,223 +466,265 @@ const TOOLS: &[ToolMeta] = &[
         name: "get_summaries",
         kind: ToolKind::Read,
         display_name: "Getting code summaries",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_active_workspace",
         kind: ToolKind::Read,
         display_name: "Getting active workspace",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_symbols",
         kind: ToolKind::Search,
         display_name: "Searching for symbols",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_ast",
         kind: ToolKind::Search,
         display_name: "Searching AST",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "query_code",
         kind: ToolKind::Search,
         display_name: "Querying code structure",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_locations",
         kind: ToolKind::Search,
         display_name: "Finding symbol locations",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_ancestors",
         kind: ToolKind::Search,
         display_name: "Finding symbol ancestors",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_summaries",
         kind: ToolKind::Search,
         display_name: "Getting symbol summaries",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_sources",
         kind: ToolKind::Search,
         display_name: "Fetching symbol source",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "most_relevant_files",
         kind: ToolKind::Search,
         display_name: "Finding related files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "scan_usages_by_reference",
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
+        concurrency_safe: true,
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
-    // New guidance and local Bifrost builds advertise the split reference name.
+    // Compatibility classification for Bifrost versions that advertise the
+    // legacy unsplit reference name.
     ToolMeta {
         name: "scan_usages",
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "usage_graph",
         kind: ToolKind::Search,
         display_name: "Building usage graph",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_definitions_by_reference",
         kind: ToolKind::Search,
         display_name: "Finding definition",
+        concurrency_safe: true,
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
+    // Compatibility classification for the legacy singular reference name.
     ToolMeta {
         name: "get_definition_by_reference",
         kind: ToolKind::Search,
         display_name: "Finding definition",
+        concurrency_safe: true,
     },
     ToolMeta {
         // bifrost returns the non-mutating rename edit set (it never writes),
-        // so it ships in the read-only `searchtools` surface with
-        // readOnlyHint=true and is classified as a read tool here.
+        // with readOnlyHint=true, so it is classified as a read tool here.
         name: "rename_symbol",
         kind: ToolKind::Read,
         display_name: "Computing symbol rename",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "semantic_search",
         kind: ToolKind::Search,
         display_name: "Searching semantically",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_file_contents",
         kind: ToolKind::Read,
         display_name: "Reading file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "classify_test_files",
         kind: ToolKind::Read,
         display_name: "Classifying test files",
+        concurrency_safe: true,
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
+    // Compatibility classification for the legacy test-classification name.
     ToolMeta {
         name: "contains_tests",
         kind: ToolKind::Read,
         display_name: "Checking for test files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "find_filenames",
         kind: ToolKind::Search,
         display_name: "Finding filenames",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "find_files_containing",
         kind: ToolKind::Search,
         display_name: "Finding files containing text",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_file_contents",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "list_files",
         kind: ToolKind::Read,
         display_name: "Listing files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "skim_files",
         kind: ToolKind::Read,
         display_name: "Skimming files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_git_commit_messages",
         kind: ToolKind::Search,
         display_name: "Searching git commit messages",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_git_log",
         kind: ToolKind::Read,
         display_name: "Reading git log",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_commit_diff",
         kind: ToolKind::Read,
         display_name: "Reading commit diff",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "jq",
         kind: ToolKind::Search,
         display_name: "Querying JSON",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "xml_skim",
         kind: ToolKind::Read,
         display_name: "Skimming XML",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "xml_select",
         kind: ToolKind::Search,
         display_name: "Selecting XML",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "compute_cyclomatic_complexity",
         kind: ToolKind::Read,
         display_name: "Computing cyclomatic complexity",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "compute_cognitive_complexity",
         kind: ToolKind::Read,
         display_name: "Computing cognitive complexity",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_comment_density_for_code_unit",
         kind: ToolKind::Read,
         display_name: "Reporting comment density",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_comment_density_for_files",
         kind: ToolKind::Read,
         display_name: "Reporting file comment density",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_exception_handling_smells",
         kind: ToolKind::Read,
         display_name: "Reporting exception handling smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_test_assertion_smells",
         kind: ToolKind::Read,
         display_name: "Reporting test assertion smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_structural_clone_smells",
         kind: ToolKind::Read,
         display_name: "Reporting structural clone smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_long_method_and_god_object_smells",
         kind: ToolKind::Read,
         display_name: "Reporting long method and god object smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_dead_code_and_unused_abstraction_smells",
         kind: ToolKind::Read,
         display_name: "Reporting dead code smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_secret_like_code",
         kind: ToolKind::Read,
         display_name: "Reporting secret-like code",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "analyze_git_hotspots",
         kind: ToolKind::Read,
         display_name: "Analyzing git hotspots",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "analyze_commit",
         kind: ToolKind::Read,
         display_name: "Analyzing commit",
+        concurrency_safe: true,
     },
     // `activate_workspace` and `refresh` mutate analyzer state, so they
     // stay `Other` rather than `Read`: prompted in `default`, refused in
@@ -557,11 +733,13 @@ const TOOLS: &[ToolMeta] = &[
         name: "activate_workspace",
         kind: ToolKind::Other,
         display_name: "Activating workspace",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "refresh",
         kind: ToolKind::Other,
         display_name: "Refreshing analyzer index",
+        concurrency_safe: false,
     },
     // --- Agent Skills activation -------------------------------------------
     // The tool itself is registered dynamically in `tool_definitions()`
@@ -573,6 +751,7 @@ const TOOLS: &[ToolMeta] = &[
         name: "activate_skill",
         kind: ToolKind::Read,
         display_name: "Activating skill",
+        concurrency_safe: true,
     },
     // --- Subagent dispatch -------------------------------------------------
     // Like `activate_skill`, registered dynamically in `tool_definitions()`
@@ -587,6 +766,7 @@ const TOOLS: &[ToolMeta] = &[
         name: "task",
         kind: ToolKind::Other,
         display_name: "Running subagent",
+        concurrency_safe: false,
     },
 ];
 
@@ -625,16 +805,48 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
+    "delete_file",
+    "move_file",
     "edit",
     "list_directory",
     "grep_search",
     "web_search",
     "diagnostics",
     "run_shell_command",
+    "update_plan",
 ];
 
 fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOL_NAMES.contains(&name)
+}
+
+/// One row of the static tool catalog exposed over the HTTP API
+/// (`GET /v1/tools`). Derived from the `TOOLS` metadata table so the HTTP
+/// surface cannot drift from the permission gate's view of the harness.
+/// Rows for MCP-loaded tools describe Anvil's default Bifrost toolset; a
+/// session's live registry may expose fewer (server disabled) or more
+/// (extra MCP servers) at prompt time.
+#[cfg(feature = "http-api")]
+pub(crate) struct ToolCatalogEntry {
+    pub(crate) name: &'static str,
+    pub(crate) kind: ToolKind,
+    pub(crate) display_name: &'static str,
+    pub(crate) concurrency_safe: bool,
+    pub(crate) builtin: bool,
+}
+
+#[cfg(feature = "http-api")]
+pub(crate) fn tool_catalog() -> Vec<ToolCatalogEntry> {
+    TOOLS
+        .iter()
+        .map(|meta| ToolCatalogEntry {
+            name: meta.name,
+            kind: meta.kind,
+            display_name: meta.display_name,
+            concurrency_safe: meta.concurrency_safe,
+            builtin: is_builtin_tool(meta.name),
+        })
+        .collect()
 }
 
 fn is_harness_only_mcp_tool(name: &str) -> bool {
@@ -676,7 +888,36 @@ pub struct ToolRegistry {
     /// time. Ordered; executed by `tool_loop::execute_tool` around each
     /// tool call.
     plugin_hooks: Vec<crate::plugins::HookCommand>,
+    /// Post-capture shell-output minimizer; `None` when disabled via
+    /// `--no-shell-minimizer`.
+    shell_minimizer: Option<shell::ShellMinimizer>,
     lsp: Option<Arc<crate::lsp::LspManager>>,
+}
+
+fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String> {
+    entries.retain(|(_, instructions)| !instructions.trim().is_empty());
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut block = String::from("<mcp_instructions>\n");
+    for (name, instructions) in entries {
+        block.push_str(&format!(
+            "  <server name=\"{name}\">\n{}\n  </server>\n",
+            instructions.trim()
+        ));
+    }
+    block.push_str("</mcp_instructions>");
+    Some(block)
+}
+
+/// Feature knobs for `ToolRegistry::new`. Bundled so the constructor stays
+/// under clippy's argument-count limit while each knob remains explicit at
+/// call sites.
+pub(crate) struct ToolRegistryOptions {
+    pub lsp_settings: crate::lsp::LspSettings,
+    pub shell_minimizer_enabled: bool,
 }
 
 impl ToolRegistry {
@@ -726,6 +967,19 @@ impl ToolRegistry {
         self.agents.read().await.clone()
     }
 
+    /// Render instructions from currently connected MCP servers for inclusion
+    /// in the model's system prompt. Clients are sorted by server name so the
+    /// prefix remains deterministic even when configuration order changes.
+    pub(crate) async fn mcp_instructions(&self) -> Option<String> {
+        let mut entries = Vec::new();
+        for client in &self.mcp_clients {
+            if let Some(instructions) = client.instructions().await {
+                entries.push((client.name().to_string(), instructions));
+            }
+        }
+        render_mcp_instructions(entries)
+    }
+
     pub async fn new(
         cwd: PathBuf,
         additional_roots: Vec<PathBuf>,
@@ -733,12 +987,13 @@ impl ToolRegistry {
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
         plugin_hooks: Vec<crate::plugins::HookCommand>,
-        lsp_settings: crate::lsp::LspSettings,
+        options: ToolRegistryOptions,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
         // profile from a concurrent in-flight shell call.
         sandbox::cleanup_stale_policy_files();
+        shell::cleanup_stale_shell_outputs(&cwd);
 
         let mut mcp_clients = Vec::new();
         let mut mcp_tool_servers = HashMap::new();
@@ -787,11 +1042,19 @@ impl ToolRegistry {
                 }
             }
         }
-        let lsp = if lsp_settings.servers.iter().any(|server| server.enabled) {
-            Some(crate::lsp::LspManager::start(cwd.clone(), lsp_settings).await)
+        let lsp = if options
+            .lsp_settings
+            .servers
+            .iter()
+            .any(|server| server.enabled)
+        {
+            Some(crate::lsp::LspManager::start(cwd.clone(), options.lsp_settings).await)
         } else {
             None
         };
+        let shell_minimizer = options
+            .shell_minimizer_enabled
+            .then(|| shell::ShellMinimizer::new(&cwd));
         Self {
             cwd,
             additional_roots,
@@ -807,7 +1070,16 @@ impl ToolRegistry {
             agents: RwLock::new(agents),
             plugin_hooks,
             lsp,
+            shell_minimizer,
         }
+    }
+
+    /// Whether `name` is served by a connected MCP server (in practice: a
+    /// Bifrost tool). Bifrost bounds its own responses and marks elisions
+    /// with `----- OMITTED` delimiters the model can act on, so its results
+    /// are exempt from the harness's tool-result truncation.
+    pub(crate) fn is_mcp_tool(&self, name: &str) -> bool {
+        self.mcp_tool_servers.contains_key(name)
     }
 
     /// Hooks contributed by enabled plugins at registry build time.
@@ -856,7 +1128,7 @@ impl ToolRegistry {
         }
         if builtin_tools.contains("write_file") {
             let write_description = format!(
-                "Writes content to a specified file in the local filesystem, capped at {} bytes. Paths may be relative to the working directory or absolute paths inside it.",
+                "Writes content to a specified file in the local filesystem, capped at {} bytes. Use it to create files and to REPLACE a file's entire contents when editing would take more than a few hunks -- one write_file call is better than a chain of edits. Paths may be relative to the working directory or absolute paths inside it.",
                 filesystem::WRITE_MAX_BYTES
             );
             defs.push(tool_def(
@@ -878,10 +1150,46 @@ impl ToolRegistry {
                 }),
             ));
         }
+        if builtin_tools.contains("delete_file") {
+            defs.push(tool_def(
+                "delete_file",
+                "Deletes one regular file from the local filesystem. Directory and symlink deletion is refused. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the regular file to delete. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        }
+                    },
+                    "required": ["file_path"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("move_file") {
+            defs.push(tool_def(
+                "move_file",
+                "Moves or renames one regular file without overwriting an existing destination. Directory and symlink moves are refused. Both paths must remain inside configured workspace roots; missing destination parent directories are created.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "source_path": {
+                            "type": "string",
+                            "description": "Path to the existing regular file. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        },
+                        "destination_path": {
+                            "type": "string",
+                            "description": "New path for the file. The destination must not already exist. Relative paths are resolved against the working directory; absolute paths must remain inside a configured workspace root."
+                        }
+                    },
+                    "required": ["source_path", "destination_path"]
+                }),
+            ));
+        }
         if builtin_tools.contains("edit") {
             defs.push(tool_def(
                 "edit",
-                "Replaces exact literal text within a file. By default, replaces a single occurrence. Set `replace_all` to true to replace every matching occurrence.",
+                "Replaces exact literal text within a file using one or more sequential edit entries. Each entry matches against the file content produced by previous entries, and each `old_string` must be the smallest text that uniquely identifies the change. If `old_string` is ambiguous, expand it with more context or set `replace_all` to true. When no exact match exists, matching falls back to whole-line comparison ignoring leading/trailing whitespace, re-adjusting replacement indentation. Batch related changes to the same file into one call with multiple `edits` entries. If an entry fails, earlier entries remain applied and later entries are not attempted. For heavy rewrites -- many hunks or most of a file changing -- prefer `write_file` with the full new contents instead of a long edit chain.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -889,20 +1197,31 @@ impl ToolRegistry {
                             "type": "string",
                             "description": "Path to the file to modify. Relative paths are resolved against the working directory; absolute paths must remain inside it."
                         },
-                        "old_string": {
-                            "type": "string",
-                            "description": "The exact literal text to replace, including whitespace and indentation."
-                        },
-                        "new_string": {
-                            "type": "string",
-                            "description": "The exact literal text to replace `old_string` with."
-                        },
-                        "replace_all": {
-                            "type": "boolean",
-                            "description": "Replace all occurrences of old_string. Defaults to false."
+                        "edits": {
+                            "type": "array",
+                            "description": "Sequential exact-string replacements to apply to this file. Later entries see the content produced by earlier entries.",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": {
+                                        "type": "string",
+                                        "description": "The exact literal text to replace, including whitespace and indentation. Use the smallest text that uniquely identifies the change."
+                                    },
+                                    "new_string": {
+                                        "type": "string",
+                                        "description": "The exact literal text to replace `old_string` with."
+                                    },
+                                    "replace_all": {
+                                        "type": "boolean",
+                                        "description": "Replace all occurrences of old_string for this edit entry. Defaults to false."
+                                    }
+                                },
+                                "required": ["old_string", "new_string"]
+                            }
                         }
                     },
-                    "required": ["file_path", "old_string", "new_string"]
+                    "required": ["file_path", "edits"]
                 }),
             ));
         }
@@ -990,16 +1309,22 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("run_shell_command") {
+            // Seconds, not milliseconds: models routinely passed `120`
+            // meaning two minutes, and the millisecond reading rounded that
+            // to a 1-second budget that killed the command. The unit is
+            // stated twice on purpose -- in the field name and in the text.
             let timeout_description = format!(
-                "Optional timeout in milliseconds. Rounded up to seconds and clamped to a {} second server maximum.",
-                shell::MAX_TIMEOUT_SECONDS
+                "Optional timeout in seconds (not milliseconds) for this command. Clamped to a minimum of {} seconds and a maximum of {} seconds. Defaults to {} seconds when omitted.",
+                shell::MIN_TIMEOUT_SECONDS,
+                shell::MAX_TIMEOUT_SECONDS,
+                shell::DEFAULT_TIMEOUT_SECONDS
             );
             let mut shell_properties = json!({
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute (passed to sh -c)."
                 },
-                "timeout": {
+                "timeout_seconds": {
                     "type": "integer",
                     "description": timeout_description
                 },
@@ -1030,6 +1355,9 @@ impl ToolRegistry {
                     "required": ["command"]
                 }),
             ));
+        }
+        if builtin_tools.contains("update_plan") {
+            defs.push(update_plan_tool_definition());
         }
         let mut advertised_names: HashSet<String> =
             defs.iter().map(|def| def.function.name.clone()).collect();
@@ -1094,25 +1422,7 @@ impl ToolRegistry {
             let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
             let catalog: String = agents
                 .iter_sorted()
-                .map(|m| {
-                    let mut restrictions = Vec::new();
-                    if let Some(max_turns) = m.max_turns {
-                        restrictions.push(format!("max_turns: {max_turns}"));
-                    }
-                    if let Some(tools) = &m.allowed_tools {
-                        restrictions.push(if tools.is_empty() {
-                            "tools: none".to_string()
-                        } else {
-                            format!("tools: {}", tools.join(", "))
-                        });
-                    }
-                    let restrictions = if restrictions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", restrictions.join("; "))
-                    };
-                    format!("- {}: {}{}", m.name, m.description, restrictions)
-                })
+                .map(|m| format!("- {}: {}", m.name, m.description))
                 .collect::<Vec<_>>()
                 .join("\n");
             defs.push(tool_def(
@@ -1155,6 +1465,14 @@ impl ToolRegistry {
                 }),
             ));
         }
+
+        // Apply the install-wide allowlist only after every source has
+        // contributed definitions. In particular, `activate_skill` and `task`
+        // are dynamic tools assembled after built-ins and MCP tools.
+        if let Some(allowed_tools) = crate::setup_state::read_allowed_tools() {
+            let allowed_tools: HashSet<String> = allowed_tools.into_iter().collect();
+            defs.retain(|tool| allowed_tools.contains(&tool.function.name));
+        }
         defs
     }
 
@@ -1162,6 +1480,14 @@ impl ToolRegistry {
         self.mcp_tool_servers
             .get(name)
             .is_some_and(|client| client.name() == "bifrost")
+    }
+
+    /// Whether a tool's calls may run concurrently with adjacent safe calls.
+    ///
+    /// Unknown tools default to `false`; newly-added MCP tools must be
+    /// classified explicitly in `TOOLS` before they can use the parallel path.
+    pub(crate) fn is_concurrency_safe(&self, name: &str) -> bool {
+        tool_meta(name).is_some_and(|meta| meta.concurrency_safe)
     }
 
     /// Invoke a bifrost MCP tool and return its raw structured `Value`,
@@ -1335,6 +1661,38 @@ impl ToolRegistry {
                 .await;
                 self.with_write_diagnostics(result, &diagnostics_path).await
             }
+            "delete_file" => {
+                let args: DeleteFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
+                let path = args.file_path;
+                run_blocking_filesystem_tool(move || {
+                    filesystem::delete_file_in_roots(&cwd, &additional_roots, &path)
+                })
+                .await
+            }
+            "move_file" => {
+                let args: MoveFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
+                let source_path = args.source_path;
+                let destination_path = args.destination_path;
+                run_blocking_filesystem_tool(move || {
+                    filesystem::move_file_in_roots(
+                        &cwd,
+                        &additional_roots,
+                        &source_path,
+                        &destination_path,
+                    )
+                })
+                .await
+            }
             "edit" => {
                 let args: EditFileArgs = match parse_builtin_args(name, args) {
                     Ok(args) => args,
@@ -1342,19 +1700,22 @@ impl ToolRegistry {
                 };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                let path = args.file_path.clone();
+                let path = args.file_path;
+                let diagnostics_path = path.clone();
+                let edits: Vec<filesystem::EditFileEntry> = args
+                    .edits
+                    .into_iter()
+                    .map(|edit| filesystem::EditFileEntry {
+                        old_string: edit.old_string,
+                        new_string: edit.new_string,
+                        replace_all: edit.replace_all,
+                    })
+                    .collect();
                 let result = run_blocking_filesystem_tool(move || {
-                    filesystem::edit_file_in_roots(
-                        &cwd,
-                        &additional_roots,
-                        &args.file_path,
-                        &args.old_string,
-                        &args.new_string,
-                        args.replace_all,
-                    )
+                    filesystem::edit_file_entries_in_roots(&cwd, &additional_roots, &path, &edits)
                 })
                 .await;
-                self.with_write_diagnostics(result, &path).await
+                self.with_write_diagnostics(result, &diagnostics_path).await
             }
             "list_directory" => {
                 let args: ListDirectoryArgs = match parse_builtin_args(name, args) {
@@ -1403,8 +1764,7 @@ impl ToolRegistry {
                     Ok(args) => args,
                     Err(result) => return result,
                 };
-                let timeout_seconds = args.timeout.saturating_add(999) / 1000;
-                let timeout_seconds = timeout_seconds.max(1);
+                let timeout = shell::ShellTimeout::resolve(args.timeout_seconds, args.timeout);
                 let command_cwd = match args.directory.as_deref() {
                     Some(directory) if !directory.trim().is_empty() => {
                         match safe_resolve_in_roots(&self.cwd, &self.additional_roots, directory) {
@@ -1425,15 +1785,26 @@ impl ToolRegistry {
                     }
                     _ => self.cwd.clone(),
                 };
-                shell::run_shell_command_cancellable(
+                shell::run_shell_command_with_timeout(
                     &command_cwd,
                     &args.command,
-                    timeout_seconds,
+                    timeout,
                     policy,
                     outside_sandbox_once,
                     cancel,
+                    self.shell_minimizer.as_ref(),
                 )
                 .await
+            }
+            "update_plan" => {
+                let _: crate::plan::UpdatePlanArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                ToolResult {
+                    status: ToolStatus::Success,
+                    output: "Plan updated".to_string(),
+                }
             }
             "activate_skill" => self.execute_activate_skill(args).await,
             // Any name not handled above is delegated to a configured MCP
@@ -1472,9 +1843,8 @@ impl ToolRegistry {
         let Ok(resolved) = safe_resolve_in_roots(&self.cwd, &self.additional_roots, path) else {
             return result;
         };
-        lsp.change_file(&resolved).await;
         let diagnostics = lsp
-            .wait_for_file_diagnostics(&resolved, std::time::Duration::from_secs(5))
+            .change_file_and_wait(&resolved, std::time::Duration::from_secs(5))
             .await;
         result.output.push_str(&crate::lsp::format_diagnostics(
             Some(&resolved),
@@ -1508,9 +1878,8 @@ impl ToolRegistry {
                     };
                 }
             };
-            lsp.open_file(&resolved).await;
             let diagnostics = lsp
-                .wait_for_file_diagnostics(&resolved, std::time::Duration::from_secs(2))
+                .open_file_and_wait(&resolved, std::time::Duration::from_secs(2))
                 .await;
             (Some(resolved), diagnostics)
         } else {
@@ -1555,7 +1924,7 @@ impl ToolRegistry {
         };
         ToolResult {
             status: ToolStatus::Success,
-            output: crate::agent::build_skill_payload(meta),
+            output: crate::acp::build_skill_payload(meta),
         }
     }
 
@@ -1739,6 +2108,41 @@ fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> Too
     }
 }
 
+pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
+    tool_def(
+        "update_plan",
+        "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time. Plan updates are bookkeeping: include this call in the same response as your next tool call rather than spending a response on it alone.",
+        json!({
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional explanation for this plan update."
+                },
+                "plan": {
+                    "type": "array",
+                    "description": "The list of steps.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "Task step text." },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Step status."
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 /// Resolve a relative path against cwd and ensure it stays within cwd.
 #[cfg(test)]
 pub fn safe_resolve(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
@@ -1875,6 +2279,22 @@ fn canonical_workspace_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_instruction_block_is_deterministic_and_omits_empty_entries() {
+        let rendered = render_mcp_instructions(vec![
+            ("zeta".to_string(), "Last policy".to_string()),
+            ("empty".to_string(), " \n".to_string()),
+            ("alpha".to_string(), "First policy".to_string()),
+        ]);
+        assert_eq!(
+            rendered.as_deref(),
+            Some(
+                "<mcp_instructions>\n  <server name=\"alpha\">\nFirst policy\n  </server>\n  <server name=\"zeta\">\nLast policy\n  </server>\n</mcp_instructions>"
+            )
+        );
+        assert_eq!(render_mcp_instructions(Vec::new()), None);
+    }
 
     /// Allocate a fresh empty directory under the system temp dir for one test
     /// to scribble in. Caller is responsible for cleaning it up.
@@ -2020,6 +2440,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             lsp: None,
+            shell_minimizer: None,
         }
     }
 
@@ -2044,6 +2465,7 @@ mod tests {
             agents: RwLock::new(Arc::new(reg)),
             plugin_hooks: Vec::new(),
             lsp: None,
+            shell_minimizer: None,
         }
     }
 
@@ -2219,6 +2641,12 @@ mod tests {
         assert_eq!(ToolRegistry::tool_kind("scan_usages"), ToolKind::Search);
     }
 
+    #[test]
+    fn first_class_file_mutations_have_acp_delete_and_move_kinds() {
+        assert_eq!(ToolRegistry::tool_kind("delete_file"), ToolKind::Delete);
+        assert_eq!(ToolRegistry::tool_kind("move_file"), ToolKind::Move);
+    }
+
     #[tokio::test]
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
@@ -2236,6 +2664,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             lsp: None,
+            shell_minimizer: None,
         };
         let advertised: Vec<String> = registry
             .tool_definitions()
@@ -2359,12 +2788,90 @@ mod tests {
 
         assert_builtin_schema_matches::<ReadFileArgs>(&defs, "read_file");
         assert_builtin_schema_matches::<WriteFileArgs>(&defs, "write_file");
+        assert_builtin_schema_matches::<DeleteFileArgs>(&defs, "delete_file");
+        assert_builtin_schema_matches::<MoveFileArgs>(&defs, "move_file");
         assert_builtin_schema_matches::<EditFileArgs>(&defs, "edit");
         assert_builtin_schema_matches::<ListDirectoryArgs>(&defs, "list_directory");
         assert_builtin_schema_matches::<GrepSearchArgs>(&defs, "grep_search");
         assert_builtin_schema_matches::<WebSearchArgs>(&defs, "web_search");
         assert_builtin_schema_matches::<RunShellCommandArgs>(&defs, "run_shell_command");
         assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
+    }
+
+    /// The model is offered exactly one timeout field, in seconds. The legacy
+    /// millisecond `timeout` stays deserializable for replay and in-process
+    /// callers but must never be advertised again: seeing both would just
+    /// reintroduce the unit confusion this switch exists to remove.
+    #[tokio::test]
+    async fn shell_schema_advertises_timeout_seconds_only() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let shell_def = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+        let properties = &shell_def.function.parameters["properties"];
+
+        assert!(
+            properties["timeout"].is_null(),
+            "the millisecond timeout field must not be advertised: {properties}"
+        );
+        assert_eq!(properties["timeout_seconds"]["type"], "integer");
+        let description = properties["timeout_seconds"]["description"]
+            .as_str()
+            .expect("timeout_seconds should carry a description");
+        assert_eq!(
+            description,
+            "Optional timeout in seconds (not milliseconds) for this command. \
+             Clamped to a minimum of 10 seconds and a maximum of 3600 seconds. \
+             Defaults to 120 seconds when omitted."
+        );
+        // The advertised numbers are the constants the resolver enforces.
+        assert!(description.contains(&format!(
+            "minimum of {} seconds",
+            shell::MIN_TIMEOUT_SECONDS
+        )));
+        assert!(description.contains(&format!(
+            "maximum of {} seconds",
+            shell::MAX_TIMEOUT_SECONDS
+        )));
+        assert!(description.contains(&format!(
+            "Defaults to {} seconds",
+            shell::DEFAULT_TIMEOUT_SECONDS
+        )));
+    }
+
+    #[tokio::test]
+    async fn edit_tool_schema_surfaces_batch_entries() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let edit = defs
+            .iter()
+            .find(|def| def.function.name == "edit")
+            .expect("edit should be advertised");
+
+        assert!(edit.function.description.contains(
+            "When no exact match exists, matching falls back to whole-line comparison ignoring leading/trailing whitespace, re-adjusting replacement indentation."
+        ));
+        assert_eq!(
+            edit.function.parameters["required"],
+            json!(["file_path", "edits"])
+        );
+        assert!(
+            edit.function.parameters["properties"]["old_string"].is_null(),
+            "flat old_string must not be advertised at top level"
+        );
+        let edits = &edit.function.parameters["properties"]["edits"];
+        assert_eq!(edits["type"], "array");
+        assert_eq!(edits["minItems"], 1);
+        assert_eq!(
+            edits["items"]["required"],
+            json!(["old_string", "new_string"])
+        );
+        assert_eq!(
+            edits["items"]["properties"]["replace_all"]["type"],
+            "boolean"
+        );
     }
 
     async fn assert_invalid_builtin_args(
@@ -2420,14 +2927,24 @@ mod tests {
             "content",
         )
         .await;
+        assert_invalid_builtin_args(&registry, "delete_file", json!({}), "file_path").await;
+        assert_invalid_builtin_args(
+            &registry,
+            "move_file",
+            json!({ "source_path": "x" }),
+            "destination_path",
+        )
+        .await;
         assert_invalid_builtin_args(
             &registry,
             "edit",
             json!({
                 "file_path": "x",
-                "old_string": "a",
-                "new_string": "b",
-                "replace_all": "yes"
+                "edits": [{
+                    "old_string": "a",
+                    "new_string": "b",
+                    "replace_all": "yes"
+                }]
             }),
             "replace_all",
         )
@@ -2460,6 +2977,14 @@ mod tests {
         assert_invalid_builtin_args(
             &registry,
             "run_shell_command",
+            json!({ "command": "echo ok", "timeout_seconds": 30.5 }),
+            "timeout_seconds",
+        )
+        .await;
+        // Legacy millisecond field: unadvertised, still validated.
+        assert_invalid_builtin_args(
+            &registry,
+            "run_shell_command",
             json!({ "command": "echo ok", "timeout": 1000.5 }),
             "timeout",
         )
@@ -2478,6 +3003,78 @@ mod tests {
             "name",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn edit_tool_accepts_legacy_flat_args_as_one_entry_batch() {
+        let cwd = fresh_tmp_dir("edit-flat-compat");
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let mut registry = registry_with_skills(vec![]);
+        registry.cwd = cwd.clone();
+
+        let result = registry
+            .execute(
+                "edit",
+                json!({
+                    "file_path": "a.txt",
+                    "old_string": "beta",
+                    "new_string": "BETA"
+                }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "{}",
+            result.output
+        );
+        assert_eq!(result.output, "Edited 'a.txt' (1 replacement)");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "alpha\nBETA\n"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn first_class_move_and_delete_dispatch_through_registry() {
+        let cwd = fresh_tmp_dir("move-delete-dispatch");
+        std::fs::write(cwd.join("source.txt"), "content").unwrap();
+        let mut registry = registry_with_skills(vec![]);
+        registry.cwd = cwd.clone();
+
+        let moved = registry
+            .execute(
+                "move_file",
+                json!({
+                    "source_path": "source.txt",
+                    "destination_path": "nested/destination.txt"
+                }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(
+            matches!(moved.status, ToolStatus::Success),
+            "{}",
+            moved.output
+        );
+        assert!(cwd.join("nested/destination.txt").exists());
+
+        let deleted = registry
+            .execute(
+                "delete_file",
+                json!({ "file_path": "nested/destination.txt" }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(
+            matches!(deleted.status, ToolStatus::Success),
+            "{}",
+            deleted.output
+        );
+        assert!(!cwd.join("nested/destination.txt").exists());
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]
@@ -2575,6 +3172,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_allowed_tools_filters_builtins_and_dynamic_tools() {
+        use crate::agents::{AgentMeta, AgentScope};
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": ["read_file", "task"] }).to_string(),
+        )
+        .expect("write setup state");
+
+        let registry = registry_with_agents(vec![AgentMeta {
+            name: "reviewer".into(),
+            description: "Reviews code".into(),
+            max_turns: None,
+            allowed_tools: None,
+            location: PathBuf::from("/tmp/reviewer.md"),
+            scope: AgentScope::Project,
+            bundled_body: None,
+        }]);
+        let advertised: Vec<String> = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+
+        assert_eq!(advertised, vec!["read_file", "task"]);
+
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": [] }).to_string(),
+        )
+        .expect("write empty allowed_tools");
+        assert!(registry.tool_definitions().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn hidden_builtins_still_execute_for_non_llm_callers() {
         let registry = registry_with_skills(vec![]);
         registry.set_builtin_tools(HashSet::new()).await;
@@ -2650,13 +3285,16 @@ mod tests {
         );
     }
 
+    /// End-to-end wiring of the ceiling. The exact clamped value is pinned by
+    /// `shell::timeout_tests`, which serializes against the deployment-cap
+    /// override; asserting the number here would race that test.
     #[tokio::test]
-    async fn shell_timeout_is_clamped_and_reported() {
+    async fn shell_timeout_seconds_above_the_cap_is_clamped_and_reported() {
         let registry = registry_with_skills(vec![]);
         let result = registry
             .execute_with_sandbox_mode_cancellable(
                 "run_shell_command",
-                json!({ "command": "echo ok", "timeout": 601_000 }),
+                json!({ "command": "echo ok", "timeout_seconds": 4000 }),
                 SandboxPolicy::None,
                 false,
                 None,
@@ -2672,13 +3310,116 @@ mod tests {
         assert!(
             result
                 .output
-                .contains(&format!("clamped to {}s", shell::MAX_TIMEOUT_SECONDS)),
+                .contains("exceeded the server maximum; clamped to"),
             "clamped timeout should be reported; output={}",
             result.output
         );
         assert!(
             result.output.contains("ok"),
             "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// The trace that motivated the seconds switch: a model passed a small
+    /// number meaning seconds, got a sub-second budget, and gave up on
+    /// verifying its work. Now the floor rescues it and says so.
+    #[tokio::test]
+    async fn shell_timeout_seconds_below_the_floor_is_raised_and_reported() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout_seconds": 3 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "floored timeout command should still run; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains(&format!(
+                "Notice: requested timeout 3s was below the {}s minimum; raised to {}s.",
+                shell::MIN_TIMEOUT_SECONDS,
+                shell::MIN_TIMEOUT_SECONDS
+            )),
+            "raised timeout should be reported; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// The millisecond field is no longer advertised, but replayed traces and
+    /// in-process callers still pass it and must keep working unchanged: 2000ms
+    /// is a 2 second budget, not floored to the new 10 second minimum.
+    #[tokio::test]
+    async fn legacy_millisecond_timeout_is_still_accepted() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout": 2_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "legacy millisecond timeout should still run; output={}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Notice: requested timeout"),
+            "a legacy millisecond value inside the range should not be clamped; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "command output should be preserved; output={}",
+            result.output
+        );
+    }
+
+    /// Both fields present: the advertised seconds field wins. A legacy
+    /// 600000ms would be a silent 600s budget, so the floor notice is the
+    /// tell that `timeout_seconds` was the one that took effect.
+    #[tokio::test]
+    async fn timeout_seconds_takes_precedence_over_legacy_milliseconds() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout_seconds": 3, "timeout": 600_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "command should still run; output={}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("Notice: requested timeout 3s was below"),
+            "timeout_seconds should win over the legacy millisecond field; output={}",
             result.output
         );
     }
@@ -2770,20 +3511,25 @@ mod tests {
             .collect();
         assert_eq!(permission_values, vec!["readOnly", "inherit"]);
 
-        // Description should surface the catalog so the model can pick.
-        assert!(
-            task_def.function.description.contains("doc-writer"),
-            "catalog should mention each subagent; got: {}",
-            task_def.function.description
-        );
-        assert!(task_def.function.description.contains("bug-hunter"));
-        assert!(task_def.function.description.contains("max_turns: 7"));
+        // The model-facing catalog contains only selection-relevant metadata.
+        // Execution constraints remain enforced from AgentMeta at dispatch,
+        // but repeating long tool allowlists here wastes tokens every turn.
         assert!(
             task_def
                 .function
                 .description
-                .contains("tools: grep_search, read_file")
+                .contains("- doc-writer: Drafts docs from code"),
+            "catalog should mention each subagent; got: {}",
+            task_def.function.description
         );
+        assert!(
+            task_def
+                .function
+                .description
+                .contains("- bug-hunter: Hunts for regressions")
+        );
+        assert!(!task_def.function.description.contains("max_turns:"));
+        assert!(!task_def.function.description.contains("tools:"));
     }
 
     /// MCP schemas often ask for arrays. The host must wrap scalar strings into

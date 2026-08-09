@@ -1,0 +1,133 @@
+{
+  "type": "asgard_q3_live_pilot_summary",
+  "status": "complete",
+  "runs": 20,
+  "ordinary_routing_records_validated": 456,
+  "ordinary_supervisor_model_calls": 961,
+  "bootstrap_variant": "aggressive-compact-bootstrap",
+  "null_outcome_semantics": "solver timeout; no grader reward or partial score",
+  "paired_task_outcomes": {
+    "returns-validated-error-accumulation": {
+      "full": 1,
+      "latest-state": 0,
+      "checkpoint-plus-delta": 0,
+      "decision-log-only": 0,
+      "recent-exact-tail": 0
+    },
+    "psd-tools-blend-range-api": {
+      "full": 0,
+      "latest-state": 0,
+      "checkpoint-plus-delta": 1,
+      "decision-log-only": 0,
+      "recent-exact-tail": 1
+    },
+    "happy-dom-abort-pending-body-reads": {
+      "full": 0,
+      "latest-state": 1,
+      "checkpoint-plus-delta": 1,
+      "decision-log-only": 1,
+      "recent-exact-tail": 1
+    },
+    "drizzle-orm-window-function-builders": {
+      "full": null,
+      "latest-state": null,
+      "checkpoint-plus-delta": null,
+      "decision-log-only": null,
+      "recent-exact-tail": 1
+    }
+  },
+  "mode_totals": [
+    {
+      "mode": "full",
+      "successes": 1,
+      "timeouts": 1,
+      "ordinary_windows": 108,
+      "ordinary_model_calls": 179,
+      "prompt_bytes": 14375060,
+      "estimated_request_tokens": 3287915,
+      "ordinary_raw_input_tokens": 6259135,
+      "ordinary_uncached_input_tokens": 1301695,
+      "ordinary_cached_read_tokens": 4957440,
+      "cached_read_fraction": 0.7920327649108063,
+      "raw_input_tokens_per_window": 57954.9537037037,
+      "uncached_input_tokens_per_window": 12052.731481481482
+    },
+    {
+      "mode": "latest-state",
+      "successes": 1,
+      "timeouts": 1,
+      "ordinary_windows": 89,
+      "ordinary_model_calls": 204,
+      "prompt_bytes": 5492338,
+      "full_control_prompt_bytes": 13163733,
+      "prompt_byte_reduction_fraction": 0.5827674414241006,
+      "estimated_request_tokens": 1409513,
+      "full_control_estimated_request_tokens": 3159212,
+      "estimated_token_reduction_fraction": 0.5538403247392072,
+      "ordinary_raw_input_tokens": 4690700,
+      "ordinary_uncached_input_tokens": 1361676,
+      "ordinary_cached_read_tokens": 3329024,
+      "cached_read_fraction": 0.7097072931545398,
+      "raw_input_tokens_per_window": 52704.49438202247,
+      "uncached_input_tokens_per_window": 15299.730337078652
+    },
+    {
+      "mode": "checkpoint-plus-delta",
+      "successes": 2,
+      "timeouts": 1,
+      "ordinary_windows": 77,
+      "ordinary_model_calls": 170,
+      "prompt_bytes": 4414617,
+      "full_control_prompt_bytes": 10336910,
+      "prompt_byte_reduction_fraction": 0.5729268224256572,
+      "estimated_request_tokens": 1042980,
+      "full_control_estimated_request_tokens": 2357106,
+      "estimated_token_reduction_fraction": 0.5575167175341287,
+      "ordinary_raw_input_tokens": 3293122,
+      "ordinary_uncached_input_tokens": 933442,
+      "ordinary_cached_read_tokens": 2359680,
+      "cached_read_fraction": 0.716548005206002,
+      "raw_input_tokens_per_window": 42767.818181818184,
+      "uncached_input_tokens_per_window": 12122.623376623376
+    },
+    {
+      "mode": "decision-log-only",
+      "successes": 1,
+      "timeouts": 1,
+      "ordinary_windows": 85,
+      "ordinary_model_calls": 195,
+      "prompt_bytes": 6832527,
+      "full_control_prompt_bytes": 10663532,
+      "prompt_byte_reduction_fraction": 0.35926229695751843,
+      "estimated_request_tokens": 1640711,
+      "full_control_estimated_request_tokens": 2450658,
+      "estimated_token_reduction_fraction": 0.3305018488911957,
+      "ordinary_raw_input_tokens": 4829310,
+      "ordinary_uncached_input_tokens": 1076990,
+      "ordinary_cached_read_tokens": 3752320,
+      "cached_read_fraction": 0.776988845197347,
+      "raw_input_tokens_per_window": 56815.41176470588,
+      "uncached_input_tokens_per_window": 12670.470588235294
+    },
+    {
+      "mode": "recent-exact-tail",
+      "successes": 3,
+      "timeouts": 0,
+      "ordinary_windows": 97,
+      "ordinary_model_calls": 213,
+      "prompt_bytes": 6250377,
+      "full_control_prompt_bytes": 15287025,
+      "prompt_byte_reduction_fraction": 0.591131891260726,
+      "estimated_request_tokens": 1504287,
+      "full_control_estimated_request_tokens": 3602286,
+      "estimated_token_reduction_fraction": 0.5824076711288332,
+      "ordinary_raw_input_tokens": 4402258,
+      "ordinary_uncached_input_tokens": 1383762,
+      "ordinary_cached_read_tokens": 3018496,
+      "cached_read_fraction": 0.6856699448328563,
+      "raw_input_tokens_per_window": 45384.1030927835,
+      "uncached_input_tokens_per_window": 14265.58762886598
+    }
+  ],
+  "promotion_decision": "no-go"
+}

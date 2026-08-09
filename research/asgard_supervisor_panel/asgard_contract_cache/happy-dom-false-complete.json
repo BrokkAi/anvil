@@ -1,0 +1,119 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "execution",
+      "text": "When happyDOM.close() is called while a Request body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Request body read is in flight (started but not yet resolved) at the moment happyDOM.close() is invoked."
+    },
+    {
+      "id": "C2",
+      "kind": "execution",
+      "text": "When page.close() is called while a Request body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Request body read is in flight (started but not yet resolved) at the moment page.close() is invoked."
+    },
+    {
+      "id": "C3",
+      "kind": "execution",
+      "text": "When browser.close() is called while a Request body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Request body read is in flight (started but not yet resolved) at the moment browser.close() is invoked."
+    },
+    {
+      "id": "C4",
+      "kind": "execution",
+      "text": "When a navigation swaps out the active page state while a Request body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Request body read is in flight (started but not yet resolved) at the moment navigation discards the active page state."
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "When happyDOM.close() is called while a Response body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Response body read is in flight (started but not yet resolved) at the moment happyDOM.close() is invoked."
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "When page.close() is called while a Response body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Response body read is in flight (started but not yet resolved) at the moment page.close() is invoked."
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "When browser.close() is called while a Response body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Response body read is in flight (started but not yet resolved) at the moment browser.close() is invoked."
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "When a navigation swaps out the active page state while a Response body read is in progress, the read must reject with a DOMException named AbortError.",
+      "adverse_condition": "A Response body read is in flight (started but not yet resolved) at the moment navigation discards the active page state."
+    },
+    {
+      "id": "C9",
+      "kind": "execution",
+      "text": "When any of the four shutdown triggers (happyDOM.close, page.close, browser.close, or navigation that swaps page state) occurs while multipart formData() parsing is in progress, the parsing must reject with a DOMException named AbortError.",
+      "adverse_condition": "Multipart formData() parsing is in flight (started but not yet resolved) at the moment the shutdown trigger fires."
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "The rejected error object must be an instance of DOMException (not a plain Error, TypeError, or other built-in error type).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "The DOMException's name property must be exactly the string \"AbortError\".",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "Successful Request/Response body reads that are not interrupted by shutdown must remain unchanged in behavior and return value.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "A fully buffered Response body (one whose entire body was already read into memory before shutdown) must remain readable after shutdown and must not reject.",
+      "adverse_condition": "The Response body was fully buffered (completely consumed and held in memory) before any shutdown trigger fires."
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "Scheduled timers (setTimeout/setInterval) that are associated with page state discarded by any of the four shutdown triggers must be cleared and must not fire.",
+      "adverse_condition": "Timers were scheduled on a page before that page state was discarded via close or navigation."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "requestAnimationFrame callbacks that are associated with page state discarded by any of the four shutdown triggers must be cleared and must not fire.",
+      "adverse_condition": "requestAnimationFrame callbacks were registered on a page before that page state was discarded via close or navigation."
+    },
+    {
+      "id": "C16",
+      "kind": "delivery",
+      "text": "All work must be performed on a new branch created from main.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "delivery",
+      "text": "All changes must be committed when the work is complete.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1113,
+    "completion_tokens": 2895,
+    "total_tokens": 4008,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 1659
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 1113
+  }
+}

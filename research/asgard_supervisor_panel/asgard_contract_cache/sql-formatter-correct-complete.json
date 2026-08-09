@@ -1,0 +1,131 @@
+{
+  "contracts": [
+    {
+      "id": "C01",
+      "kind": "inspection",
+      "text": "`|>` must tokenize as a distinct token type — not as bitwise `|` followed by `>`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C02",
+      "kind": "execution",
+      "text": "A pipe query begins with a standalone `FROM` clause at base indentation (i.e., the `FROM` keyword is not preceded by `SELECT` or any other clause on the same line).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C03",
+      "kind": "execution",
+      "text": "Each subsequent `|>` step occupies its own line at base indentation.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C04",
+      "kind": "execution",
+      "text": "The pipe operator `|>` and the clause keyword that follows it share the same line.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C05",
+      "kind": "execution",
+      "text": "The body of an indented pipe clause (`WHERE`, `SELECT`, `ORDER BY`, `AGGREGATE`, `EXTEND`, `SET`, `DROP`) starts on the next line, indented one level deeper than the `|>` line.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C06",
+      "kind": "execution",
+      "text": "The body of a one-line pipe clause (`LIMIT`, `JOIN` and its variants, `AS`) stays on the same line as the `|>` and keyword.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C07",
+      "kind": "execution",
+      "text": "An `AGGREGATE` pipe clause with a nested `GROUP BY` sub-clause places `GROUP BY` on its own indented line and its body on a further indented line, forming its own indentation level.",
+      "adverse_condition": "The `AGGREGATE` clause contains a `GROUP BY` sub-clause. When `GROUP BY` is absent, this nested-indentation requirement does not apply."
+    },
+    {
+      "id": "C08",
+      "kind": "execution",
+      "text": "Each `|>` operator resets indentation to base level for the next pipe step.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C09",
+      "kind": "execution",
+      "text": "A semicolon attaches after the final pipe step (not after every pipe step and not on a separate line).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "Pipe queries nested inside parentheses as subqueries are formatted correctly with the pipe structure preserved within the parentheses.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "Traditional (non-pipe) BigQuery query formatting remains unchanged when pipe support is added.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "The `keywordCase` setting governs the casing of all pipe keywords including pipe-exclusive ones (`AGGREGATE`, `EXTEND`, `SET`, `DROP`, `AS`).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "Pipe clauses produce structured parse nodes; `AGGREGATE` and `EXTEND` are promoted to reserved clauses when they appear after `|>`.",
+      "adverse_condition": "The keyword `AGGREGATE` or `EXTEND` appears immediately after `|>` (not in a traditional query context)."
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "`GROUP BY` within an `AGGREGATE` pipe clause nests as a sub-clause parse node with its own indentation level.",
+      "adverse_condition": "`GROUP BY` appears inside an `AGGREGATE` pipe clause."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "Mixed pipe and traditional statements in the same input format independently (each statement follows its own formatting rules without interference from the other style).",
+      "adverse_condition": "The input contains both a pipe-style statement and a traditional-style statement."
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "The indentation pattern for the body of each clause type in a pipe query matches the indentation pattern the formatter already uses for that same clause type in traditional queries.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "delivery",
+      "text": "All work is on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "delivery",
+      "text": "All work is committed when done.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "inspection",
+      "text": "Pipe-exclusive clauses are recognized: `AGGREGATE` (with optional nested `GROUP BY`), `EXTEND` (for computed columns), `SET` (for replacing values), `DROP` (for removing columns), and `AS` (for naming intermediates).",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1359,
+    "completion_tokens": 1625,
+    "total_tokens": 2984,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 446
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 1359
+  }
+}

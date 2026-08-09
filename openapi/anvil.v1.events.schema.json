@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anvil.brokk.ai/schemas/anvil.v1.events.schema.json",
+  "title": "Anvil run event stream (v1)",
+  "description": "Contract for the JSON payload carried in each Server-Sent Event on GET /v1/runs/{run_id}/events. The SSE `id` field is the decimal `seq`; the SSE `event` field equals `type`. Every event shares the envelope fields and one payload variant selected by `type`. The stream ends after a terminal `run.completed`, `run.cancelled`, or `run.failed` event. The synthetic `events.gap` notice is emitted without an envelope `seq` when a reconnect falls behind the bounded replay buffer.",
+  "oneOf": [
+    { "$ref": "#/$defs/runCreated" },
+    { "$ref": "#/$defs/messageDelta" },
+    { "$ref": "#/$defs/thoughtDelta" },
+    { "$ref": "#/$defs/planUpdated" },
+    { "$ref": "#/$defs/toolCallStarted" },
+    { "$ref": "#/$defs/toolCallBlocked" },
+    { "$ref": "#/$defs/toolCallInProgress" },
+    { "$ref": "#/$defs/toolCallFailed" },
+    { "$ref": "#/$defs/toolCallCompleted" },
+    { "$ref": "#/$defs/permissionRequested" },
+    { "$ref": "#/$defs/permissionResolved" },
+    { "$ref": "#/$defs/runTerminal" },
+    { "$ref": "#/$defs/eventsGap" }
+  ],
+  "$defs": {
+    "envelope": {
+      "type": "object",
+      "required": ["type", "run_id", "session_id", "seq", "ts_ms"],
+      "properties": {
+        "type": { "type": "string" },
+        "run_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "seq": { "type": "integer", "format": "int64", "minimum": 1 },
+        "ts_ms": { "type": "integer", "format": "int64", "minimum": 0 }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "thought_tokens",
+        "cached_read_tokens",
+        "cached_write_tokens"
+      ],
+      "properties": {
+        "input_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "output_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "thought_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "cached_read_tokens": { "type": "integer", "format": "int64", "minimum": 0 },
+        "cached_write_tokens": { "type": "integer", "format": "int64", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "toolCallBase": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "required": ["call_id", "tool_name"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "tool_name": { "type": "string" }
+      }
+    },
+    "runCreated": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "run.created" },
+        "prompt_chars": { "type": "integer", "format": "int64", "minimum": 0 }
+      },
+      "required": ["prompt_chars"]
+    },
+    "messageDelta": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "message.delta" },
+        "text": { "type": "string" }
+      },
+      "required": ["text"]
+    },
+    "thoughtDelta": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "thought.delta" },
+        "text": { "type": "string" }
+      },
+      "required": ["text"]
+    },
+    "planUpdated": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "plan.updated" },
+        "plan": {
+          "type": "object",
+          "required": ["plan"],
+          "properties": {
+            "explanation": { "type": ["string", "null"] },
+            "plan": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["step", "status"],
+                "properties": {
+                  "step": { "type": "string" },
+                  "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed"]
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["plan"]
+    },
+    "toolCallStarted": {
+      "allOf": [{ "$ref": "#/$defs/toolCallBase" }],
+      "properties": {
+        "type": { "const": "tool_call.started" },
+        "input": {},
+        "oversized": {
+          "type": "boolean",
+          "description": "Present and true when the rendered card would hide the input (adapters use a static title)."
+        }
+      },
+      "required": ["input"]
+    },
+    "toolCallBlocked": {
+      "allOf": [{ "$ref": "#/$defs/toolCallBase" }],
+      "properties": {
+        "type": { "const": "tool_call.blocked" },
+        "input": {},
+        "reason": { "type": "string" }
+      },
+      "required": ["input", "reason"]
+    },
+    "toolCallInProgress": {
+      "allOf": [{ "$ref": "#/$defs/toolCallBase" }],
+      "properties": {
+        "type": { "const": "tool_call.in_progress" }
+      }
+    },
+    "toolCallFailed": {
+      "allOf": [{ "$ref": "#/$defs/toolCallBase" }],
+      "properties": {
+        "type": { "const": "tool_call.failed" },
+        "reason": { "type": "string" },
+        "permission_notice": { "type": ["string", "null"] },
+        "input": {
+          "description": "Present for post-execution failures; null for pre-execution rejections."
+        }
+      },
+      "required": ["reason"]
+    },
+    "toolCallCompleted": {
+      "allOf": [{ "$ref": "#/$defs/toolCallBase" }],
+      "properties": {
+        "type": { "const": "tool_call.completed" },
+        "input": {},
+        "output": { "type": "string" },
+        "diff": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["path", "old_text", "new_text"],
+              "properties": {
+                "path": { "type": "string" },
+                "old_text": { "type": ["string", "null"] },
+                "new_text": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "permission_notice": { "type": ["string", "null"] }
+      },
+      "required": ["input", "output"]
+    },
+    "permissionRequested": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "permission.requested" },
+        "id": { "type": "string" },
+        "permission_id": { "type": "string" },
+        "tool_name": { "type": "string" },
+        "tool_call_id": { "type": "string" },
+        "input": {},
+        "permission_notice": { "type": ["string", "null"] },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "kind"],
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" },
+              "kind": {
+                "type": "string",
+                "enum": ["allow_once", "allow_always", "reject_once"]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "created_at_ms": { "type": "integer", "format": "int64", "minimum": 0 }
+      },
+      "required": ["permission_id", "tool_name", "tool_call_id", "options"]
+    },
+    "permissionResolved": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": { "const": "permission.resolved" },
+        "permission_id": { "type": "string" },
+        "tool_call_id": { "type": "string" },
+        "tool_name": { "type": "string" },
+        "decision": {
+          "type": "string",
+          "description": "The selected option id, or `cancelled` / `unsupported`."
+        }
+      },
+      "required": ["permission_id", "tool_name", "decision"]
+    },
+    "runTerminal": {
+      "allOf": [{ "$ref": "#/$defs/envelope" }],
+      "properties": {
+        "type": {
+          "enum": ["run.completed", "run.cancelled", "run.failed"]
+        },
+        "stop_reason": {
+          "type": ["string", "null"],
+          "enum": ["end_turn", "max_turns", "time_limit", "cancelled", "error", null]
+        },
+        "error": { "type": ["string", "null"] },
+        "result_text": { "type": ["string", "null"] },
+        "structured_output": {},
+        "usage": { "$ref": "#/$defs/usage" },
+        "cumulative_usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["stop_reason"]
+    },
+    "eventsGap": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "events.gap" },
+        "run_id": { "type": "string" },
+        "missed_through_seq": { "type": "integer", "format": "int64", "minimum": 0 }
+      },
+      "required": ["type", "run_id", "missed_through_seq"],
+      "additionalProperties": false
+    }
+  }
+}

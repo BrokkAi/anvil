@@ -1,0 +1,137 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "`Expr` and `Series` namespaces each expose a `rolling_min` method with signature `rolling_min(window_size, *, min_samples=None, center=False)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "`Expr` and `Series` namespaces each expose a `rolling_max` method with signature `rolling_max(window_size, *, min_samples=None, center=False)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "`Expr` and `Series` namespaces each expose a `rolling_median` method with signature `rolling_median(window_size, *, min_samples=None, center=False)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "`Expr` and `Series` namespaces each expose a `rolling_quantile` method with signature `rolling_quantile(window_size, *, quantile, interpolation='linear', min_samples=None, center=False)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "inspection",
+      "text": "In `rolling_quantile`, the `quantile` parameter is a required keyword-only argument with no default value.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C6",
+      "kind": "inspection",
+      "text": "In `rolling_quantile`, the `interpolation` parameter defaults to the string `'linear'`.",
+      "adverse_condition": "when interpolation is not provided by the caller — the default value must be 'linear', not another interpolation method."
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "When `min_samples` is `None` (or not provided), it defaults to `window_size`.",
+      "adverse_condition": "when min_samples is None or omitted — explicit min_samples values bypass the defaulting logic."
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "When `center=True`, the window is centered around the current observation.",
+      "adverse_condition": "when center is True — center=False takes a different code path and cannot verify centering."
+    },
+    {
+      "id": "C9",
+      "kind": "execution",
+      "text": "Null inputs are excluded from the window.",
+      "adverse_condition": "when the window contains null values — all-non-null windows do not exercise null exclusion."
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "A window with fewer than `min_samples` non-null values produces null.",
+      "adverse_condition": "when the number of non-null values in the window is strictly less than min_samples."
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "For lazy backends (Polars, DuckDB, Dask), the rolling operation must be followed by `.over()` with `order_by` specified.",
+      "adverse_condition": "when the backend is lazy (Polars, DuckDB, or Dask) — eager backends do not require .over()."
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "Calling `rolling_quantile` with `quantile` outside [0, 1] raises `ValueError` with a message starting with `\"Quantile must be between 0.0 and 1.0\"`.",
+      "adverse_condition": "when quantile < 0 or quantile > 1."
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "The error message for an out-of-range quantile must start with the exact string `\"Quantile must be between 0.0 and 1.0\"`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "Calling `rolling_quantile` with `interpolation` not in `{'linear', 'lower', 'higher', 'nearest', 'midpoint'}` raises `ValueError` with a message starting with `\"Interpolation must be one of\"`.",
+      "adverse_condition": "when interpolation is a string not among the five valid values."
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "The error message for an invalid interpolation must start with the exact string `\"Interpolation must be one of\"`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "`rolling_quantile` must accept `interpolation` values `'linear'`, `'lower'`, `'higher'`, `'nearest'`, and `'midpoint'` without raising.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "DuckDB does not support `rolling_quantile` with `.over()`; the operation is not available on the DuckDB backend.",
+      "adverse_condition": "when the backend is DuckDB."
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "All four new methods follow the same validation, classification, and backend-delegation patterns as the existing `rolling_sum`, `rolling_mean`, `rolling_std`, and `rolling_var` methods.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "delivery",
+      "text": "Work must be done on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C20",
+      "kind": "delivery",
+      "text": "All work must be committed when done.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1780,
+    "completion_tokens": 3843,
+    "total_tokens": 5623,
+    "prompt_tokens_details": {
+      "cached_tokens": 1152
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 2533
+    },
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 628
+  }
+}

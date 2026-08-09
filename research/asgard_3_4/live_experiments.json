@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "source_tasks_root": "/tmp/asgard-3-4-tasks.WXle24/full",
+  "output_root": "/tmp/asgard-3-4-live-v2",
+  "runner_root": "/home/jonathan/Projects/brokkbench",
+  "anvil_bin": "/mnt/optane/anvil-asgard-stateful-probe/target/x86_64-unknown-linux-musl/release/anvil",
+  "candidate_model": "deepseek::deepseek-v4-flash",
+  "supervisor_model": "deepseek::deepseek-v4-pro",
+  "candidate_count": 3,
+  "threads": 4,
+  "managed_environment_keys": [
+    "ASGARD_SUPERVISOR_PROMPT_MODE",
+    "ASGARD_SUPERVISOR_CHECKPOINT_INTERVAL",
+    "ASGARD_SUPERVISOR_RECENT_EXACT_TAIL",
+    "ASGARD_CAPTURE_SUPERVISOR_REPLAYS",
+    "ASGARD_SUPERVISOR_FAST_PATH",
+    "ASGARD_WINDOW_POLICY_MODE",
+    "ASGARD_SHADOW_SURVIVOR_STUDY",
+    "ASGARD_SHADOW_PROBE_STEPS"
+  ],
+  "batches": [
+    {
+      "name": "q3-corrected-full",
+      "label": "q3v2full",
+      "purpose": "corrected-bootstrap live control",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads"
+      ],
+      "run_groups": [2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "full",
+        "ASGARD_WINDOW_POLICY_MODE": "dynamic"
+      }
+    },
+    {
+      "name": "q3-corrected-checkpoint",
+      "label": "q3v2checkpoint",
+      "purpose": "corrected-bootstrap structured compression replication",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads"
+      ],
+      "run_groups": [2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "checkpoint-plus-delta",
+        "ASGARD_SUPERVISOR_CHECKPOINT_INTERVAL": "3",
+        "ASGARD_WINDOW_POLICY_MODE": "dynamic"
+      }
+    },
+    {
+      "name": "q3-corrected-recent-tail",
+      "label": "q3v2recent",
+      "purpose": "corrected-bootstrap truncation baseline replication",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads"
+      ],
+      "run_groups": [2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "recent-exact-tail",
+        "ASGARD_SUPERVISOR_RECENT_EXACT_TAIL": "2",
+        "ASGARD_WINDOW_POLICY_MODE": "dynamic"
+      }
+    },
+    {
+      "name": "q4-policy-dynamic",
+      "label": "q4dynamic",
+      "purpose": "Prototype A byte-compatible policy control",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads",
+        "drizzle-orm-window-function-builders"
+      ],
+      "run_groups": [2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "full",
+        "ASGARD_WINDOW_POLICY_MODE": "dynamic"
+      }
+    },
+    {
+      "name": "q4-policy-explicit",
+      "label": "q4explicit",
+      "purpose": "Prototype A explicit probe/work policy",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads",
+        "drizzle-orm-window-function-builders"
+      ],
+      "run_groups": [2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "full",
+        "ASGARD_WINDOW_POLICY_MODE": "explicit-probe"
+      }
+    },
+    {
+      "name": "q4-shadow-one-step",
+      "label": "q4shadow1",
+      "purpose": "Prototype B one-step recall stratum",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads",
+        "drizzle-orm-window-function-builders"
+      ],
+      "run_groups": [2, 2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "full",
+        "ASGARD_WINDOW_POLICY_MODE": "explicit-probe",
+        "ASGARD_SHADOW_SURVIVOR_STUDY": "1",
+        "ASGARD_SHADOW_PROBE_STEPS": "1"
+      }
+    },
+    {
+      "name": "q4-shadow-two-step",
+      "label": "q4shadow2",
+      "purpose": "Prototype B pre-registered two-step gate stratum",
+      "tasks": [
+        "returns-validated-error-accumulation",
+        "psd-tools-blend-range-api",
+        "happy-dom-abort-pending-body-reads",
+        "drizzle-orm-window-function-builders"
+      ],
+      "run_groups": [2, 2, 1],
+      "environment": {
+        "ASGARD_SUPERVISOR_PROMPT_MODE": "full",
+        "ASGARD_WINDOW_POLICY_MODE": "explicit-probe",
+        "ASGARD_SHADOW_SURVIVOR_STUDY": "1",
+        "ASGARD_SHADOW_PROBE_STEPS": "2"
+      }
+    }
+  ]
+}

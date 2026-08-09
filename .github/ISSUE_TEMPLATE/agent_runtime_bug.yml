@@ -1,0 +1,75 @@
+name: Agent or runtime bug
+description: Report incorrect, inconsistent, unsafe, or unexpectedly slow behavior during an Anvil ACP session.
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A minimal transcript or exact sequence of ACP interactions helps us reproduce agent behavior. Please remove secrets, credentials, personal information, and private source code.
+
+  - type: dropdown
+    id: affected-surface
+    attributes:
+      label: Affected surface
+      description: Which Anvil surface is closest to the problem?
+      options:
+        - ACP session lifecycle or streaming
+        - Model or provider routing
+        - Tool execution or MCP integration
+        - Permissions or sandboxing
+        - Context management, compaction, or replay
+        - Session persistence or resume
+        - Subagents or skills
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed-behavior
+    attributes:
+      label: What did Anvil do?
+      description: Describe the incorrect, inconsistent, unsafe, or unexpectedly slow behavior you observed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What should it have done?
+      description: Describe the behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest prompt, prior session state, ACP interaction sequence, or public repository example that demonstrates the behavior.
+      placeholder: |
+        Starting state:
+        Prompt or ACP request:
+        Actions or tool calls:
+        Result:
+    validations:
+      required: true
+
+  - type: textarea
+    id: session-environment
+    attributes:
+      label: Session and environment
+      description: Include the Anvil version or commit, ACP client, provider and model, behavior and permission modes, operating system, and relevant configuration.
+      placeholder: |
+        Anvil version or commit:
+        ACP client:
+        Provider and model:
+        Behavior and permission modes:
+        Operating system:
+    validations:
+      required: true
+
+  - type: textarea
+    id: transcript-logs
+    attributes:
+      label: Transcript, logs, or protocol messages
+      description: Optionally include a minimal transcript, stderr logs, or relevant JSON-RPC messages. Please remove secrets and private data.

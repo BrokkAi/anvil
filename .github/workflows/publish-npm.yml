@@ -1,0 +1,153 @@
+name: Publish npm Packages
+
+# Packages an existing GitHub release as the seven @brokkai npm packages. Version
+# tags dispatch this workflow only after CI, docs, crates.io, and release-asset
+# checks pass. Manual runs default to build-and-validate; registry writes require
+# the `publish` input and the npm-publish environment.
+#
+# Publishing uses npm trusted publishing (OIDC) — no long-lived npm token is
+# stored in the repository. The workflow is safe to re-run after a partial
+# publication: already-published versions are skipped, and the root package
+# is only ever published after every platform package is publicly visible.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing GitHub release tag to package (for example v0.24.2)'
+        required: true
+      publish:
+        description: 'Publish to npmjs.org. Leave unchecked to build and validate only.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  build-and-validate:
+    name: Build and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Update npm (trusted publishing needs npm >= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Verify the release tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft --jq '.'
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'brokk-anvil-*.zip' --pattern 'brokk-anvil-*.zip.sha256' \
+            --dir release-assets
+          ls -l release-assets
+
+      - name: Build and validate npm packages
+        env:
+          TAG: ${{ inputs.tag }}
+        run: node npm/build-npm-packages.mjs --tag "$TAG" --assets-dir release-assets --out npm/dist
+
+      - name: Smoke-test the built tarballs (linux-x64)
+        run: node npm/test-npm-packages.mjs --dist npm/dist
+
+      - name: Regenerate all SDKs and build the TypeScript package
+        run: |
+          npm ci --prefix sdk/typescript
+          node scripts/generate-sdks.mjs
+          git diff --exit-code -- sdk/typescript/src/generated sdk/rust sdk/python
+          npm --prefix sdk/typescript test
+          mkdir -p npm/dist-sdk
+          npm pack ./sdk/typescript --pack-destination "$PWD/npm/dist-sdk"
+
+      - name: Upload tarballs as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-packages-${{ inputs.tag }}
+          path: |
+            npm/dist/*.tgz
+            npm/dist/manifest.json
+          if-no-files-found: error
+
+      - name: Show publication plan (dry run)
+        run: node npm/publish-npm-packages.mjs --dist npm/dist
+
+      - name: Upload the TypeScript SDK tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-sdk-${{ inputs.tag }}
+          path: npm/dist-sdk/*.tgz
+          if-no-files-found: error
+
+      - name: Show TypeScript SDK publication plan (dry run)
+        run: node sdk/typescript/scripts/publish.mjs --tarball npm/dist-sdk/*.tgz
+
+  publish:
+    name: Publish to npm
+    if: ${{ inputs.publish }}
+    needs: build-and-validate
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm (trusted publishing needs npm >= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Download validated npm packages
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-packages-${{ inputs.tag }}
+          path: npm/dist
+
+      - name: Download the validated TypeScript SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: typescript-sdk-${{ inputs.tag }}
+          path: npm/dist-sdk
+
+      - name: Publish and verify npm packages
+        run: node npm/publish-npm-packages.mjs --dist npm/dist --yes-publish
+
+      - name: Publish and verify the TypeScript SDK
+        run: node sdk/typescript/scripts/publish.mjs --tarball npm/dist-sdk/*.tgz --yes-publish

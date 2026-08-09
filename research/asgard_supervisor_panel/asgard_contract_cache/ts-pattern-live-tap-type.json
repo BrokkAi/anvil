@@ -1,0 +1,287 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "delivery",
+      "text": "Work on a new branch created from main.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "delivery",
+      "text": "Commit everything when you are done.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "`matchEach` must be a named export from the package entry point.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "`matchEach` is a top-level function callable with a value argument: `matchEach(value)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "`matchEach` evaluates ALL registered patterns against the input — every `.with()` clause whose pattern matches contributes its handler's result, not just the first match.",
+      "adverse_condition": "Input matches more than one registered pattern; a short-circuit implementation would only collect the first."
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "Results are collected into an array returned in the order clauses were declared.",
+      "adverse_condition": "Patterns are declared in a different order than they would naturally match, and at least two results are not identical, so swapping would be detectable."
+    },
+    {
+      "id": "C7",
+      "kind": "inspection",
+      "text": "`matchEach` exposes the same builder API as `match`, including all `.with()` overloads: single-pattern, multi-pattern, and guard variants.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C8",
+      "kind": "inspection",
+      "text": "`matchEach` exposes a `.when()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C9",
+      "kind": "inspection",
+      "text": "`matchEach` exposes a `.returnType()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "`matchEach` exposes a `.narrow()` method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "Every `.with()` call must accept patterns against the original input type, not the progressively narrowed remainder — because all branches are always evaluated.",
+      "adverse_condition": "Input is a discriminated union and `.narrow()` was called previously; a narrowing-based API would reject a pattern already excluded."
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "Exhaustiveness tracking narrows the internal type so `.exhaustive()` can verify all cases are handled.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "`.narrow()` updates both the internal tracking type and the input type for subsequent `.with()` calls to exclude handled cases.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "`.run()` returns an array of all matching handler results.",
+      "adverse_condition": "Only one pattern matches; a single-value return would be indistinguishable from an array of length 1."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "`.exhaustive()` returns an array of all matching handler results.",
+      "adverse_condition": "Only one pattern matches; a single-value return would be indistinguishable from an array of length 1."
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "If nothing matched, `.run()` throws `NonExhaustiveError`.",
+      "adverse_condition": "At least one pattern matches; the throw path is not triggered."
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "If nothing matched, `.exhaustive()` throws `NonExhaustiveError`.",
+      "adverse_condition": "At least one pattern matches; the throw path is not triggered."
+    },
+    {
+      "id": "C18",
+      "kind": "inspection",
+      "text": "`.exhaustive()` enforces compile-time exhaustiveness: it should be a type error if not all input cases are handled.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "`.exhaustive()` accepts an optional fallback handler function; when provided and no pattern matches at runtime, the fallback is called and its result is returned in a single-element array instead of throwing.",
+      "adverse_condition": "At least one pattern matches; the fallback must not be invoked and the result must not be a single-element fallback array."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "`.otherwise(handler)` returns `[handler(value)]` when no patterns matched.",
+      "adverse_condition": "At least one pattern matches; this branch must not be taken."
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "`.otherwise(handler)` returns the array of all matching results when at least one pattern matched; the default handler is not included in that array.",
+      "adverse_condition": "No patterns match; the other branch is taken instead."
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "`.otherwise()` never throws.",
+      "adverse_condition": "Input fails to match any pattern; a throwing implementation would be detected."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "`.tap(callback)` registers a side-effect callback and returns a new `matchEach` for continued chaining.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "When the expression is evaluated, each tap point calls its callback once per result that has been collected up to that point in declaration order.",
+      "adverse_condition": "Multiple tap points exist and the number of results accumulated differs between them; counting callbacks per tap verifies per-point semantics."
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "Tap does not affect the results array.",
+      "adverse_condition": "A tap callback mutates its argument or returns a value that could be confused with a result."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "Multiple tap points can be stacked.",
+      "adverse_condition": "Only one tap point is used; stacking cannot be verified."
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "Tap callbacks execute inside compiled functions produced by `.toFunction()`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "Tap callbacks execute inside compiled functions produced by `.toExhaustiveFunction()`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C29",
+      "kind": "execution",
+      "text": "Tap callbacks execute inside compiled functions produced by `.toPartialFunction()`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "`matchEach` can be called without a value argument using explicit type parameters to build a reusable compiled matcher.",
+      "adverse_condition": "The zero-argument form must be distinguishable from the value-bearing form at the type level."
+    },
+    {
+      "id": "C31",
+      "kind": "execution",
+      "text": "`.toFunction()` compiles the registered clauses into a reusable `(input) => output[]` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "`.toFunction()` throws `NonExhaustiveError` if no pattern matches at runtime.",
+      "adverse_condition": "At least one pattern matches; the throw path is not triggered."
+    },
+    {
+      "id": "C33",
+      "kind": "inspection",
+      "text": "`.toExhaustiveFunction()` enforces compile-time exhaustiveness: it should be a type error if not all input cases are handled.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "`.toPartialFunction()` compiles into a function that returns `output[] | undefined`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C35",
+      "kind": "execution",
+      "text": "`.toPartialFunction()` returns `undefined` when no patterns match instead of throwing.",
+      "adverse_condition": "At least one pattern matches; the undefined return path is not triggered."
+    },
+    {
+      "id": "C36",
+      "kind": "execution",
+      "text": "`.toPartialFunction()` never throws.",
+      "adverse_condition": "Input fails to match any pattern; a throwing implementation would be detected."
+    },
+    {
+      "id": "C37",
+      "kind": "execution",
+      "text": "Selections via `P.select()` must produce independent results across multiple calls of any compiled function.",
+      "adverse_condition": "The same compiled function is called twice with different inputs; shared mutable selection state would leak values across invocations."
+    },
+    {
+      "id": "C38",
+      "kind": "execution",
+      "text": "Each clause maintains independent selection state. Named selections from one clause must not leak into another clause's handler.",
+      "adverse_condition": "Two clauses use the same named selection via `P.select('name')`; cross-clause leakage would produce the wrong value in at least one handler."
+    },
+    {
+      "id": "C39",
+      "kind": "execution",
+      "text": "`.exhaustive()` with a fallback handler: when patterns do match, the fallback is not called and the result array contains only the matching handler results (not the fallback result).",
+      "adverse_condition": "At least one pattern matches; invoking the fallback or including its result would be detectable."
+    },
+    {
+      "id": "C40",
+      "kind": "execution",
+      "text": "`.exhaustive()` with a fallback handler: when no pattern matches, the fallback is called exactly once and its return value is wrapped in a single-element array.",
+      "adverse_condition": "At least one pattern matches; this path should not execute."
+    },
+    {
+      "id": "C41",
+      "kind": "execution",
+      "text": "The `.with()` multi-pattern overload submits each of the N patterns against the same original input, and the handler result is included once per `.with()` clause (not once per sub-pattern) when at least one sub-pattern matches.",
+      "adverse_condition": "A clause supplies multiple patterns and more than one sub-pattern matches the input; result duplication would signal per-sub-pattern rather than per-clause semantics."
+    },
+    {
+      "id": "C42",
+      "kind": "execution",
+      "text": "A guard-function `.with(pattern, guard).handler(...)` only contributes its result when both the pattern matches and the guard returns true.",
+      "adverse_condition": "Input matches the pattern but the guard returns false; the handler must be skipped."
+    },
+    {
+      "id": "C43",
+      "kind": "execution",
+      "text": "The ordering of results in the output array of `.run()` matches the textual declaration order of the `.with()` clauses, even when a later clause's pattern is more general than an earlier one.",
+      "adverse_condition": "Two clauses both match, the later clause is more general, and results are distinguishable; swapping would be detected."
+    },
+    {
+      "id": "C44",
+      "kind": "execution",
+      "text": "`.toFunction()` with explicit type parameters (no-argument `matchEach` call) produces a function whose parameter type matches the explicit type argument.",
+      "adverse_condition": "The explicit type parameter differs from the type that would be inferred from a value argument."
+    },
+    {
+      "id": "C45",
+      "kind": "execution",
+      "text": "`.toExhaustiveFunction()` throws `NonExhaustiveError` at runtime if no pattern matches.",
+      "adverse_condition": "At least one pattern matches; throw path not triggered."
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1813,
+    "completion_tokens": 5228,
+    "total_tokens": 7041,
+    "prompt_tokens_details": {
+      "cached_tokens": 1152
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 2559
+    },
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 661
+  }
+}

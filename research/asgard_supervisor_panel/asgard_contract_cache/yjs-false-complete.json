@@ -1,0 +1,167 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "execution",
+      "text": "Conflicts must be detected for set-set on the same key within the same transaction or merged update when mapConflictPolicy is 'collect' or 'error'.",
+      "adverse_condition": "Two or more set operations target the same Y.Map key within a single transaction or merged update, and mapConflictPolicy is 'collect' or 'error'."
+    },
+    {
+      "id": "C2",
+      "kind": "execution",
+      "text": "Conflicts must be detected for delete-set on the same key within the same transaction or merged update when mapConflictPolicy is 'collect' or 'error'.",
+      "adverse_condition": "A delete and a set operation target the same Y.Map key within a single transaction or merged update, and mapConflictPolicy is 'collect' or 'error'."
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "Conflicts involving Yjs types or subdocs must be marked as ambiguous, either by setting conflict.type to 'ambiguous' or by exposing an ambiguous boolean flag on the conflict object.",
+      "adverse_condition": "A detected conflict involves a Yjs type or subdoc value."
+    },
+    {
+      "id": "C4",
+      "kind": "execution",
+      "text": "When mapConflictPolicy is 'allow', conflicts are neither blocked nor collected, and updates apply normally.",
+      "adverse_condition": "mapConflictPolicy is 'allow' and conflicting writes occur."
+    },
+    {
+      "id": "C5",
+      "kind": "inspection",
+      "text": "The mapConflictPolicy is configured via the Y.Doc constructor options as new Y.Doc({ mapConflictPolicy: 'allow' | 'collect' | 'error' }).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "In 'error' mode, conflicting map writes throw a MapConflictError.",
+      "adverse_condition": "mapConflictPolicy is 'error' and a conflicting map write is detected."
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "In 'error' mode, merged updates apply atomically with no partial application across all tested conflict types.",
+      "adverse_condition": "mapConflictPolicy is 'error' and a merged update containing multiple conflicts across different conflict types is applied."
+    },
+    {
+      "id": "C8",
+      "kind": "inspection",
+      "text": "The thrown MapConflictError must expose an err.conflicts array.",
+      "adverse_condition": "A MapConflictError is thrown."
+    },
+    {
+      "id": "C9",
+      "kind": "inspection",
+      "text": "In 'collect' mode, recorded conflicts are accessible via the Y.Doc instance method getMapConflicts().",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "In 'collect' mode, recorded conflicts are accessible via the Y.Doc instance method getMapConflictSummary().",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "getMapConflictSummary() returns an object with fields: byType, byKey, byParent, and bySource.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "Each field of the summary object (byType, byKey, byParent, bySource) is a plain JavaScript object mapping strings to counts (numbers).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "The summary fields support index access such that summary.byType[type] retrieves the count for a given type string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "The summary object must include an overall conflict count, accessible as either count or total.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "Each conflict object must include a key field.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "Each conflict object must include a parentId field.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "Each conflict object must include a type field whose value correctly reflects the classification of the conflict (e.g., set-set, delete-set, or ambiguous for Yjs-type/subdoc conflicts).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "Each conflict object must include a source field whose value is one of 'local', 'remote', or 'mixed' and correctly reflects the origin of the conflicting writes.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "inspection",
+      "text": "Each conflict object must include a top-level message field whose value is a string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C20",
+      "kind": "inspection",
+      "text": "Each conflict object must include a writes field whose value is an array.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C21",
+      "kind": "inspection",
+      "text": "Each write in the writes array must have a snapshot.summary property whose value is a non-empty string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C22",
+      "kind": "inspection",
+      "text": "Each conflict object must include a resolution object.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "The resolution object must include a winner field.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "inspection",
+      "text": "The resolution object must include a strategy field whose value is a string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "inspection",
+      "text": "The resolution object must include a deterministic field whose value is a boolean.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1279,
+    "completion_tokens": 2887,
+    "total_tokens": 4166,
+    "prompt_tokens_details": {
+      "cached_tokens": 256
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 1519
+    },
+    "prompt_cache_hit_tokens": 256,
+    "prompt_cache_miss_tokens": 1023
+  }
+}

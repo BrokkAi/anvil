@@ -32,5 +32,22 @@ brokk-acp-sandbox/target/
 
 .claude/
 .bifrost/
+# Astro / Starlight docs
+docs/node_modules/
+docs/dist/
+docs/.astro/
+
 # Mjolnir linked worktrees
 .mjolnir/worktrees/
+__pycache__/
+*.py[cod]
+*.log
+
+# npm packaging build output (npm/build-npm-packages.mjs)
+/npm/dist/
+
+# PyPI packaging build output
+/python/dist/
+
+# Derived contract consumed by SDK generators
+/sdk/.generated/

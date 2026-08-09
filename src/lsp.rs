@@ -120,12 +120,29 @@ impl LspManager {
         }
     }
 
-    pub async fn change_file(&self, path: &Path) {
+    /// Open `path` and wait until every client has published diagnostics for
+    /// this file after the `didOpen`. Returns the aggregated diagnostics
+    /// (possibly empty if the server publishes a clean set).
+    pub async fn open_file_and_wait(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
         for client in &self.clients {
-            if let Err(err) = client.change_file(path).await {
-                tracing::debug!(server = %client.name, path = %path.display(), %err, "LSP didChange failed");
-            }
+            out.extend(client.open_file_and_wait(path, timeout).await);
         }
+        sort_diagnostics(&mut out);
+        out
+    }
+
+    /// Notify every client of an on-disk change and wait until each has
+    /// published diagnostics for this file *after* the change notification.
+    /// Publishing an empty set still counts, so a clean result is not
+    /// indistinguishable from silence.
+    pub async fn change_file_and_wait(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        for client in &self.clients {
+            out.extend(client.change_file_and_wait(path, timeout).await);
+        }
+        sort_diagnostics(&mut out);
+        out
     }
 
     pub async fn diagnostics_for_file(&self, path: &Path) -> Vec<Diagnostic> {
@@ -144,21 +161,6 @@ impl LspManager {
         }
         sort_diagnostics(&mut out);
         out
-    }
-
-    pub async fn wait_for_file_diagnostics(
-        &self,
-        path: &Path,
-        timeout: Duration,
-    ) -> Vec<Diagnostic> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let diagnostics = self.diagnostics_for_file(path).await;
-            if !diagnostics.is_empty() || Instant::now() >= deadline {
-                return diagnostics;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
 }
 
@@ -272,8 +274,21 @@ struct LspClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
+    /// Per-file publish count, incremented on every `publishDiagnostics`
+    /// (including empty sets). Used to wait for a publish that postdates a
+    /// specific `didOpen`/`didChange`/`didSave`.
+    publishes: Arc<RwLock<HashMap<PathBuf, u64>>>,
     open_files: Mutex<HashMap<PathBuf, i32>>,
+    /// Whether the server wants `textDocument/didSave`, and whether it asked
+    /// for the saved text, from the `initialize` response capabilities.
+    save_support: Mutex<SaveSupport>,
     child: Mutex<tokio::process::Child>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SaveSupport {
+    send_save: bool,
+    include_text: bool,
 }
 
 impl LspClient {
@@ -310,7 +325,9 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             diagnostics: Arc::new(RwLock::new(HashMap::new())),
+            publishes: Arc::new(RwLock::new(HashMap::new())),
             open_files: Mutex::new(HashMap::new()),
+            save_support: Mutex::new(SaveSupport::default()),
             child: Mutex::new(child),
         };
         client.spawn_reader(stdout);
@@ -321,6 +338,7 @@ impl LspClient {
     fn spawn_reader(&self, stdout: tokio::process::ChildStdout) {
         let pending = self.pending.clone();
         let diagnostics = self.diagnostics.clone();
+        let publishes = self.publishes.clone();
         let name = self.name.clone();
         let stdin = self.stdin.clone();
         tokio::spawn(async move {
@@ -345,7 +363,8 @@ impl LspClient {
                     == Some("textDocument/publishDiagnostics")
                 {
                     if let Some((path, diags)) = parse_publish_diagnostics(&name, &msg) {
-                        diagnostics.write().await.insert(path, diags);
+                        diagnostics.write().await.insert(path.clone(), diags);
+                        *publishes.write().await.entry(path).or_insert(0) += 1;
                     }
                     continue;
                 }
@@ -384,9 +403,10 @@ impl LspClient {
                 }
             }
         });
-        let _ = self
+        let result = self
             .call("initialize", params, Duration::from_secs(30))
             .await?;
+        *self.save_support.lock().await = save_support_from_initialize(&result);
         self.notify("initialized", json!({})).await?;
         Ok(())
     }
@@ -436,6 +456,74 @@ impl LspClient {
             .get(path)
             .cloned()
             .unwrap_or_default()
+    }
+
+    async fn publish_count(&self, path: &Path) -> u64 {
+        self.publishes.read().await.get(path).copied().unwrap_or(0)
+    }
+
+    /// Wait until this client has published diagnostics for `path` at least
+    /// once after `baseline` was captured. An empty publish advances the
+    /// count, so a clean result is not mistaken for silence.
+    async fn wait_for_publish_after(&self, path: &Path, baseline: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.publish_count(path).await <= baseline && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Open `path` (if not already open) and wait for the resulting publish.
+    /// If the file was already open, returns the cached diagnostics without
+    /// waiting, since no notification was sent.
+    async fn open_file_and_wait(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
+        let path = path.to_path_buf();
+        if self.open_files.lock().await.contains_key(&path) {
+            return self.diagnostics_for_file(&path).await;
+        }
+        let baseline = self.publish_count(&path).await;
+        if self.open_file(&path).await.is_err() {
+            return Vec::new();
+        }
+        self.wait_for_publish_after(&path, baseline, timeout).await;
+        self.diagnostics_for_file(&path).await
+    }
+
+    /// Notify the server of an on-disk change (opening the file first if
+    /// needed), send `didSave` if the server requested save support, and wait
+    /// until the resulting diagnostics are published.
+    async fn change_file_and_wait(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
+        let path = path.to_path_buf();
+        let baseline = self.publish_count(&path).await;
+        let notified = if !self.open_files.lock().await.contains_key(&path) {
+            self.open_file(&path).await
+        } else {
+            self.change_file(&path).await
+        };
+        if notified.is_err() {
+            return Vec::new();
+        }
+        if self.save_file(&path).await.is_err() {
+            tracing::debug!(server = %self.name, path = %path.display(), "LSP didSave failed");
+        }
+        self.wait_for_publish_after(&path, baseline, timeout).await;
+        self.diagnostics_for_file(&path).await
+    }
+
+    /// Send `textDocument/didSave` when the server opted in via its
+    /// `initialize` capabilities, including the current text only if the
+    /// server requested `includeText`.
+    async fn save_file(&self, path: &Path) -> anyhow::Result<()> {
+        let save_support = *self.save_support.lock().await;
+        if !save_support.send_save {
+            return Ok(());
+        }
+        let mut params = json!({"textDocument": {"uri": file_uri(path)}});
+        if save_support.include_text
+            && let Ok(text) = tokio::fs::read_to_string(path).await
+        {
+            params["text"] = json!(text);
+        }
+        self.notify("textDocument/didSave", params).await
     }
 
     async fn all_diagnostics(&self) -> Vec<Diagnostic> {
@@ -559,11 +647,38 @@ fn parse_publish_diagnostics(server_name: &str, msg: &Value) -> Option<(PathBuf,
 }
 
 fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
 fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://").map(PathBuf::from)
+    url::Url::parse(uri).ok()?.to_file_path().ok()
+}
+
+/// Extract whether the server wants `textDocument/didSave` notifications from
+/// its `initialize` response. `true` (or an object) means send them; an
+/// object with `includeText: true` additionally requests the saved text.
+fn save_support_from_initialize(result: &Value) -> SaveSupport {
+    let did_save = result
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("textDocument"))
+        .and_then(|text_document| text_document.get("synchronization"))
+        .and_then(|synchronization| synchronization.get("didSave"));
+    match did_save {
+        Some(Value::Object(save_options)) => SaveSupport {
+            send_save: true,
+            include_text: save_options
+                .get("includeText")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        Some(Value::Bool(true)) => SaveSupport {
+            send_save: true,
+            include_text: false,
+        },
+        _ => SaveSupport::default(),
+    }
 }
 
 fn language_id(path: &Path) -> &'static str {
@@ -595,5 +710,107 @@ fn language_id(path: &Path) -> &'static str {
         "toml" => "toml",
         "md" => "markdown",
         _ => "plaintext",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uri_round_trips_through_encoding() {
+        let cases = [
+            PathBuf::from("/tmp/plain.rs"),
+            PathBuf::from("/tmp/with space.rs"),
+            PathBuf::from("/tmp/with#hash.rs"),
+            PathBuf::from("/tmp/with%percent.rs"),
+            PathBuf::from("/tmp/caf\u{e9}.rs"),
+            PathBuf::from("/tmp/日本語/ログ.rs"),
+        ];
+        for path in cases {
+            let uri = file_uri(&path);
+            assert!(!uri.contains(' '), "space must be percent-encoded in {uri}");
+            assert_eq!(
+                path_from_file_uri(&uri),
+                Some(path.clone()),
+                "round-trip {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_from_file_uri_decodes_inbound_percent_encoding() {
+        assert_eq!(
+            path_from_file_uri("file:///tmp/my%20file.rs"),
+            Some(PathBuf::from("/tmp/my file.rs"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///tmp/with%23hash.rs"),
+            Some(PathBuf::from("/tmp/with#hash.rs"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///tmp/caf%C3%A9.rs"),
+            Some(PathBuf::from("/tmp/caf\u{e9}.rs"))
+        );
+    }
+
+    #[test]
+    fn path_from_file_uri_rejects_non_file_schemes() {
+        assert_eq!(path_from_file_uri("https://example.com/foo.rs"), None);
+        assert_eq!(path_from_file_uri("not a uri"), None);
+    }
+
+    #[test]
+    fn save_support_from_initialize_parses_capabilities() {
+        let absent = serde_json::json!({});
+        assert_eq!(
+            save_support_from_initialize(&absent),
+            SaveSupport::default()
+        );
+
+        let bool_true = serde_json::json!({
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {"didSave": true}
+                }
+            }
+        });
+        assert_eq!(
+            save_support_from_initialize(&bool_true),
+            SaveSupport {
+                send_save: true,
+                include_text: false,
+            }
+        );
+
+        let include_text = serde_json::json!({
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {"didSave": {"includeText": true}}
+                }
+            }
+        });
+        assert_eq!(
+            save_support_from_initialize(&include_text),
+            SaveSupport {
+                send_save: true,
+                include_text: true,
+            }
+        );
+
+        let no_text = serde_json::json!({
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {"didSave": {"includeText": false}}
+                }
+            }
+        });
+        assert_eq!(
+            save_support_from_initialize(&no_text),
+            SaveSupport {
+                send_save: true,
+                include_text: false,
+            }
+        );
     }
 }

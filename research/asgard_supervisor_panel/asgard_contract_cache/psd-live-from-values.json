@@ -1,0 +1,275 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "`BlendRangeChannel` and `BlendRanges` are defined in a new module `psd_tools.api.blend_range`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "`BlendRangeChannel` has four mutable attributes: `this_layer_black`, `this_layer_white`, `underlying_black`, `underlying_white`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "Each of the four attributes is a `(left_handle, right_handle)` tuple with values in the range 0–255.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "`BlendRangeChannel.from_raw(raw_pair)` exists and parses a 2-element list of `(black_uint16, white_uint16)` pairs.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "In `from_raw`, each uint16 encodes a split slider: low byte = left handle, high byte = right handle.",
+      "adverse_condition": "Homogeneous bytes (e.g., 0x0101) hide whether low/high are swapped; use distinguishable bytes like 0x0305 to verify."
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "`from_raw` maps the first `(black_uint16, white_uint16)` pair to `this_layer_black` / `this_layer_white` and the second pair to `underlying_black` / `underlying_white`.",
+      "adverse_condition": "Swapped pairs still produce a valid object; verification requires raw data where the two pairs carry distinguishable values so the mapping can be confirmed."
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "`BlendRangeChannel.to_raw()` converts back to a 2-element list of `(black_uint16, white_uint16)` pairs matching the format parsed by `from_raw`.",
+      "adverse_condition": "A round-trip that passes with homogeneous handles does not prove the encoding is reversible for split sliders; use split (left≠right) handles."
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "`BlendRangeChannel.default()` returns a `BlendRangeChannel` set to full range.",
+      "adverse_condition": "\"Full range\" is not defined with exact handle values; both (0,255) and (0,0)/(255,255) interpretations are plausible. Verification must check the actual values chosen."
+    },
+    {
+      "id": "C9",
+      "kind": "inspection",
+      "text": "`BlendRangeChannel.from_values(this_layer_black, this_layer_white, underlying_black, underlying_white)` exists, with all four parameters defaulting to full range.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "`from_values` creates non-split channels — each slider has `left_handle == right_handle`.",
+      "adverse_condition": "If explicit values with left≠right are passed, it is ambiguous whether the function rejects them, clamps them, or silently stores them as non-split."
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "`from_values` maps its first positional argument to `this_layer_black`, second to `this_layer_white`, third to `underlying_black`, fourth to `underlying_white`.",
+      "adverse_condition": "Calling with four pairwise-distinct values and reading back each attribute is required; green tests using the same value for multiple parameters prove nothing about position."
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "`BlendRangeChannel.is_default` is a property that checks whether all handles are at their default positions.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "Boolean split properties exist: `this_layer_black_split`, `this_layer_white_split`, `underlying_black_split`, `underlying_white_split`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "Each split property is `True` when the corresponding slider's `left_handle != right_handle`.",
+      "adverse_condition": "A slider at (0,0) or (255,255) is not split; the property must return False for those and True for e.g. (0,128)."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "`BlendRangeChannel.describe()` returns a non-empty string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "`BlendRanges` constructor takes `composite` (a `BlendRangeChannel`) and `channels` (a list of `BlendRangeChannel`).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "inspection",
+      "text": "`BlendRanges.channel_count` property returns the number of channels (excluding `composite`).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "`len(blend_ranges)` operates on channels only — it returns the number of channels, not counting `composite`.",
+      "adverse_condition": "When both composite and channels are non-empty, len() must equal len(channels), not 1+len(channels)."
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "Indexing on `BlendRanges` (including negative indices) operates on channels only and does not expose `composite`.",
+      "adverse_condition": "If channels are [A, B, C] and composite is D, blend_ranges[0] must be A (not D), blend_ranges[-1] must be C."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "Iteration over `BlendRanges` yields channel objects only, excluding `composite`.",
+      "adverse_condition": "`list(blend_ranges)` must equal the channels list even when composite differs from all channels."
+    },
+    {
+      "id": "C21",
+      "kind": "inspection",
+      "text": "`BlendRanges.from_raw(raw_blending_ranges)` classmethod exists and creates a `BlendRanges` from a `LayerBlendingRanges` object.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "When `from_raw` receives null/empty ranges, `channels` is an empty list and `composite` defaults to full range.",
+      "adverse_condition": "A non-null but empty LayerBlendingRanges (zero channel ranges) must also produce empty channels; distinguishing 'no ranges at all' from 'zero extra channels' may require two test fixtures."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "`BlendRanges.from_channels(composite, channels)` classmethod exists and creates a `BlendRanges` from explicit objects.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "`BlendRanges.apply_to_raw(raw)` writes the blend ranges back into a `LayerBlendingRanges` object.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "`BlendRanges.is_default` returns `True` only when every channel and the composite `BlendRangeChannel` are all at their default positions.",
+      "adverse_condition": "Composite at default but one channel non-default → False; all channels at default but composite non-default → False."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "`BlendRanges.describe()` returns a non-empty string.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "`BlendRanges.compute_visibility(source_color, backdrop_color)` accepts float arrays in [0, 1] and returns a weight array of shape `(H, W, 1)` with values in [0, 1].",
+      "adverse_condition": "Verification requires checking the returned shape has a trailing dimension of size 1, not (H, W), and that values stay within [0,1] for extreme inputs like all-zeros or all-ones."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`BlendRanges.to_pil_mask(source_color, backdrop_color)` returns a PIL Image in `'L'` mode.",
+      "adverse_condition": "The returned image's `.mode` attribute must equal `'L'`; a mode of `'1'` or `'RGB'` would be wrong."
+    },
+    {
+      "id": "C29",
+      "kind": "inspection",
+      "text": "`Layer` gains a `blend_ranges` property.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "The `Layer.blend_ranges` property persists through save (a round-trip save-then-load preserves the blend ranges).",
+      "adverse_condition": "A save/load cycle that does not exercise non-default, split-slider blend ranges may silently succeed when the persistence code is a no-op; use at least one channel with split sliders."
+    },
+    {
+      "id": "C31",
+      "kind": "execution",
+      "text": "Writing a `LayerBlendingRanges` validates that `composite_ranges` has exactly 2 pairs, raising `ValueError` otherwise.",
+      "adverse_condition": "Must test with 0 pairs, 1 pair, and 3+ pairs in composite_ranges — each must raise ValueError."
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "Writing a `LayerBlendingRanges` validates that each channel range has exactly 2 pairs, raising `ValueError` otherwise.",
+      "adverse_condition": "Must test with at least one channel range that has 0, 1, or 3+ pairs while composite_ranges is valid."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "The compositing engine applies blend-if during layer composition: the composite (gray) range modulates visibility based on luminosity `0.299*R + 0.587*G + 0.114*B`.",
+      "adverse_condition": "Using a pure-red source (1,0,0) yields luminosity 0.299; pure-green yields 0.587; pure-blue yields 0.114. Any other weighting fails this contract."
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "Per-channel ranges modulate visibility based on individual channel values (R for the red-channel range, G for green, B for blue).",
+      "adverse_condition": "A source with (R=1,G=0,B=0) and a per-channel range that blocks high red must block this pixel even if the gray-range luminosity would allow it."
+    },
+    {
+      "id": "C35",
+      "kind": "execution",
+      "text": "The \"This Layer\" slider uses source (foreground) color values; the \"Underlying Layer\" slider uses backdrop (background) color values.",
+      "adverse_condition": "Swapping source and backdrop images must change the result when this_layer and underlying ranges differ; if the result is identical the source/backdrop distinction is not honored."
+    },
+    {
+      "id": "C36",
+      "kind": "execution",
+      "text": "Split sliders fade linearly between the left and right handle positions.",
+      "adverse_condition": "At a value exactly midway between left_handle/255 and right_handle/255 the weight must be 0.5; a step function or non-linear ramp fails this contract."
+    },
+    {
+      "id": "C37",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C38",
+      "kind": "delivery",
+      "text": "Everything must be committed when the work is done.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C39",
+      "kind": "execution",
+      "text": "`BlendRangeChannel.from_raw` returns a `BlendRangeChannel` instance (typed public API shape).",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests."
+    },
+    {
+      "id": "C40",
+      "kind": "execution",
+      "text": "`BlendRanges.from_raw` returns a `BlendRanges` instance (typed public API shape).",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests."
+    },
+    {
+      "id": "C41",
+      "kind": "execution",
+      "text": "`BlendRanges(composite, channels)` constructor signature: first parameter is `composite: BlendRangeChannel`, second is `channels: list[BlendRangeChannel]` (typed public API shape).",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests."
+    },
+    {
+      "id": "C42",
+      "kind": "execution",
+      "text": "`compute_visibility(source_color, backdrop_color)` signature: both parameters are float arrays in [0,1]; returns a weight array of shape `(H, W, 1)` in [0,1] (typed public API shape with container/element relationship).",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests; the trailing singleton dimension distinguishes this from a plain (H,W) return."
+    },
+    {
+      "id": "C43",
+      "kind": "execution",
+      "text": "`to_pil_mask(source_color, backdrop_color)` signature: returns a `PIL.Image.Image` in `'L'` mode (typed public API shape).",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests."
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1892,
+    "completion_tokens": 10294,
+    "total_tokens": 12186,
+    "prompt_tokens_details": {
+      "cached_tokens": 384
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 7039
+    },
+    "prompt_cache_hit_tokens": 384,
+    "prompt_cache_miss_tokens": 1508
+  }
+}

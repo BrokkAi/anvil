@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.21";
+
 struct SmokeCase {
     name: &'static str,
     prompt: String,
@@ -143,7 +145,7 @@ fn session_load_replays_tool_updates_in_order() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -283,7 +285,7 @@ fn additional_directories_scope_builtin_file_tools() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let allowed_args = format!(
         r#"{{"file_path":{}}}"#,
@@ -415,7 +417,7 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -528,7 +530,7 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     // A fake stdio MCP server supplied via session/load; spawning it leaves a
     // log line, proving the load-time mcpServers were applied (#145). It lives
@@ -574,35 +576,34 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         }),
     );
     assert_response_ok(&case, "initialize", &initialize, &client);
-    // Anvil advertises stdio-only MCP support (#159).
     assert_eq!(
-        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["http"], false,
-        "{}: should advertise mcpCapabilities.http=false: {initialize}",
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["http"], true,
+        "{}: should advertise mcpCapabilities.http=true: {initialize}",
         case.name
     );
     assert_eq!(
-        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], false,
-        "{}: should advertise mcpCapabilities.sse=false: {initialize}",
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], true,
+        "{}: should advertise mcpCapabilities.sse=true: {initialize}",
+        case.name
+    );
+    // The ACP registry requires at least one advertised auth method; Anvil
+    // declares an explicit no-auth method instead of an empty list.
+    assert_eq!(
+        initialize["result"]["authMethods"][0]["id"], "none",
+        "{}: should advertise the no-auth authMethod: {initialize}",
         case.name
     );
 
-    let http_server = json!({
-        "type": "http",
-        "name": "remote",
-        "url": "https://example.com/mcp",
-        "headers": []
-    });
-
-    // session/new with an HTTP transport is rejected, not silently dropped (#159).
-    let new_http = client.request(
-        "session/new",
-        json!({ "cwd": cwd, "mcpServers": [http_server] }),
-    );
+    // Clients may authenticate with any advertised method id, so "none" must
+    // succeed as a no-op while unknown ids are rejected.
+    let authenticate = client.request("authenticate", json!({ "methodId": "none" }));
+    assert_response_ok(&case, "authenticate", &authenticate, &client);
+    let bad_authenticate = client.request("authenticate", json!({ "methodId": "oauth" }));
     assert_response_invalid_params_contains(
         &case,
-        "session/new (http mcp)",
-        &new_http,
-        "unsupported 'http' transport",
+        "authenticate",
+        &bad_authenticate,
+        "unknown authMethod id",
         &client,
     );
 
@@ -612,30 +613,6 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         .as_str()
         .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
         .to_string();
-
-    // session/load and session/resume also reject unsupported transports (#159).
-    let load_http = client.request(
-        "session/load",
-        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
-    );
-    assert_response_invalid_params_contains(
-        &case,
-        "session/load (http mcp)",
-        &load_http,
-        "unsupported 'http' transport",
-        &client,
-    );
-    let resume_http = client.request(
-        "session/resume",
-        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
-    );
-    assert_response_invalid_params_contains(
-        &case,
-        "session/resume (http mcp)",
-        &resume_http,
-        "unsupported 'http' transport",
-        &client,
-    );
 
     // session/load with a stdio MCP server applies it; the next prompt builds a
     // registry that spawns the server, leaving a spawn-log entry (#145).
@@ -736,7 +713,7 @@ fn session_list_without_cwd_and_cursor_semantics() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // One plain text response: the prompt names the session (auto-rename) and
@@ -903,7 +880,7 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1204,7 +1181,7 @@ fn session_fork_creates_independent_session() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // One turn to name the source, one to exercise the fork.
@@ -1357,7 +1334,7 @@ fn session_delete_removes_session_and_is_idempotent() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![text_sse_body("Summary.")]);
@@ -1489,7 +1466,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1654,7 +1631,7 @@ fn invalid_prompt_requests_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1758,7 +1735,7 @@ fn llm_request_cancelled_mid_send_is_not_reported_as_error() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_hanging_smoke_server();
@@ -1871,7 +1848,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // Turn 0 returns a tool call (read_file is auto-allowed, so no permission
@@ -2002,7 +1979,7 @@ fn empty_completion_is_reported_in_transcript_and_survives_reload() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // An empty completion is retried on the transient-failure budget
@@ -2105,7 +2082,7 @@ fn run_smoke_case(case: &SmokeCase) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -2342,7 +2319,7 @@ fn run_p2t_prefix_tail_case(case: SmokeCase, prefix_steps: Vec<Value>) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let p2t_dir = temp.path().join("p2t");
     std::fs::create_dir_all(&p2t_dir).expect("create p2t dir");
@@ -2469,7 +2446,7 @@ fn run_direct_prompt_case(case: &SmokeCase) -> (OpenAiSmokeServer, usize) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider =
@@ -2554,7 +2531,7 @@ fn run_auto_classifier_denial_case(case: &SmokeCase) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -2699,7 +2676,7 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let classifier_body = match escalation_case {
         AutoEscalationCase::ApproveOutside => text_sse_body(
@@ -3224,27 +3201,53 @@ fn text_sse_body(text: &str) -> String {
     )
 }
 
-fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
+fn install_fake_managed_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
     let fake_bifrost = make_fake_bifrost_binary(temp, bifrost_log);
     seed_fake_managed_bifrost(config_home, &fake_bifrost);
+
+    // A batch script copied to `bifrost.exe` is enough to satisfy bundled
+    // Bifrost discovery, but Windows cannot execute that text file as a PE
+    // binary. Persist an equivalent custom Bifrost command through cmd.exe so
+    // smoke tests exercise the setup/default MCP merge with a runnable shim.
+    #[cfg(windows)]
+    persist_windows_fake_bifrost(config_home, &fake_bifrost);
+}
+
+#[cfg(windows)]
+fn persist_windows_fake_bifrost(config_home: &Path, fake_bifrost: &str) {
+    let command = std::env::var_os("COMSPEC")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cmd.exe".to_string());
     let setup = json!({
-        "mcp_servers": [
-            {
-                "name": "bifrost",
-                "command": fake_bifrost,
-                "args": ["--root", "{cwd}", "--mcp", "searchtools", "--no-line-numbers"],
-                "framing": "line",
-                "enabled": true
-            }
-        ]
+        "mcp_servers": [{
+            "name": "bifrost",
+            "transport": "stdio",
+            "command": command,
+            "args": [
+                "/D",
+                "/C",
+                fake_bifrost,
+                "--root",
+                "{cwd}",
+                "--mcp",
+                "core",
+                "--no-line-numbers"
+            ],
+            "framing": "line",
+            "enabled": true
+        }]
     });
-    std::fs::write(config_home.join("setup.json"), setup.to_string()).expect("write setup");
+    std::fs::write(
+        config_home.join("setup.json"),
+        serde_json::to_vec_pretty(&setup).expect("serialize fake Windows Bifrost setup"),
+    )
+    .expect("persist fake Windows Bifrost setup");
 }
 
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
     let cache_dir = config_home
         .join("bifrost")
-        .join("0.7.4")
+        .join(SMOKE_BUNDLED_BIFROST_VERSION)
         .join(bifrost_target_triple_for_smoke());
     std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
     let target = cache_dir.join(bifrost_binary_name_for_smoke());
@@ -3280,7 +3283,7 @@ fn bifrost_target_triple_for_smoke() -> &'static str {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "x86_64-unknown-linux-gnu"
+        "x86_64-unknown-linux-musl"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {

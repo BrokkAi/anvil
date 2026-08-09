@@ -1,0 +1,371 @@
+{
+  "contracts": [
+    {
+      "id": "C01",
+      "kind": "inspection",
+      "text": "`httpx.CookieStore` is a public class accessible as `httpx.CookieStore`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C02",
+      "kind": "execution",
+      "text": "`CookieStore` can be used in any position that accepts `cookies=`, including `Client(cookies=...)` and `AsyncClient(cookies=...)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C03",
+      "kind": "execution",
+      "text": "Existing cookie behavior is unchanged unless `CookieStore` is explicitly used.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C04",
+      "kind": "inspection",
+      "text": "`CookieStore.__init__` accepts two optional keyword arguments: `max_cookies` (int or None) and `max_cookies_per_domain` (int or None).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C05",
+      "kind": "execution",
+      "text": "If `max_cookies` or `max_cookies_per_domain` is passed a non-int (and not None), `TypeError` is raised.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C06",
+      "kind": "execution",
+      "text": "If `max_cookies` or `max_cookies_per_domain` is passed a negative int, `ValueError` is raised.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C07",
+      "kind": "execution",
+      "text": "When the per-domain cookie count exceeds `max_cookies_per_domain`, the oldest-by-creation-order cookie for that domain is evicted first.",
+      "adverse_condition": "Domain contains multiple cookies with distinguishable creation times; without a domain over the per-domain limit the eviction order cannot be verified."
+    },
+    {
+      "id": "C08",
+      "kind": "execution",
+      "text": "When the global cookie count exceeds `max_cookies`, the oldest-by-creation-order cookie across all domains is evicted first.",
+      "adverse_condition": "Store contains cookies across multiple domains with distinguishable creation times; without exceeding the global limit the eviction order cannot be verified."
+    },
+    {
+      "id": "C09",
+      "kind": "execution",
+      "text": "Per-domain limit eviction happens before global limit eviction when both limits would be exceeded by a single insertion.",
+      "adverse_condition": "A single insertion causes both per-domain and global limits to be exceeded; the ordering of evictions is only observable when both limits are in play simultaneously."
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "`CookieStore.extract_cookies(response)` parses `Set-Cookie` headers from the response and stores the resulting cookies.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "A single `Set-Cookie` header value containing multiple cookies combined with comma separation is parsed correctly, including when an `Expires=` attribute value itself contains a comma.",
+      "adverse_condition": "The header value must contain multiple cookies whose boundary comma could be confused with an `Expires` comma; without this specific input shape the comma-handling logic is untested."
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "Empty cookie strings in `Set-Cookie` are ignored (not stored).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "Malformed cookie strings in `Set-Cookie` are ignored (not stored).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "A cookie is ignored entirely if a `Domain` attribute appears without a value.",
+      "adverse_condition": "The `Set-Cookie` header must contain a `Domain` attribute with no value; without this specific malformed input the rejection cannot be observed."
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "A cookie is ignored entirely if a `Max-Age` attribute appears without a value.",
+      "adverse_condition": "The `Set-Cookie` header must contain a `Max-Age` attribute with no value; without this specific malformed input the rejection cannot be observed."
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "A cookie is ignored entirely if an `Expires` attribute appears without a value.",
+      "adverse_condition": "The `Set-Cookie` header must contain an `Expires` attribute with no value; without this specific malformed input the rejection cannot be observed."
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "Unknown attributes in `Set-Cookie` are ignored (they do not prevent the cookie from being stored).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "Empty cookie values (e.g., `name=`) are valid and stored.",
+      "adverse_condition": "The cookie string must have a name with an empty value; without this edge case the handling of empty values is unverified."
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "A cookie without a `Domain` attribute is host-only: it is sent only to the exact host that set it.",
+      "adverse_condition": "Verification requires a request to a different host (including a subdomain of the origin host) where the cookie must not appear."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "A cookie with a `Domain` attribute is sent only when the request host domain-matches it (case-insensitive suffix match including a leading dot or not).",
+      "adverse_condition": "Verification requires requests to at least a matching domain, a non-matching domain, and the same domain with different case."
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "A cookie with a `Domain` attribute is sent to subdomains of the specified domain.",
+      "adverse_condition": "Verification requires a request to a subdomain of the cookie's domain; without a subdomain request the subdomain-sending behavior is unverified."
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "When no `Path` attribute is present, the default path is derived from the request path that set the cookie.",
+      "adverse_condition": "The deriving request must have a path other than `/`; with only root-path requests the default-path logic cannot be distinguished from a hardcoded `/`."
+    },
+    {
+      "id": "C23",
+      "kind": "execution",
+      "text": "A `Path` value not starting with `/` (or empty) causes the default path to be used instead.",
+      "adverse_condition": "The `Set-Cookie` header must contain `Path=something` where `something` does not start with `/`; without this malformed input the fallback logic is unverified."
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "Path matching: a cookie with path `/sub` is sent to requests for `/sub` and `/sub/x` but not `/submarine`.",
+      "adverse_condition": "Verification requires a request to `/submarine` specifically to confirm the cookie is excluded; `/sub` and `/sub/x` alone cannot distinguish prefix matching from substring matching."
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "A cookie with the `Secure` attribute is only sent over HTTPS requests.",
+      "adverse_condition": "Verification requires both an HTTP and an HTTPS request for the same cookie; the HTTP request must not include the cookie."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "When storing, a cookie named with the `__Secure-` prefix is rejected unless it has the `Secure` attribute and the origin is HTTPS.",
+      "adverse_condition": "The `Set-Cookie` must bear the `__Secure-` prefix but lack `Secure` or arrive over HTTP; without those conditions the rejection is not triggered."
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "When storing, a cookie named with the `__Host-` prefix is rejected unless it has `Secure`, the origin is HTTPS, no `Domain` attribute is present, and `Path=/`.",
+      "adverse_condition": "The `Set-Cookie` must bear the `__Host-` prefix but violate at least one of: `Secure` missing, HTTP origin, `Domain` present, or `Path` not `/`; without a violation the rejection logic is untested."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`Max-Age` takes precedence over `Expires` when both are present in a `Set-Cookie` header.",
+      "adverse_condition": "Both `Max-Age` and `Expires` must be present with conflicting values (e.g., `Max-Age` far future, `Expires` in the past); otherwise the precedence is not observable."
+    },
+    {
+      "id": "C29",
+      "kind": "execution",
+      "text": "A `Max-Age` value <= 0 deletes an existing matching cookie (same name, domain, path) and does not store a new cookie.",
+      "adverse_condition": "A cookie with the same name, domain, and path must already exist in the store; without a pre-existing match the delete side-effect is invisible."
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "An `Expires` date in the past deletes an existing matching cookie (same name, domain, path).",
+      "adverse_condition": "A cookie with the same name, domain, and path must already exist in the store and `Max-Age` must be absent; without a pre-existing match the delete is invisible."
+    },
+    {
+      "id": "C31",
+      "kind": "execution",
+      "text": "An invalid `Expires` value does not prevent the cookie from being stored (the cookie is stored as if no `Expires` were present).",
+      "adverse_condition": "The `Set-Cookie` must contain an unparseable `Expires` string; a valid `Expires` alone cannot test the invalid-handling path."
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "When a stored cookie is replaced by a new `Set-Cookie` with the same (name, domain, path), it is treated as newly created for eviction ordering purposes.",
+      "adverse_condition": "Multiple cookies must already exist with distinguishable creation times; the replacement must cause the updated cookie to become the newest, observable only when an eviction later spares it over an older cookie."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "When sending cookies on a request via `set_cookie_header(request)`, cookies are ordered by longer path first, then by older creation time first among cookies with equal path length.",
+      "adverse_condition": "At least two cookies with different path lengths and/or different creation times must be eligible; without distinguishable path lengths or creation times the ordering cannot be verified."
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "When multiple stored cookies share the same name, mapping-style access `store[\"name\"]` raises `httpx.CookieConflict`.",
+      "adverse_condition": "At least two cookies with the same name but different domain/path must exist; without a name collision `CookieConflict` is never raised."
+    },
+    {
+      "id": "C35",
+      "kind": "execution",
+      "text": "`httpx.CookieConflict` is an exception class accessible as `httpx.CookieConflict`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C36",
+      "kind": "execution",
+      "text": "Mapping-style access `store[\"name\"]` succeeds and returns the value when domain/path disambiguates to a single cookie, even if multiple cookies share the name.",
+      "adverse_condition": "Multiple cookies with the same name must exist, but domain and path must select exactly one; without this precise configuration the single-result path is not tested."
+    },
+    {
+      "id": "C37",
+      "kind": "inspection",
+      "text": "`CookieStore` implements the mutable mapping protocol (at minimum `__getitem__`, `__setitem__`, `__delitem__`, `__iter__`, `__len__`).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C38",
+      "kind": "execution",
+      "text": "`CookieStore.set_cookie_header(request)` sets the correct `Cookie` header on the given request object for the cookies that match the request.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C39",
+      "kind": "inspection",
+      "text": "`CookieStore.set(name, value, domain=\"\", path=\"/\")` — signature with `domain` defaulting to `\"\"` and `path` defaulting to `\"/\"`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C40",
+      "kind": "execution",
+      "text": "Cookies added via `set(name, value, domain=\"\")` (i.e., with the default empty-string domain) are not host-only: they are sent to any host that matches by path and scheme rules.",
+      "adverse_condition": "Verification requires requests to at least two different hosts; a single-host test cannot distinguish host-only from non-host-only cookies."
+    },
+    {
+      "id": "C41",
+      "kind": "inspection",
+      "text": "`CookieStore.get(name, default=None, domain=None, path=None)` — signature with `default` defaulting to `None`, `domain` defaulting to `None`, `path` defaulting to `None`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C42",
+      "kind": "inspection",
+      "text": "`CookieStore.delete(name, domain=None, path=None)` — signature.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C43",
+      "kind": "inspection",
+      "text": "`CookieStore.clear(domain=None, path=None)` — signature.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C44",
+      "kind": "inspection",
+      "text": "`CookieStore.update(cookies)` — signature accepting a single `cookies` argument.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C45",
+      "kind": "execution",
+      "text": "`update(cookies)` accepts `CookieStore` instances as input.",
+      "adverse_condition": "The input must be a `CookieStore`; verification requires that the type is accepted without error."
+    },
+    {
+      "id": "C46",
+      "kind": "execution",
+      "text": "`update(cookies)` accepts `httpx.Cookies` instances as input.",
+      "adverse_condition": "The input must be an `httpx.Cookies` instance; verification requires that the type is accepted without error."
+    },
+    {
+      "id": "C47",
+      "kind": "execution",
+      "text": "`update(cookies)` accepts `http.cookiejar.CookieJar` instances as input.",
+      "adverse_condition": "The input must be a `http.cookiejar.CookieJar`; verification requires that the type is accepted without error."
+    },
+    {
+      "id": "C48",
+      "kind": "execution",
+      "text": "`update(cookies)` accepts `dict[str, str]` as input.",
+      "adverse_condition": "The input must be a `dict[str, str]`; verification requires that the type is accepted without error."
+    },
+    {
+      "id": "C49",
+      "kind": "execution",
+      "text": "`update(cookies)` accepts `list[tuple[str, str]]` as input.",
+      "adverse_condition": "The input must be a `list[tuple[str, str]]`; verification requires that the type is accepted without error."
+    },
+    {
+      "id": "C50",
+      "kind": "execution",
+      "text": "Cookies added via mapping (`dict[str, str]`) or list (`list[tuple[str, str]]`) inputs to `update()` are not host-only: they are sent to any host that matches by path and scheme rules.",
+      "adverse_condition": "Verification requires requests to at least two different hosts; a single-host test cannot distinguish host-only from non-host-only cookies."
+    },
+    {
+      "id": "C51",
+      "kind": "execution",
+      "text": "Cookies added via mapping/list inputs to `update()` are not host-only: same rule as `set()` with `domain=\"\"`.",
+      "adverse_condition": "Verification requires requests to at least two different hosts; a single-host test cannot distinguish."
+    },
+    {
+      "id": "C52",
+      "kind": "execution",
+      "text": "When `get(name, default=None, domain=None, path=None)` is called with `domain` and `path` both `None` and multiple cookies share the name, `CookieConflict` is raised.",
+      "adverse_condition": "At least two cookies with the same name must exist; without a collision the conflict path is not tested."
+    },
+    {
+      "id": "C53",
+      "kind": "execution",
+      "text": "When `get(name, domain=..., path=...)` is called with explicit domain and path, the single matching cookie is returned even if others share the name.",
+      "adverse_condition": "Multiple cookies with the same name must exist but domain+path must select exactly one; without this configuration the disambiguation is not tested."
+    },
+    {
+      "id": "C54",
+      "kind": "execution",
+      "text": "Domain matching is case-insensitive.",
+      "adverse_condition": "The cookie's domain and the request host must differ only in casing; same-case matching cannot detect case-insensitivity."
+    },
+    {
+      "id": "C55",
+      "kind": "delivery",
+      "text": "Work must be done on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C56",
+      "kind": "delivery",
+      "text": "All work must be committed when done.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C57",
+      "kind": "execution",
+      "text": "When both `max_cookies` and `max_cookies_per_domain` are `None`, no eviction occurs regardless of the number of cookies stored.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C58",
+      "kind": "execution",
+      "text": "`extract_cookies(response)` must be a public method on `CookieStore`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C59",
+      "kind": "execution",
+      "text": "`set_cookie_header(request)` must be a public method on `CookieStore`.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1946,
+    "completion_tokens": 4582,
+    "total_tokens": 6528,
+    "prompt_tokens_details": {
+      "cached_tokens": 512
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 423
+    },
+    "prompt_cache_hit_tokens": 512,
+    "prompt_cache_miss_tokens": 1434
+  }
+}

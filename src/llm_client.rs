@@ -6,6 +6,7 @@ use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -27,11 +28,20 @@ use crate::structured_output::StructuredOutputRequest;
 /// the parser do NOT reset the inter-chunk timer -- otherwise a server
 /// or proxy could keep us alive forever by drip-feeding pings.
 ///
-/// Distinct from the reqwest client's overall `.timeout()` (wall-clock).
-pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 300;
+/// Also used as the pre-stream HTTP send budget for streaming requests:
+/// if response headers do not arrive within this window, the request is
+/// retried instead of waiting for reqwest's last-resort wall-clock timeout.
+pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 120;
 
 /// Default value for `--llm-stall-timeout-secs`: the maximum gap between
 /// meaningful chunks after the first progress event has arrived.
+///
+/// 30s was tried and reverted: a benchmark sweep showed ~11 stall-aborts per
+/// task, which looked like a provider defect worth detecting faster. The
+/// stalls turned out to be an artifact of that sweep's sealed container
+/// network (0.8/task unsealed vs 10.9/task sealed, same 60s budget). At 30s
+/// on a healthy network the abort rate tripled against 60s with nothing left
+/// to detect, and every abort costs a full request retry.
 pub const DEFAULT_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
 
 /// Lower bound for the LLM stream timeout CLI flags and the `/idle-timeout`
@@ -133,13 +143,19 @@ pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
         return None;
     }
 
+    // A per-day quota outranks every retry marker, including one a
+    // mid-stream wrapper may have layered on top of it: waiting cannot
+    // clear it, so retrying only converts a loud failure into a quiet one.
+    if crate::http_retry::is_fatal_llm_quota_error(error) {
+        return None;
+    }
+
     if is_incomplete_stream_error(error) {
         return Some(LlmRetryTier::Fast);
     }
 
     error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<RetryableLlmError>())
+        .downcast_ref::<RetryableLlmError>()
         .map(RetryableLlmError::tier)
 }
 
@@ -234,6 +250,195 @@ pub struct FunctionDef {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+fn provider_compatible_tools(
+    wire: ToolSchemaWire,
+    model: &str,
+    mut tools: Option<Vec<ToolDefinition>>,
+) -> Option<Vec<ToolDefinition>> {
+    if wire == ToolSchemaWire::Standard {
+        return tools;
+    }
+    if wire == ToolSchemaWire::Kimi {
+        if let Some(tools) = &mut tools {
+            for tool in tools {
+                tool.function.parameters = normalize_kimi_tool_schema(&tool.function.parameters);
+            }
+        }
+        return tools;
+    }
+
+    let remove_required = model.starts_with("google/gemini-");
+    let remove_combiners = remove_required || model.starts_with("moonshotai/kimi-");
+    if !remove_combiners {
+        return tools;
+    }
+
+    fn project_schema(value: &mut serde_json::Value, remove_required: bool) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+
+        for child in object.values_mut() {
+            if let serde_json::Value::Array(values) = child {
+                for value in values {
+                    project_schema(value, remove_required);
+                }
+            } else if child.is_object() {
+                project_schema(child, remove_required);
+            }
+        }
+
+        // Gemini's function-declaration schema is a strict OpenAPI subset. In
+        // particular it rejects JSON Schema conditionals such as
+        // `anyOf: [{required: [...]}, ...]`, even though they are valid JSON
+        // Schema and are emitted by MCP servers such as Bifrost.
+        object.remove("anyOf");
+        object.remove("oneOf");
+        object.remove("allOf");
+
+        if remove_required {
+            // Google's adapter can also reject a direct required property that
+            // is visibly present (notably Bifrost's `match` argument). Runtime
+            // validation remains authoritative, so omit the constraint.
+            object.remove("required");
+        } else if let Some(mut required) = object.remove("required") {
+            let property_names = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                });
+            if let (serde_json::Value::Array(names), Some(property_names)) =
+                (&mut required, property_names)
+            {
+                names.retain(|name| {
+                    name.as_str()
+                        .is_some_and(|name| property_names.contains(name))
+                });
+                if !names.is_empty() {
+                    object.insert("required".into(), required);
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = &mut tools {
+        for tool in tools {
+            project_schema(&mut tool.function.parameters, remove_required);
+        }
+    }
+    tools
+}
+
+fn normalize_kimi_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    fn dereference(
+        node: &serde_json::Value,
+        root: &serde_json::Value,
+        visiting: &mut std::collections::HashSet<String>,
+    ) -> serde_json::Value {
+        match node {
+            serde_json::Value::Array(values) => serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(|value| dereference(value, root, visiting))
+                    .collect(),
+            ),
+            serde_json::Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str)
+                    && let Some(pointer) = reference.strip_prefix('#')
+                    && visiting.insert(reference.to_string())
+                    && let Some(target) = root.pointer(pointer)
+                {
+                    let mut resolved = dereference(target, root, visiting);
+                    visiting.remove(reference);
+                    if let Some(resolved_object) = resolved.as_object_mut() {
+                        for (key, value) in object {
+                            if key != "$ref" {
+                                resolved_object
+                                    .insert(key.clone(), dereference(value, root, visiting));
+                            }
+                        }
+                    }
+                    return resolved;
+                }
+                serde_json::Value::Object(
+                    object
+                        .iter()
+                        .map(|(key, value)| (key.clone(), dereference(value, root, visiting)))
+                        .collect(),
+                )
+            }
+            scalar => scalar.clone(),
+        }
+    }
+
+    fn infer_type(value: &serde_json::Value) -> Option<&'static str> {
+        match value {
+            serde_json::Value::String(_) => Some("string"),
+            serde_json::Value::Bool(_) => Some("boolean"),
+            serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => {
+                Some("integer")
+            }
+            serde_json::Value::Number(_) => Some("number"),
+            serde_json::Value::Array(_) => Some("array"),
+            serde_json::Value::Object(_) => Some("object"),
+            serde_json::Value::Null => None,
+        }
+    }
+
+    fn fill_property_types(value: &mut serde_json::Value, property_schema: bool) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if let Some(properties) = object
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for property in properties.values_mut() {
+                fill_property_types(property, true);
+            }
+        }
+        for key in ["items", "additionalProperties"] {
+            if let Some(child) = object.get_mut(key) {
+                fill_property_types(child, false);
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(children) = object
+                .get_mut(key)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for child in children {
+                    fill_property_types(child, false);
+                }
+            }
+        }
+        if property_schema && !object.contains_key("type") {
+            let inferred = if object.contains_key("properties") {
+                Some("object")
+            } else if object.contains_key("items") {
+                Some("array")
+            } else {
+                object
+                    .get("const")
+                    .and_then(infer_type)
+                    .or_else(|| object.get("enum")?.as_array()?.first().and_then(infer_type))
+                    .or(Some("string"))
+            };
+            if let Some(inferred) = inferred {
+                object.insert("type".to_string(), serde_json::json!(inferred));
+            }
+        }
+    }
+
+    let mut normalized = dereference(schema, schema, &mut std::collections::HashSet::new());
+    fill_property_types(&mut normalized, false);
+    normalized
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,9 +849,7 @@ pub struct ModelServiceTier {
 
 /// Per-token USD pricing published by a provider's model catalog.
 ///
-/// Today this is populated only from OpenRouter's `/models` endpoint,
-/// which publishes `pricing.prompt` and `pricing.completion` values as
-/// decimal USD-per-token strings.
+/// OpenRouter and other providers may populate this from their model catalogs.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     pub input_cost_per_token_usd: f64,
@@ -668,6 +871,12 @@ impl ModelPricing {
         billed_input_tokens as f64 * self.input_cost_per_token_usd
             + billed_output_tokens as f64 * self.output_cost_per_token_usd
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDiscoveryNotice {
+    pub source: String,
+    pub message: String,
 }
 
 /// Richer model descriptor surfaced through `LlmBackend::list_model_metadata`.
@@ -744,6 +953,10 @@ pub trait LlmBackend: Send + Sync {
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         let fut = self.list_models();
         Box::pin(async move { Ok(fut.await?.into_iter().map(ModelMetadata::id_only).collect()) })
+    }
+
+    fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        Vec::new()
     }
 
     /// Stream a chat completion. `reasoning_effort` is honored only by
@@ -885,6 +1098,8 @@ struct ReasoningConfig {
 #[derive(Debug, Serialize)]
 struct ThinkingConfig {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -916,6 +1131,24 @@ pub(crate) struct ModelEntry {
     pub(crate) context_length: Option<u32>,
     #[serde(default)]
     pub(crate) pricing: Option<ModelPricingEntry>,
+    #[serde(default)]
+    pub(crate) supports_image_in: Option<bool>,
+    #[serde(default)]
+    pub(crate) supports_reasoning: bool,
+    #[serde(default)]
+    pub(crate) supports_thinking_type: Option<String>,
+    #[serde(default)]
+    pub(crate) think_efforts: Option<KimiThinkEfforts>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct KimiThinkEfforts {
+    #[serde(default)]
+    support: bool,
+    #[serde(default)]
+    valid_efforts: Vec<String>,
+    #[serde(default)]
+    default_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -972,6 +1205,8 @@ enum ReasoningWire {
     Off,
     /// OpenRouter / Ollama unified `reasoning: { effort }` object.
     Unified,
+    /// Kimi Code: `thinking: { type: "enabled", effort: "..." }`.
+    Kimi,
     /// DeepSeek: `thinking: { type: "enabled" }` + a top-level
     /// `reasoning_effort` on DeepSeek's `high`/`max` scale.
     DeepSeek,
@@ -981,6 +1216,36 @@ enum ReasoningWire {
 enum StructuredOutputWire {
     JsonSchema,
     JsonObject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSchemaWire {
+    Standard,
+    OpenRouterModelAware,
+    Kimi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataWire {
+    Standard,
+    OpenRouter,
+    DeepSeek,
+    Kimi,
+}
+
+pub trait BearerTokenProvider: Send + Sync {
+    fn bearer_token(&self) -> BoxFuture<'_, Result<Option<String>>>;
+}
+
+#[derive(Debug)]
+struct StaticBearerToken {
+    token: Option<String>,
+}
+
+impl BearerTokenProvider for StaticBearerToken {
+    fn bearer_token(&self) -> BoxFuture<'_, Result<Option<String>>> {
+        Box::pin(std::future::ready(Ok(self.token.clone())))
+    }
 }
 
 /// DeepSeek's two documented reasoning levels. DeepSeek's `/v1/models` is
@@ -1090,6 +1355,42 @@ impl ModelEntry {
             pricing: self.pricing(),
         }
     }
+
+    fn to_kimi_model_metadata(&self) -> ModelMetadata {
+        let efforts = self
+            .think_efforts
+            .as_ref()
+            .filter(|efforts| efforts.support);
+        let supported_reasoning_levels = efforts
+            .map(|efforts| {
+                efforts
+                    .valid_efforts
+                    .iter()
+                    .map(|effort| ReasoningLevelPreset {
+                        effort: effort.clone(),
+                        description: format!("Kimi thinking effort: {effort}"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let supports_reasoning = self.supports_reasoning
+            || self
+                .supports_thinking_type
+                .as_deref()
+                .is_some_and(|kind| kind != "no")
+            || efforts.is_some();
+        ModelMetadata {
+            id: self.id.clone(),
+            default_reasoning_level: supports_reasoning
+                .then(|| efforts.and_then(|efforts| efforts.default_effort.clone()))
+                .flatten(),
+            supported_reasoning_levels,
+            service_tiers: Vec::new(),
+            supports_images: self.supports_image_in.or_else(|| self.supports_images()),
+            context_length: self.context_length,
+            pricing: self.pricing(),
+        }
+    }
 }
 
 // SSE chunk types for streaming (extended for tool calls)
@@ -1144,7 +1445,7 @@ impl UsageChunk {
     /// in `total_tokens`. Similarly, `completion_tokens` is total
     /// output (reasoning + visible); we surface reasoning separately
     /// as `thought_tokens` and subtract from `output_tokens`.
-    fn into_usage(self) -> TokenUsage {
+    fn to_usage(&self) -> TokenUsage {
         let cached_read = self
             .prompt_tokens_details
             .as_ref()
@@ -1173,6 +1474,10 @@ struct ChunkChoice {
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
+    /// Kimi Code currently attaches usage to the final choice rather than
+    /// emitting OpenAI's separate empty-choices usage chunk.
+    #[serde(default)]
+    usage: Option<UsageChunk>,
 }
 
 #[derive(Debug)]
@@ -1317,21 +1622,25 @@ fn normalize_stream_tool_calls(
 #[derive(Clone)]
 pub struct OpenAiClient {
     base_url: String,
-    api_key: Option<String>,
+    auth: Arc<dyn BearerTokenProvider>,
     http: reqwest::Client,
     /// How this client forwards reasoning effort on the wire (off, the
     /// unified object, or DeepSeek's thinking + top-level reasoning_effort).
     reasoning_wire: ReasoningWire,
     structured_output_wire: StructuredOutputWire,
+    tool_schema_wire: ToolSchemaWire,
+    metadata_wire: MetadataWire,
 }
 
 impl std::fmt::Debug for OpenAiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiClient")
             .field("base_url", &self.base_url)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("auth", &"[REDACTED]")
             .field("reasoning_wire", &self.reasoning_wire)
             .field("structured_output_wire", &self.structured_output_wire)
+            .field("tool_schema_wire", &self.tool_schema_wire)
+            .field("metadata_wire", &self.metadata_wire)
             .finish()
     }
 }
@@ -1401,6 +1710,18 @@ impl OpenAiClient {
         api_key: Option<String>,
         default_headers: reqwest::header::HeaderMap,
     ) -> Self {
+        Self::with_auth_provider(
+            base_url,
+            Arc::new(StaticBearerToken { token: api_key }),
+            default_headers,
+        )
+    }
+
+    pub fn with_auth_provider(
+        base_url: String,
+        auth: Arc<dyn BearerTokenProvider>,
+        default_headers: reqwest::header::HeaderMap,
+    ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let openrouter_mode = base_url.contains("openrouter.ai");
         let mut builder = Self::apply_runtime_tls_workarounds(
@@ -1422,7 +1743,7 @@ impl OpenAiClient {
         let http = builder.build().expect("failed to build HTTP client");
         Self {
             base_url,
-            api_key,
+            auth,
             http,
             reasoning_wire: ReasoningWire::Off,
             // Default to OpenAI's strict JSON Schema response_format for
@@ -1430,6 +1751,8 @@ impl OpenAiClient {
             // dialect in their constructor; hosted DeepSeek currently supports
             // JSON mode only.
             structured_output_wire: StructuredOutputWire::JsonSchema,
+            tool_schema_wire: ToolSchemaWire::Standard,
+            metadata_wire: MetadataWire::Standard,
         }
     }
 
@@ -1445,6 +1768,29 @@ impl OpenAiClient {
         client
     }
 
+    pub fn with_openrouter_support(
+        base_url: String,
+        api_key: Option<String>,
+        default_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut client = Self::with_reasoning_support(base_url, api_key, default_headers);
+        client.tool_schema_wire = ToolSchemaWire::OpenRouterModelAware;
+        client.metadata_wire = MetadataWire::OpenRouter;
+        client
+    }
+
+    pub fn with_kimi_support(
+        base_url: String,
+        auth: Arc<dyn BearerTokenProvider>,
+        default_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut client = Self::with_auth_provider(base_url, auth, default_headers);
+        client.reasoning_wire = ReasoningWire::Kimi;
+        client.tool_schema_wire = ToolSchemaWire::Kimi;
+        client.metadata_wire = MetadataWire::Kimi;
+        client
+    }
+
     /// Construct an `OpenAiClient` for the hosted DeepSeek API: it advertises
     /// DeepSeek's `high`/`max` reasoning levels (see
     /// [`deepseek_reasoning_presets`]) and forwards effort in DeepSeek's
@@ -1457,6 +1803,7 @@ impl OpenAiClient {
         let mut client = Self::with_default_headers(base_url, api_key, default_headers);
         client.reasoning_wire = ReasoningWire::DeepSeek;
         client.structured_output_wire = StructuredOutputWire::JsonObject;
+        client.metadata_wire = MetadataWire::DeepSeek;
         client
     }
 
@@ -1501,7 +1848,7 @@ impl OpenAiClient {
             ));
         }
         let http = self.http.clone();
-        let api_key = self.api_key.clone();
+        let api_key = self.auth.bearer_token().await?;
         let url_for_task = url.clone();
         let trace_for_task = trace_openrouter;
         let mut send_task = tokio::spawn(async move {
@@ -1606,14 +1953,7 @@ impl OpenAiClient {
                 "OpenRouter list_model_metadata_impl: fetched models response",
             );
         }
-        if self.reasoning_wire == ReasoningWire::Off {
-            return Ok(models
-                .data
-                .into_iter()
-                .map(|model| model.to_model_metadata())
-                .collect());
-        }
-        if self.reasoning_wire == ReasoningWire::DeepSeek {
+        if self.metadata_wire == MetadataWire::DeepSeek {
             // DeepSeek's `/models` is id-only, so `to_model_metadata` would
             // yield no reasoning info. Declare DeepSeek's levels here (default
             // `high`) so the shared picker/selection code can map requests to
@@ -1633,11 +1973,19 @@ impl OpenAiClient {
                 })
                 .collect());
         }
-        let metadata = models
-            .data
-            .into_iter()
-            .map(|model| model.to_model_metadata())
-            .collect::<Vec<_>>();
+        let metadata = match self.metadata_wire {
+            MetadataWire::Kimi => models
+                .data
+                .into_iter()
+                .map(|model| model.to_kimi_model_metadata())
+                .collect::<Vec<_>>(),
+            MetadataWire::Standard | MetadataWire::OpenRouter => models
+                .data
+                .into_iter()
+                .map(|model| model.to_model_metadata())
+                .collect::<Vec<_>>(),
+            MetadataWire::DeepSeek => unreachable!("handled above"),
+        };
         if self.base_url.contains("openrouter.ai") {
             crate::openrouter_auth::append_refresh_log(&format!(
                 "OpenRouter list_model_metadata_impl: built {} metadata entries",
@@ -1663,6 +2011,8 @@ impl OpenAiClient {
         } = request;
         let url = self.api_url("/chat/completions");
 
+        let tools = provider_compatible_tools(self.tool_schema_wire, &model, tools);
+
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
         // Spell reasoning effort in this client's dialect. `stream_chat` has
@@ -1674,10 +2024,21 @@ impl OpenAiClient {
                 None,
                 None,
             ),
+            ReasoningWire::Kimi => (
+                None,
+                reasoning_effort.map(|effort| ThinkingConfig {
+                    r#type: "enabled",
+                    effort: Some(effort),
+                }),
+                None,
+            ),
             ReasoningWire::DeepSeek => match reasoning_effort {
                 Some(effort) => (
                     None,
-                    Some(ThinkingConfig { r#type: "enabled" }),
+                    Some(ThinkingConfig {
+                        r#type: "enabled",
+                        effort: None,
+                    }),
                     Some(deepseek_reasoning_effort(&effort).to_string()),
                 ),
                 // No effort: send nothing; DeepSeek defaults to thinking
@@ -1723,16 +2084,18 @@ impl OpenAiClient {
             reasoning_effort: reasoning_effort_field,
             response_format,
         };
+        let api_key = self.auth.bearer_token().await?;
         let resp = match crate::http_retry::send_with_retries(
             "sending chat completion request",
             || {
                 let mut req = self.http.post(&url).json(&body);
-                if let Some(key) = &self.api_key {
+                if let Some(key) = &api_key {
                     req = req.bearer_auth(key);
                 }
                 req
             },
             Some(&cancel),
+            Some(idle_timeouts.first_progress),
         )
         .await
         {
@@ -1916,12 +2279,16 @@ where
                                         tool_acc.push(tc);
                                     }
                                 }
+                                if let Some(choice_usage) = &choice.usage {
+                                    usage = choice_usage.to_usage();
+                                    made_progress = true;
+                                }
                             }
                             // Last chunk before [DONE]: trailing usage
                             // block. `choices` is empty here; we just
                             // record the totals.
                             if let Some(u) = chunk.usage {
-                                usage = u.into_usage();
+                                usage = u.to_usage();
                                 made_progress = true;
                             }
                         }
@@ -1970,6 +2337,111 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn gemini_tool_projection_accepts_bifrost_conditional_schemas() {
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDef {
+                name: "scan_usages".into(),
+                description: "Find usages".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbols": {"type": "array", "items": {"type": "string"}},
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "line": {"type": "integer"},
+                                    "start_byte": {"type": "integer"}
+                                },
+                                "required": ["path", "not_a_property"],
+                                "anyOf": [
+                                    {"required": ["line"]},
+                                    {"required": ["start_byte"]}
+                                ]
+                            }
+                        }
+                    },
+                    "anyOf": [
+                        {"required": ["symbols"]},
+                        {"required": ["targets"]}
+                    ]
+                }),
+            },
+        }];
+
+        let original_tools = tools.clone();
+        let projected = provider_compatible_tools(
+            ToolSchemaWire::OpenRouterModelAware,
+            "google/gemini-3-flash-preview",
+            Some(tools),
+        )
+        .expect("tools");
+        let schema = &projected[0].function.parameters;
+        assert!(schema.get("anyOf").is_none());
+        assert!(
+            schema["properties"]["targets"]["items"]
+                .get("anyOf")
+                .is_none()
+        );
+        assert!(
+            schema["properties"]["targets"]["items"]
+                .get("required")
+                .is_none()
+        );
+
+        let kimi = provider_compatible_tools(
+            ToolSchemaWire::OpenRouterModelAware,
+            "moonshotai/kimi-k2.7-code",
+            Some(original_tools.clone()),
+        )
+        .expect("tools");
+        assert!(kimi[0].function.parameters.get("anyOf").is_none());
+        assert_eq!(
+            kimi[0].function.parameters["properties"]["targets"]["items"]["required"],
+            serde_json::json!(["path"])
+        );
+
+        let unchanged = provider_compatible_tools(
+            ToolSchemaWire::OpenRouterModelAware,
+            "minimax/minimax-m3",
+            Some(original_tools),
+        )
+        .expect("tools");
+        assert!(unchanged[0].function.parameters.get("anyOf").is_some());
+    }
+
+    #[test]
+    fn kimi_tool_projection_dereferences_and_fills_property_types() {
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "lookup".to_string(),
+                description: "lookup".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "mode": {"enum": ["fast", "deep"]},
+                        "query": {"$ref": "#/$defs/query"}
+                    },
+                    "$defs": {
+                        "query": {"description": "search terms"}
+                    }
+                }),
+            },
+        }];
+
+        let projected =
+            provider_compatible_tools(ToolSchemaWire::Kimi, "k3", Some(tools)).expect("tools");
+        let schema = &projected[0].function.parameters;
+        assert_eq!(schema["properties"]["mode"]["type"], "string");
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["properties"]["query"]["description"], "search terms");
+    }
 
     fn collect_tokens() -> (TokenSink, Arc<Mutex<Vec<String>>>) {
         let collected = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2076,13 +2548,16 @@ mod tests {
         );
         assert!(is_retryable_llm_error(&gateway));
 
+        // Body-borne 5xx/429 equivalents earn the patient tier, same as the
+        // status path and the codex path: one error string must not mean
+        // different patience depending on which provider path produced it.
         let standard = crate::http_retry::retryable_llm_error_for_responses_failure(
             "Responses stream failed: server_error: overloaded",
             "server_error: overloaded",
         );
         assert_eq!(
             llm_retry_tier(&standard),
-            Some(crate::http_retry::LlmRetryTier::Fast)
+            Some(crate::http_retry::LlmRetryTier::GatewayTransient)
         );
 
         let validation =
@@ -2320,6 +2795,11 @@ mod tests {
                 None,
                 reqwest::header::HeaderMap::new(),
             ),
+            ReasoningWire::Kimi => OpenAiClient::with_kimi_support(
+                server.uri(),
+                Arc::new(StaticBearerToken { token: None }),
+                reqwest::header::HeaderMap::new(),
+            ),
             ReasoningWire::Off => OpenAiClient::new(server.uri(), None),
         };
         let (on_token, _) = collect_tokens();
@@ -2376,6 +2856,15 @@ mod tests {
         assert!(body.get("thinking").is_none(), "{body}");
         assert!(body.get("reasoning_effort").is_none(), "{body}");
         assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn kimi_wire_sends_nested_thinking_effort() {
+        let body = capture_request_body(ReasoningWire::Kimi, Some("max")).await;
+        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert_eq!(body["thinking"]["effort"], "max", "{body}");
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     #[tokio::test]
@@ -2924,6 +3413,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drive_sse_stream_captures_kimi_choice_usage() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4}}]}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let (on_token, _) = collect_tokens();
+        let result = drive_sse_stream(
+            stream::iter(chunks),
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
+        )
+        .await
+        .expect("stream should complete");
+
+        match result {
+            LlmResponse::Text { usage, .. } => {
+                assert_eq!(usage.input_tokens, 12);
+                assert_eq!(usage.output_tokens, 4);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn drive_sse_stream_preserves_reasoning_content() {
         let chunks: Vec<Result<Vec<u8>>> = vec![
             Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n".to_vec()),
@@ -3359,6 +3875,37 @@ mod tests {
             Some(true)
         );
         assert_eq!(plain.supports_images, None);
+    }
+
+    #[test]
+    fn kimi_model_metadata_uses_server_declared_efforts() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "k3",
+            "context_length": 262144,
+            "supports_reasoning": true,
+            "supports_image_in": true,
+            "supports_thinking_type": "only",
+            "think_efforts": {
+                "support": true,
+                "valid_efforts": ["low", "high", "max"],
+                "default_effort": "max"
+            }
+        }))
+        .expect("Kimi model entry");
+
+        let metadata = entry.to_kimi_model_metadata();
+        assert_eq!(metadata.id, "k3");
+        assert_eq!(metadata.context_length, Some(262_144));
+        assert_eq!(metadata.supports_images, Some(true));
+        assert_eq!(metadata.default_reasoning_level.as_deref(), Some("max"));
+        assert_eq!(
+            metadata
+                .supported_reasoning_levels
+                .iter()
+                .map(|preset| preset.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high", "max"]
+        );
     }
 
     /// Missing `context_length` (some OpenRouter providers omit it, and

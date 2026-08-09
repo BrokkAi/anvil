@@ -9,12 +9,48 @@
 //! reasoning effort, behavior mode, and permission mode are intentionally not
 //! stored here; clients must send them for each session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
-//! config with its preinstalled servers.
+//! config with its preinstalled servers. An optional `allowed_tools` list
+//! constrains the install-wide model-facing tool catalog.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BedrockCatalogMode {
+    MantleOnly,
+    NativeOnly,
+    #[default]
+    MantlePreferred,
+    NativePreferred,
+}
+
+impl BedrockCatalogMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MantleOnly => "mantle-only",
+            Self::NativeOnly => "native-only",
+            Self::MantlePreferred => "mantle-preferred",
+            Self::NativePreferred => "native-preferred",
+        }
+    }
+}
+
+impl std::str::FromStr for BedrockCatalogMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "mantle-only" => Ok(Self::MantleOnly),
+            "native-only" => Ok(Self::NativeOnly),
+            "mantle-preferred" => Ok(Self::MantlePreferred),
+            "native-preferred" => Ok(Self::NativePreferred),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SetupState {
@@ -28,6 +64,12 @@ pub struct SetupState {
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_recap_enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_optional"
+    )]
+    pub bedrock_catalog_mode: Option<BedrockCatalogMode>,
     /// Legacy install-wide approvals from older builds. Current builds use
     /// repo-local `.brokk/permissions.json` instead, but we still deserialize
     /// this field for backward compatibility.
@@ -37,6 +79,10 @@ pub struct SetupState {
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<crate::lsp::LspSettings>,
+    /// Optional install-wide allowlist for the model-facing tool catalog.
+    /// Absent means unrestricted; an explicitly empty list hides every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Deserialize an optional enum field leniently: a value this build does not
@@ -139,6 +185,14 @@ pub fn remember_turn_recap_enabled(enabled: bool) -> Result<()> {
     update(|state| state.turn_recap_enabled = Some(enabled))
 }
 
+pub fn bedrock_catalog_mode() -> BedrockCatalogMode {
+    read().bedrock_catalog_mode.unwrap_or_default()
+}
+
+pub fn remember_bedrock_catalog_mode(mode: BedrockCatalogMode) -> Result<()> {
+    update(|state| state.bedrock_catalog_mode = Some(mode))
+}
+
 pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
     #[cfg(test)]
     if path().is_err() {
@@ -159,6 +213,10 @@ pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result
 
 pub fn remember_lsp_settings(settings: crate::lsp::LspSettings) -> Result<()> {
     update(|state| state.lsp = Some(settings))
+}
+
+pub fn read_allowed_tools() -> Option<Vec<String>> {
+    read().allowed_tools
 }
 
 fn update(mutator: impl FnOnce(&mut SetupState)) -> Result<()> {
@@ -226,6 +284,9 @@ mod tests {
             last_sandbox_mode: Some(SandboxMode::Wasm),
             mcp_servers: Some(vec![crate::mcp::McpServerConfig {
                 name: "bifrost".to_string(),
+                transport: crate::mcp::McpTransport::Stdio,
+                url: None,
+                headers: Vec::new(),
                 command: "bifrost".to_string(),
                 args: Vec::new(),
                 env: Vec::new(),
@@ -242,6 +303,51 @@ mod tests {
         assert!(parsed.first_run_seen);
         assert_eq!(parsed.last_sandbox_mode, None);
         assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn bedrock_catalog_mode_round_trips_and_defaults_to_mantle_preferred() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        assert_eq!(bedrock_catalog_mode(), BedrockCatalogMode::MantlePreferred);
+        remember_bedrock_catalog_mode(BedrockCatalogMode::NativeOnly)
+            .expect("remember catalog mode");
+        assert_eq!(bedrock_catalog_mode(), BedrockCatalogMode::NativeOnly);
+
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path().expect("setup path")).expect("read setup"),
+        )
+        .expect("setup json");
+        assert_eq!(json["bedrock_catalog_mode"], "native-only");
+    }
+
+    #[test]
+    fn allowed_tools_distinguishes_absent_from_empty() {
+        let absent: SetupState = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize setup without allowed_tools");
+        assert_eq!(absent.allowed_tools, None);
+
+        let empty: SetupState = serde_json::from_value(serde_json::json!({
+            "allowed_tools": []
+        }))
+        .expect("deserialize empty allowed_tools");
+        assert_eq!(empty.allowed_tools, Some(Vec::new()));
+
+        let configured: SetupState = serde_json::from_value(serde_json::json!({
+            "allowed_tools": ["read_file", "semantic_search", "task"]
+        }))
+        .expect("deserialize allowed_tools");
+        assert_eq!(
+            configured.allowed_tools.as_deref(),
+            Some(
+                &[
+                    "read_file".to_string(),
+                    "semantic_search".to_string(),
+                    "task".to_string()
+                ][..]
+            )
+        );
     }
 
     #[test]
@@ -292,6 +398,9 @@ mod tests {
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -327,6 +436,9 @@ mod tests {
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "/tmp/custom-bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),

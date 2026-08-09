@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::llm_client::ModelMetadata;
 use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
 use crate::structured_output::StructuredOutputResult;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, ToolRegistryOptions};
 
 // ---------------------------------------------------------------------------
 // Sandbox-bounded read limits
@@ -50,6 +50,7 @@ const MAX_CONTENT_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTED_PERMISSION_NOTICE_BYTES: usize = 1024;
 const DEFAULT_SESSION_NAME: &str = "New Session";
+const BROKK_ACP_PERMISSION_MODE_ENV: &str = "BROKK_ACP_PERMISSION_MODE";
 
 // ---------------------------------------------------------------------------
 // Store limits
@@ -298,21 +299,58 @@ fn discover_session_context(
     (project_instructions, skills, agents)
 }
 
+/// A lifecycle request carried an `additionalDirectories` entry that cannot
+/// become an executable workspace root. `requirement` is the property the
+/// path failed ("absolute", "an existing directory", ...), phrased so both
+/// the ACP and HTTP adapters can render "path N must be <requirement>".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditionalDirectoryError {
+    pub index: usize,
+    pub path: PathBuf,
+    pub requirement: &'static str,
+}
+
+/// Validate requested additional workspace roots for a session lifecycle
+/// operation. Shared by the ACP handlers and the HTTP API so both transports
+/// enforce identical rules: every entry must be a non-empty absolute path to
+/// an existing directory.
+pub(crate) fn validate_additional_directories(
+    directories: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, AdditionalDirectoryError> {
+    for (index, path) in directories.iter().enumerate() {
+        let fail = |requirement: &'static str| AdditionalDirectoryError {
+            index,
+            path: path.clone(),
+            requirement,
+        };
+        if path.as_os_str().is_empty() {
+            return Err(fail("non-empty"));
+        }
+        if !path.is_absolute() {
+            return Err(fail("absolute"));
+        }
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(fail("a directory")),
+            Err(_) => return Err(fail("an existing directory")),
+        }
+    }
+    Ok(directories)
+}
+
 /// An ACP lifecycle request referenced an MCP server transport Anvil does not
-/// support. Anvil only speaks to stdio MCP subprocesses, and it advertises
-/// `mcpCapabilities` (http=false, sse=false) accordingly, so a request that
-/// still carries an HTTP/SSE server is rejected rather than silently dropped --
-/// otherwise the session would look configured while the requested tools were
-/// missing.
+/// support. Stdio, HTTP, and SSE are supported; unknown future transports are
+/// rejected rather than silently dropped, which would leave the session looking
+/// configured while the requested tools were missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedMcpTransport {
     pub server: String,
     pub transport: &'static str,
 }
 
-/// Convert ACP `mcpServers` into Anvil's internal MCP configs, rejecting any
-/// transport other than stdio. Returns the offending server on the first
-/// unsupported entry so the caller can surface a protocol error.
+/// Convert ACP `mcpServers` into Anvil's internal MCP configs. Returns the
+/// offending server on the first unsupported entry so the caller can surface a
+/// protocol error.
 pub(crate) fn acp_mcp_servers_to_configs(
     servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 ) -> Result<Vec<McpServerConfig>, UnsupportedMcpTransport> {
@@ -322,6 +360,9 @@ pub(crate) fn acp_mcp_servers_to_configs(
             agent_client_protocol::schema::v1::McpServer::Stdio(stdio) => {
                 configs.push(McpServerConfig {
                     name: stdio.name,
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: stdio.command.display().to_string(),
                     args: stdio.args,
                     env: stdio
@@ -337,15 +378,43 @@ pub(crate) fn acp_mcp_servers_to_configs(
                 });
             }
             agent_client_protocol::schema::v1::McpServer::Http(http) => {
-                return Err(UnsupportedMcpTransport {
-                    server: http.name,
-                    transport: "http",
+                configs.push(McpServerConfig {
+                    name: http.name,
+                    transport: crate::mcp::McpTransport::Http,
+                    command: String::new(),
+                    url: Some(http.url),
+                    headers: http
+                        .headers
+                        .into_iter()
+                        .map(|header| McpEnvVar {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
                 });
             }
             agent_client_protocol::schema::v1::McpServer::Sse(sse) => {
-                return Err(UnsupportedMcpTransport {
-                    server: sse.name,
-                    transport: "sse",
+                configs.push(McpServerConfig {
+                    name: sse.name,
+                    transport: crate::mcp::McpTransport::Sse,
+                    command: String::new(),
+                    url: Some(sse.url),
+                    headers: sse
+                        .headers
+                        .into_iter()
+                        .map(|header| McpEnvVar {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
                 });
             }
             // `McpServer` is `#[non_exhaustive]`; reject unknown future
@@ -442,6 +511,42 @@ impl PermissionMode {
     }
 }
 
+fn initial_permission_mode() -> PermissionMode {
+    let default = PermissionMode::default();
+    match std::env::var(BROKK_ACP_PERMISSION_MODE_ENV) {
+        Ok(value) => match PermissionMode::parse(&value) {
+            Some(mode) => {
+                tracing::info!(
+                    permission_mode = mode.as_str(),
+                    source = "env",
+                    env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                    "applying ACP permission mode default"
+                );
+                mode
+            }
+            None => {
+                tracing::warn!(
+                    value,
+                    default_permission_mode = default.as_str(),
+                    env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                    "ignoring invalid ACP permission mode default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            tracing::warn!(
+                value = %value.to_string_lossy(),
+                default_permission_mode = default.as_str(),
+                env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                "ignoring non-unicode ACP permission mode default"
+            );
+            default
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conversation history
 // ---------------------------------------------------------------------------
@@ -477,6 +582,14 @@ pub struct ConversationTurn {
     /// reproduces the same compressed prompt. Mirrors Brokk's
     /// `TaskEntry.summary` on the Java side.
     pub summary: Option<String>,
+    /// Latest plan published during this turn. Stored independently from the
+    /// transcript so compaction can pin it exactly rather than trusting a
+    /// summarizer to reconstruct task state.
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
+    /// Cumulative model-history checkpoint covering every turn through this
+    /// one. Raw turns remain authoritative for ACP replay and rewind; Anvil
+    /// uses only the newest checkpoint when rebuilding model context.
+    pub compaction_checkpoint: Option<CompactionCheckpoint>,
     /// Stable identifier matching the fragment id under which this
     /// turn was persisted in the session zip (the `task.<id>` key in
     /// `fragments-v4.json` plus the `logId` value in
@@ -488,6 +601,12 @@ pub struct ConversationTurn {
     /// rewrite. Not persisted as a separate field -- it's just the
     /// in-memory shadow of the zip's existing id.
     pub fragment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    pub messages: Vec<crate::llm_client::ChatMessage>,
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
 /// One tool invocation and its result, captured during a turn so the next
@@ -887,7 +1006,7 @@ impl Session {
     ) -> Self {
         let now = current_timestamp_millis();
         let mode = SessionMode::Lutz;
-        let permission_mode = PermissionMode::default();
+        let permission_mode = initial_permission_mode();
         let manifest = SessionManifest {
             id: id.clone(),
             name,
@@ -997,7 +1116,7 @@ impl Session {
             model,
             history,
             manifest,
-            permission_mode: PermissionMode::default(),
+            permission_mode: initial_permission_mode(),
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
@@ -1100,6 +1219,19 @@ pub(crate) struct SessionMetadata {
 // ---------------------------------------------------------------------------
 
 fn session_storage_root(cwd: &Path) -> PathBuf {
+    let configured = std::env::var_os("BROKK_SESSION_STORAGE_ROOT");
+    session_storage_root_with_override(cwd, configured.as_deref())
+}
+
+fn session_storage_root_with_override(cwd: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(configured);
+        return if root.is_absolute() {
+            root
+        } else {
+            cwd.join(root)
+        };
+    }
     let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     for ancestor in start.ancestors() {
         let git_marker = ancestor.join(".git");
@@ -1571,6 +1703,16 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                 .and_then(|v| v.as_str())
                 .and_then(|sid| content_map.get(sid))
                 .and_then(|raw| serde_json::from_str::<StructuredOutputResult>(raw).ok());
+            let current_plan = task
+                .get("anvilPlanContentId")
+                .and_then(|v| v.as_str())
+                .and_then(|sid| content_map.get(sid))
+                .and_then(|raw| serde_json::from_str::<crate::plan::UpdatePlanArgs>(raw).ok());
+            let compaction_checkpoint = task
+                .get("anvilCompactionContentId")
+                .and_then(|v| v.as_str())
+                .and_then(|sid| content_map.get(sid))
+                .and_then(|raw| serde_json::from_str::<CompactionCheckpoint>(raw).ok());
 
             // Try markdownContentId first (newer format: pre-rendered markdown)
             if let Some(content_id) = task.get("markdownContentId").and_then(|v| v.as_str())
@@ -1595,6 +1737,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                     tool_exchanges: exchanges,
                     structured_output,
                     summary,
+                    current_plan,
+                    compaction_checkpoint,
                     fragment_id,
                 });
                 continue;
@@ -1630,6 +1774,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                         tool_exchanges: exchanges,
                         structured_output: structured_output.clone(),
                         summary: summary.clone(),
+                        current_plan: current_plan.clone(),
+                        compaction_checkpoint: compaction_checkpoint.clone(),
                         fragment_id: fragment_id.clone(),
                     });
                 }
@@ -2309,6 +2455,14 @@ fn append_turn_to_zip(
         .structured_output
         .as_ref()
         .map(|_| uuid::Uuid::new_v4().to_string());
+    let plan_content_id = turn
+        .current_plan
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
+    let compaction_content_id = turn
+        .compaction_checkpoint
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
 
     // Keep the Brokk-compatible visible messages in the legacy flat shape,
     // and store faithful model replay separately under `brokkReplayMessages`.
@@ -2414,6 +2568,8 @@ fn append_turn_to_zip(
             "taskDescription": null,
             "markdownContentId": response_content_id,
             "structuredOutputContentId": structured_output_content_id,
+            "anvilPlanContentId": plan_content_id,
+            "anvilCompactionContentId": compaction_content_id,
             "escapeHtml": false
         });
         if !replay_messages_json.is_empty()
@@ -2507,6 +2663,17 @@ fn append_turn_to_zip(
             writer.start_file(format!("content/{sid}.txt"), options)?;
             writer.write_all(serde_json::to_string(structured_output)?.as_bytes())?;
         }
+        if let (Some(sid), Some(plan)) = (plan_content_id.as_ref(), turn.current_plan.as_ref()) {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(serde_json::to_string(plan)?.as_bytes())?;
+        }
+        if let (Some(sid), Some(checkpoint)) = (
+            compaction_content_id.as_ref(),
+            turn.compaction_checkpoint.as_ref(),
+        ) {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(serde_json::to_string(checkpoint)?.as_bytes())?;
+        }
 
         Ok(())
     })?;
@@ -2566,6 +2733,7 @@ fn rewrite_history_zip(
 /// Atomic via `with_temp_zip_writer`: any failure leaves the on-disk
 /// zip unchanged, so the caller can roll back its in-memory mutation
 /// and keep `memory == disk`.
+#[cfg(test)]
 fn rewrite_turn_summary_in_zip(
     zip_path: &Path,
     fragment_id: &str,
@@ -2635,6 +2803,53 @@ fn rewrite_turn_summary_in_zip(
         writer.write_all(rewritten.as_bytes())?;
         writer.start_file(format!("content/{new_content_id}.txt"), options)?;
         writer.write_all(summary_text.as_bytes())?;
+        Ok(())
+    })
+}
+
+/// Attach or replace Anvil's cumulative model-history checkpoint on a task
+/// fragment. This is deliberately separate from Brokk's `summaryContentId`:
+/// the latter summarizes one task, while this checkpoint supersedes all model
+/// history through its anchor turn.
+fn rewrite_compaction_checkpoint_in_zip(
+    zip_path: &Path,
+    fragment_id: &str,
+    checkpoint: &CompactionCheckpoint,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let backend = crate::sandbox_backend::global();
+    let raw = backend
+        .read_zip_entry_text(
+            zip_path,
+            "fragments-v4.json",
+            MAX_SESSION_ARCHIVE_BYTES,
+            MAX_FRAGMENTS_BYTES,
+        )
+        .context("reading fragments-v4.json for compaction rewrite")?
+        .ok_or_else(|| anyhow::anyhow!("session archive has no fragments-v4.json"))?;
+    let mut fragments: serde_json::Value =
+        serde_json::from_str(&raw).context("parsing fragments-v4.json")?;
+    let task = fragments
+        .get_mut("task")
+        .and_then(|tasks| tasks.get_mut(fragment_id))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("no task fragment `{fragment_id}`"))?;
+    let content_id = uuid::Uuid::new_v4().to_string();
+    task.insert(
+        "anvilCompactionContentId".to_string(),
+        serde_json::Value::String(content_id.clone()),
+    );
+    let checkpoint_json = serde_json::to_string(checkpoint)?;
+
+    with_temp_zip_writer(zip_path, |writer, options| {
+        copy_zip_entries_via_sandbox(zip_path, writer, options, |name| {
+            name == "fragments-v4.json"
+        })?;
+        writer.start_file("fragments-v4.json", options)?;
+        writer.write_all(serde_json::to_string(&fragments)?.as_bytes())?;
+        writer.start_file(format!("content/{content_id}.txt"), options)?;
+        writer.write_all(checkpoint_json.as_bytes())?;
         Ok(())
     })
 }
@@ -2856,6 +3071,9 @@ pub struct SessionStore {
     /// not of any one session), mirroring `available_models`.
     client_elicitation_caps: Arc<RwLock<ClientElicitationCaps>>,
     limits: SessionLimits,
+    /// Whether each session's ToolRegistry gets a shell-output minimizer.
+    /// Set once at startup from `--no-shell-minimizer`.
+    shell_minimizer_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2959,7 +3177,15 @@ impl SessionStore {
             next_access: Arc::new(AtomicU64::new(0)),
             client_elicitation_caps: Arc::new(RwLock::new(ClientElicitationCaps::default())),
             limits,
+            shell_minimizer_enabled: true,
         }
+    }
+
+    /// Enable or disable the shell-output minimizer for registries built by
+    /// this store. Consuming builder, wired from `--no-shell-minimizer`.
+    pub fn with_shell_minimizer(mut self, enabled: bool) -> Self {
+        self.shell_minimizer_enabled = enabled;
+        self
     }
 
     /// Bump the LRU "last accessed" counter for `id`. Cheap: a single
@@ -3050,6 +3276,28 @@ impl SessionStore {
                 Ok(())
             }
             None => crate::setup_state::remember_lsp_settings(settings),
+        }
+    }
+
+    pub(crate) fn bedrock_catalog_mode(&self) -> crate::setup_state::BedrockCatalogMode {
+        self.setup_state_snapshot()
+            .bedrock_catalog_mode
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn remember_bedrock_catalog_mode(
+        &self,
+        mode: crate::setup_state::BedrockCatalogMode,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .bedrock_catalog_mode = Some(mode);
+                Ok(())
+            }
+            None => crate::setup_state::remember_bedrock_catalog_mode(mode),
         }
     }
 
@@ -3179,7 +3427,10 @@ impl SessionStore {
                 skills,
                 agents,
                 plugin_hooks,
-                lsp_settings,
+                ToolRegistryOptions {
+                    lsp_settings,
+                    shell_minimizer_enabled: self.shell_minimizer_enabled,
+                },
             )
             .await,
         );
@@ -3379,7 +3630,6 @@ impl SessionStore {
             select_session_reasoning_effort(&model, default_reasoning_effort, &catalog);
         let prefs = self.setup_state_snapshot();
         let session_mode = SessionMode::Lutz;
-        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let mut session = match sandbox_mode {
@@ -3405,7 +3655,6 @@ impl SessionStore {
         session.mcp_servers = mcp_servers.clone();
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
-        session.permission_mode = permission_mode;
         session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
 
@@ -3516,7 +3765,6 @@ impl SessionStore {
         let model = self.default_model.read().await.clone();
 
         let prefs = self.setup_state_snapshot();
-        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let manifest_additional_directories =
@@ -3550,7 +3798,6 @@ impl SessionStore {
                 return false;
             }
         };
-        session.permission_mode = permission_mode;
         session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
@@ -4354,6 +4601,7 @@ impl SessionStore {
     ///   programming error rather than a runtime condition).
     /// - `Err` only when the disk rewrite fails. The in-memory
     ///   mutation is rolled back so `memory == disk`.
+    #[cfg(test)]
     pub async fn set_turn_summary(
         &self,
         id: &str,
@@ -4409,6 +4657,47 @@ impl SessionStore {
                 turn.summary = prev_summary;
             }
             return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Persist a cumulative model-history checkpoint on an already-written
+    /// turn. The mutation is atomic on disk and rolled back in memory if the
+    /// archive rewrite fails.
+    pub async fn set_compaction_checkpoint(
+        &self,
+        id: &str,
+        turn_index: usize,
+        checkpoint: CompactionCheckpoint,
+    ) -> anyhow::Result<bool> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return Ok(false);
+            };
+            let Some(turn) = session.history.get_mut(turn_index) else {
+                return Ok(false);
+            };
+            let Some(fragment_id) = turn.fragment_id.clone() else {
+                return Ok(false);
+            };
+            let previous = turn.compaction_checkpoint.replace(checkpoint.clone());
+            (session.cwd.clone(), fragment_id, previous)
+        };
+        let (cwd, fragment_id, previous) = snapshot;
+        let zip_path = session_zip_path(&cwd, id);
+        let checkpoint_for_zip = checkpoint.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            rewrite_compaction_checkpoint_in_zip(&zip_path, &fragment_id, &checkpoint_for_zip)
+        })
+        .await;
+        if let Err(error) = flatten_persist_join(result) {
+            if let Some(session) = self.sessions.write().await.get_mut(id)
+                && let Some(turn) = session.history.get_mut(turn_index)
+            {
+                turn.compaction_checkpoint = previous;
+            }
+            return Err(error);
         }
         Ok(true)
     }
@@ -4984,6 +5273,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
     use crate::setup_state::TestConfigHomeScope;
 
     fn write_legacy_session_config_setup(config_dir: &Path) {
@@ -5571,6 +5861,45 @@ mod tests {
         assert_eq!(PermissionMode::parse("accept-edits"), None);
     }
 
+    #[test]
+    fn initial_permission_mode_uses_env_bypass_permissions() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::set(BROKK_ACP_PERMISSION_MODE_ENV, "bypassPermissions");
+        let session = Session::new(
+            "env-bypass".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn initial_permission_mode_preserves_default_when_env_unset() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::remove(BROKK_ACP_PERMISSION_MODE_ENV);
+        let session = Session::new(
+            "env-unset".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn initial_permission_mode_ignores_invalid_env_value() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::set(BROKK_ACP_PERMISSION_MODE_ENV, "bypass-permissions");
+        let session = Session::new(
+            "env-invalid".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::Auto);
+    }
+
     /// `create_session` writes a manifest.json that round-trips through
     /// `read_manifest_from_zip` -- the disk persistence format must stay
     /// stable, otherwise a session created today won't load tomorrow.
@@ -5810,6 +6139,11 @@ mod tests {
     /// changes are not persisted, so they reset on reload.
     #[tokio::test]
     async fn get_session_loads_from_disk_when_cold() {
+        // Reloading mints a fresh `permission_mode` via `initial_permission_mode`,
+        // which reads `BROKK_ACP_PERMISSION_MODE` - a process-wide env var that
+        // the `initial_permission_mode_*` tests set. Without the guard this test
+        // reads whatever they have installed and sees `bypassPermissions`.
+        let _env_guard = ENV_GUARD.lock().await;
         let store = SessionStore::new("m".to_string());
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-rust-cold-{}", uuid::Uuid::new_v4()));
@@ -6040,6 +6374,13 @@ mod tests {
                 .await
         );
         assert!(store.set_mode(&first.id, SessionMode::Lutz).await);
+        store
+            .remember_bedrock_catalog_mode(crate::setup_state::BedrockCatalogMode::NativeOnly)
+            .expect("set transient Bedrock catalog mode");
+        assert_eq!(
+            store.bedrock_catalog_mode(),
+            crate::setup_state::BedrockCatalogMode::NativeOnly
+        );
         assert_no_legacy_session_config_keys(&setup_state_json());
         assert!(store.set_mode(&first.id, SessionMode::Plan).await);
         assert!(
@@ -6072,6 +6413,11 @@ mod tests {
             crate::setup_state::read().last_sandbox_mode,
             Some(SandboxMode::Wasm),
             "transient choices must not overwrite setup.json sandbox preference"
+        );
+        assert_eq!(
+            crate::setup_state::bedrock_catalog_mode(),
+            crate::setup_state::BedrockCatalogMode::MantlePreferred,
+            "transient choices must not overwrite setup.json Bedrock catalog preference"
         );
 
         store.sessions.write().await.remove(&first.id);
@@ -7760,6 +8106,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    #[test]
+    fn configured_session_storage_root_is_independent_of_workspace() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(
+            session_storage_root_with_override(
+                cwd,
+                Some(std::ffi::OsStr::new("/run/anvil-session")),
+            ),
+            PathBuf::from("/run/anvil-session")
+        );
+        assert_eq!(
+            session_storage_root_with_override(cwd, Some(std::ffi::OsStr::new("../session-state")),),
+            PathBuf::from("/work/repo/../session-state")
+        );
+    }
+
     /// `list_sessions_from_disk` ignores non-zip files in the sessions
     /// directory (e.g. half-written `.tmp` files from a crashed write,
     /// or stray editor backups). Otherwise the list could surface entries
@@ -8015,15 +8377,7 @@ done
 
     #[cfg(unix)]
     fn bifrost_spawn_args(cwd: &Path) -> Vec<String> {
-        let cwd = normalize_cwd(cwd);
-        vec![
-            "--root".to_string(),
-            cwd.display().to_string(),
-            "--mcp".to_string(),
-            // Mirrors the default Bifrost surface (#121).
-            "searchtools".to_string(),
-            "--no-line-numbers".to_string(),
-        ]
+        crate::mcp::McpServerConfig::bifrost().rendered_args(&normalize_cwd(cwd))
     }
 
     #[cfg(unix)]
@@ -8051,6 +8405,9 @@ done
             configs,
             vec![crate::mcp::McpServerConfig {
                 name: "local".to_string(),
+                transport: crate::mcp::McpTransport::Stdio,
+                url: None,
+                headers: Vec::new(),
                 command: "/usr/bin/mcp".to_string(),
                 args: vec!["--flag".to_string(), "value".to_string()],
                 env: vec![crate::mcp::McpEnvVar {
@@ -8063,21 +8420,45 @@ done
         );
     }
 
-    /// Unsupported transports (http/sse) are rejected, not silently dropped, so
-    /// the caller can return a protocol error rather than appear configured
-    /// while the requested tools are missing (#159).
     #[test]
-    fn acp_http_mcp_server_is_rejected() {
-        let err =
+    fn acp_sse_mcp_server_converts_to_anvil_config() {
+        let configs =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Sse(
+                agent_client_protocol::schema::v1::McpServerSse::new(
+                    "events",
+                    "https://example.com/sse",
+                )
+                .headers(vec![agent_client_protocol::schema::v1::HttpHeader::new(
+                    "Authorization",
+                    "Bearer secret",
+                )]),
+            )])
+            .expect("sse servers convert");
+        let config = &configs[0];
+        assert_eq!(config.transport, crate::mcp::McpTransport::Sse);
+        assert_eq!(config.url.as_deref(), Some("https://example.com/sse"));
+        assert_eq!(config.headers[0].name, "Authorization");
+    }
+
+    #[test]
+    fn acp_http_mcp_server_converts_to_anvil_config() {
+        let configs =
             acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Http(
                 agent_client_protocol::schema::v1::McpServerHttp::new(
                     "remote",
                     "https://example.com/mcp",
-                ),
+                )
+                .headers(vec![agent_client_protocol::schema::v1::HttpHeader::new(
+                    "Authorization",
+                    "Bearer secret",
+                )]),
             )])
-            .expect_err("http transport must be rejected");
-        assert_eq!(err.server, "remote");
-        assert_eq!(err.transport, "http");
+            .expect("http servers convert");
+        let config = &configs[0];
+        assert_eq!(config.transport, crate::mcp::McpTransport::Http);
+        assert_eq!(config.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(config.headers[0].name, "Authorization");
+        assert_eq!(config.headers[0].value, "Bearer secret");
     }
 
     /// `session/load` and `session/resume` apply the client-supplied MCP server
@@ -8091,6 +8472,9 @@ done
 
         let servers = vec![crate::mcp::McpServerConfig {
             name: "extra".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "/usr/bin/extra-mcp".to_string(),
             args: vec!["--flag".to_string()],
             env: vec![],
@@ -8154,6 +8538,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8193,6 +8580,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8238,6 +8628,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8253,6 +8646,9 @@ done
                 cwd.path().to_path_buf(),
                 Some(vec![crate::mcp::McpServerConfig {
                     name: "local".to_string(),
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: extra_mcp.display().to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
@@ -8294,6 +8690,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8309,6 +8708,9 @@ done
                 cwd.path().to_path_buf(),
                 Some(vec![crate::mcp::McpServerConfig {
                     name: "bifrost".to_string(),
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: extra_bifrost.display().to_string(),
                     args: vec![
                         "--root".to_string(),
@@ -8356,6 +8758,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8488,6 +8893,8 @@ done
                         }],
                         structured_output: None,
                         summary: None,
+                        current_plan: None,
+                        compaction_checkpoint: None,
                         fragment_id: None,
                     },
                 )
@@ -8566,6 +8973,8 @@ done
                     tool_exchanges: exchanges.clone(),
                     structured_output: None,
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -8679,6 +9088,8 @@ done
                     tool_exchanges: vec![r1.clone(), r2.clone()],
                     structured_output: None,
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -8763,6 +9174,8 @@ done
                         },
                     )),
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -9309,5 +9722,53 @@ done
                 .expect("empty rewind"),
             RewindOutcome::Empty
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_round_trips_without_replacing_raw_turn() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        store
+            .add_turn(
+                &session.id,
+                ConversationTurn {
+                    user_prompt: "raw user".into(),
+                    agent_response: "raw assistant".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+        let checkpoint = CompactionCheckpoint {
+            messages: vec![crate::llm_client::ChatMessage::user(
+                "<state_snapshot>compact</state_snapshot>",
+            )],
+            current_plan: None,
+        };
+        assert!(
+            store
+                .set_compaction_checkpoint(&session.id, 0, checkpoint.clone())
+                .await
+                .expect("checkpoint persists")
+        );
+
+        store.sessions.write().await.remove(&session.id);
+        let reloaded = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.history[0].user_prompt, "raw user");
+        assert_eq!(reloaded.history[0].agent_response, "raw assistant");
+        assert_eq!(
+            reloaded.history[0].compaction_checkpoint.as_ref(),
+            Some(&checkpoint)
+        );
     }
 }
