@@ -871,6 +871,9 @@ pub struct ToolRegistry {
     /// Post-capture shell-output minimizer; `None` when disabled via
     /// `--no-shell-minimizer`.
     shell_minimizer: Option<shell::ShellMinimizer>,
+    /// Guards the one-time semantic index readiness wait; see
+    /// `semantic_readiness`.
+    semantic_readiness: tokio::sync::OnceCell<()>,
 }
 
 fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String> {
@@ -1029,6 +1032,7 @@ impl ToolRegistry {
             agents: RwLock::new(agents),
             plugin_hooks,
             shell_minimizer,
+            semantic_readiness: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1423,6 +1427,21 @@ impl ToolRegistry {
         self.mcp_tool_servers
             .get(name)
             .is_some_and(|client| client.name() == "bifrost")
+    }
+
+    /// A connected MCP server by name, for harness-internal calls that cannot
+    /// go through the tool map: a server may expose a tool it deliberately
+    /// keeps out of `tools/list` (bifrost's `semantic_search_status` readiness
+    /// probe), and an unadvertised tool has no entry in `mcp_tool_servers`.
+    pub(crate) fn mcp_client(&self, name: &str) -> Option<&Arc<McpClient>> {
+        self.mcp_clients.iter().find(|client| client.name() == name)
+    }
+
+    /// Set once the semantic readiness wait has run for this registry. The
+    /// registry lives exactly as long as the session's MCP connections, so this
+    /// makes the wait a once-per-session event rather than a per-turn one.
+    pub(crate) fn semantic_readiness_once(&self) -> &tokio::sync::OnceCell<()> {
+        &self.semantic_readiness
     }
 
     /// Whether a tool's calls may run concurrently with adjacent safe calls.
@@ -2288,6 +2307,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             shell_minimizer: None,
+            semantic_readiness: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -2312,6 +2332,7 @@ mod tests {
             agents: RwLock::new(Arc::new(reg)),
             plugin_hooks: Vec::new(),
             shell_minimizer: None,
+            semantic_readiness: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -2510,6 +2531,7 @@ mod tests {
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
             shell_minimizer: None,
+            semantic_readiness: tokio::sync::OnceCell::new(),
         };
         let advertised: Vec<String> = registry
             .tool_definitions()

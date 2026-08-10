@@ -1868,6 +1868,18 @@ pub(crate) async fn run(
     context_prefix_len: usize,
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> LoopOutcome {
+    // Bifrost hydrates its semantic index asynchronously, so the first tool
+    // call that needs it would otherwise absorb the whole startup (bifrost
+    // AGENTS.md, "Index readiness design"). Wait for the index here instead:
+    // after the MCP connection is up, before the first request goes out, and
+    // once per session -- the registry lives as long as those connections do.
+    registry
+        .semantic_readiness_once()
+        .get_or_init(|| async {
+            crate::semantic_readiness::wait_for_semantic_index(registry, &cancel).await;
+        })
+        .await;
+
     let train_bifrost = train_bifrost_enabled();
     let mut current_plan = initial_plan;
     let mut history_compacted = false;

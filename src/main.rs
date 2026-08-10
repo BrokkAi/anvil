@@ -40,6 +40,7 @@ mod responses_api;
 mod runtime;
 mod sandbox_backend;
 mod secrets;
+mod semantic_readiness;
 mod semantic_rerank;
 mod session;
 mod setup_state;
