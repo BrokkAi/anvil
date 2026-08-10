@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::llm_client::ModelMetadata;
 use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
 use crate::structured_output::StructuredOutputResult;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, ToolRegistryOptions};
 
 // ---------------------------------------------------------------------------
 // Sandbox-bounded read limits
@@ -3263,6 +3263,22 @@ impl SessionStore {
         }
     }
 
+    pub(crate) fn remember_lsp_settings(
+        &self,
+        settings: crate::lsp::LspSettings,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .lsp = Some(settings);
+                Ok(())
+            }
+            None => crate::setup_state::remember_lsp_settings(settings),
+        }
+    }
+
     pub(crate) fn bedrock_catalog_mode(&self) -> crate::setup_state::BedrockCatalogMode {
         self.setup_state_snapshot()
             .bedrock_catalog_mode
@@ -3369,7 +3385,7 @@ impl SessionStore {
         cwd: PathBuf,
     ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents, mcp_servers, additional_directories) = {
+        let (skills, agents, mcp_servers, additional_directories, lsp_settings) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.closed_sessions.read().await.contains(session_id) {
                 return None;
@@ -3381,6 +3397,7 @@ impl SessionStore {
                 session.agents.clone(),
                 effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
                 session.additional_directories.clone(),
+                self.setup_state_snapshot().lsp.unwrap_or_default(),
             )
         };
         let normalized_additional_directories =
@@ -3410,7 +3427,10 @@ impl SessionStore {
                 skills,
                 agents,
                 plugin_hooks,
-                self.shell_minimizer_enabled,
+                ToolRegistryOptions {
+                    lsp_settings,
+                    shell_minimizer_enabled: self.shell_minimizer_enabled,
+                },
             )
             .await,
         );

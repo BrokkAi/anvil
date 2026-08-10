@@ -28,7 +28,7 @@ name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-agent-client-protocol = { version = "1", features = ["unstable"] }
+agent-client-protocol = { version = "2", features = ["unstable"] }
 # HTTP daemon for `anvil serve` (#317). Server-side only; LLM/MCP client
 # traffic stays on `reqwest`. Optional: gated behind the `http-api` feature.
 axum = { version = "0.8", optional = true }
@@ -68,6 +68,7 @@ tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 walkdir = "2"
 rustls-native-certs = "0.8"
 sha2 = "0.11"

@@ -28,6 +28,7 @@ mod infer;
 mod installer;
 mod kimi_auth;
 mod llm_client;
+mod lsp;
 mod mcp;
 mod multi_backend;
 mod openai_providers;
@@ -626,8 +627,39 @@ fn build_bedrock_backend(
     Some(backend)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
+    // The ACP connection + model-discovery path recurses deeply enough to
+    // overflow the 1MB main-thread stack Windows gives executables (the
+    // macOS/Linux main-thread default is 8MB, which is why only Windows hit
+    // the overflow). Host the tokio runtime on a dedicated 8MB-stack thread
+    // so the whole agent run gets the same headroom everywhere.
+    let handle = std::thread::Builder::new()
+        .name("anvil-main".to_string())
+        .stack_size(ANVIL_MAIN_STACK_BYTES)
+        .spawn(anvil_run)
+        .expect("failed to spawn anvil main thread");
+    match handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("Error: {error:?}");
+            std::process::exit(1);
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Stack for the Anvil server thread, in bytes. 8MB matches the macOS/Linux
+/// main-thread default so behavior is uniform across platforms.
+const ANVIL_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn anvil_run() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(anvil_main())
+}
+
+async fn anvil_main() -> Result<()> {
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
