@@ -1,10 +1,10 @@
 //! LLM relevance reranker wrapped transparently around bifrost's
 //! `semantic_search` MCP tool.
 //!
-//! `semantic_search` returns three independent, un-fused ranked lists
-//! (`vector_ranked` and `bm25_ranked` over symbols, `coedit_ranked` over
-//! files) and explicitly leaves fusion to the caller. Rather than dump all
-//! three raw lists into the model's context, the harness runs one *disposable*
+//! `semantic_search` returns independent, un-fused ranked lists
+//! (`vector_ranked` over symbols, `coedit_ranked` over files) and explicitly
+//! leaves fusion to the caller. Rather than dump the raw lists into the
+//! model's context, the harness runs one *disposable*
 //! LLM turn on top of the live conversation: it shows the selected utility model each
 //! candidate together with its (truncated) source or file summary and asks it
 //! to return just the relevant ones, best-first. The model then sees a single
@@ -20,7 +20,17 @@
 //! Provider failures return a tool error. Invalid structured output gets one
 //! corrective retry, then returns a tool error. A failed reranker must not
 //! silently change the result into a different retrieval treatment.
-//! Bifrost's raw three-list payload is never exposed to the model.
+//! Bifrost's raw ranked-list payload is never exposed to the model.
+//!
+//! Bifrost used to return a third list, `bm25_ranked`, from a lexical arm fused
+//! alongside the dense one, and a `retrieval_profile` naming the leg budget the
+//! `BIFROST_SEMANTIC_SEARCH_PROFILE` sweep had selected. Both were deleted in
+//! bifrost c353c862 once that sweep concluded against hybrid retrieval; the
+//! winning budget (dense `2*k`, co-edit `k`) is now the server's only behavior.
+//! This module still reads both where they appear. This branch replays archived
+//! r26 responses and can be pointed at an older bifrost build, so their absence
+//! is an ordinary input rather than an error, and nothing branches on which
+//! shape arrived.
 
 use futures::future::join_all;
 use serde_json::{Value, json};
@@ -92,8 +102,8 @@ struct Candidate {
     kind: CandidateKind,
     /// Fully-qualified symbol name or workspace-relative file path.
     name: String,
-    /// Which retrieval legs surfaced it (`vector`/`bm25` for symbols,
-    /// `coedit` for files).
+    /// Which retrieval legs surfaced it (`vector` for symbols, `coedit` for
+    /// files; `bm25` only when replaying a pre-c353c862 bifrost response).
     signals: Vec<&'static str>,
     /// `path:start-end` for symbols (from `get_symbol_sources`), if known.
     location: Option<String>,
@@ -629,14 +639,20 @@ fn prepare_bifrost_args(query: &str, final_k: usize) -> (Value, usize) {
     (json!({ "query": query, "k": base_k }), base_k)
 }
 
-/// Parse every realized item from `semantic_search`'s three legs into one
+/// Symbol legs, in the order they are folded together. `vector_ranked` is the
+/// only one a current bifrost sends; `bm25_ranked` is read for replayed and
+/// older-server responses (see the module docs). A leg the response omits
+/// simply contributes nothing, so its RRF contribution is zero everywhere.
+const SYMBOL_LEGS: [(&str, &str); 2] = [("vector_ranked", "vector"), ("bm25_ranked", "bm25")];
+
+/// Parse every realized item from `semantic_search`'s legs into one
 /// identity-deduplicated candidate list. The order is deterministic RRF order,
 /// which is also the provider-failure fallback order.
 fn parse_candidates(raw: &Value) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut index: HashMap<(CandidateKind, String), usize> = HashMap::new();
     let mut first_seen = 0;
-    for (key, signal) in [("vector_ranked", "vector"), ("bm25_ranked", "bm25")] {
+    for (key, signal) in SYMBOL_LEGS {
         let Some(array) = raw.get(key).and_then(Value::as_array) else {
             continue;
         };
@@ -1212,13 +1228,14 @@ fn trace_phase(
 }
 
 fn trace_rerank(trace: RerankTrace<'_>) {
-    let realized = |key: &str| {
-        trace
-            .raw
-            .get(key)
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-    };
+    // A leg the response does not carry is reported as null, not as zero. Zero
+    // is a real measurement -- r26 ran the `semantic-coedit-2-1` budget, whose
+    // bm25 leg was present with a zero depth -- and a dense-only server that
+    // has no lexical leg at all must not be averaged in as though it had asked
+    // and got nothing. cimeval's `mean_realized_*` skips nulls and keeps its
+    // r26 numbers.
+    let realized =
+        |key: &str| -> Option<usize> { trace.raw.get(key).and_then(Value::as_array).map(Vec::len) };
     append_trace_record(json!({
         "type": "semantic_search_rerank",
         "query": trace.query,
@@ -1226,6 +1243,9 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "query_count": trace.query_count,
         "requested_final_k": trace.final_k,
         "forwarded_base_k": trace.base_k,
+        // Null against a current bifrost: c353c862 removed the profile knob
+        // and fixed the budget at the arm the sweep chose. The field stays so a
+        // reader can tell a dense-only run from an r26 one that named its arm.
         "retrieval_profile": diagnostic(trace.raw, "retrieval_profile"),
         "requested_leg_counts": diagnostic(trace.raw, "requested_leg_counts"),
         "retrieval_timings": diagnostic(trace.raw, "timings"),
@@ -1467,6 +1487,66 @@ mod tests {
         assert!(clamped.len() < wide.len());
     }
 
+    /// The shape a current bifrost sends: dense symbols plus co-edited files,
+    /// no `bm25_ranked` and no `retrieval_profile`. Their absence must read as
+    /// "that leg does not exist", not as a parse failure or an empty result.
+    #[test]
+    fn dense_only_response_parses_and_reranks_without_the_removed_bm25_leg() {
+        let raw = json!({
+            "vector_ranked": [
+                { "fqfn": "a.B.c", "score": 0.9 },
+                { "fqfn": "a.B.d", "score": 0.5 }
+            ],
+            "coedit_ranked": [
+                { "path": "src/x.rs", "score": 0.3 }
+            ],
+            "requested_leg_counts": { "vector": 40, "coedit": 20 },
+            "timings": { "total_ms": 12, "wait_ready_ms": 0 },
+            "notes": []
+        });
+        let candidates = parse_candidates(&raw);
+        // RRF order: the two rank-0 hits tie and break on first-seen, so the
+        // co-edited file lands between the two dense hits.
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a.B.c", "src/x.rs", "a.B.d"]);
+        for candidate in &candidates {
+            let expected = match candidate.kind {
+                CandidateKind::Symbol => vec!["vector"],
+                CandidateKind::File => vec!["coedit"],
+            };
+            assert_eq!(candidate.signals, expected, "{}", candidate.name);
+        }
+
+        // The full rerank path over these candidates: prompt, model selection,
+        // ordering. A dense-only response reranks like any other.
+        let prompt = build_rerank_prompt("find the retry budget", &candidates, 20);
+        for candidate in &candidates {
+            assert!(prompt.contains(&format!("[{}]", candidate.id)));
+            assert!(prompt.contains(&candidate.name));
+        }
+        assert!(
+            !prompt.contains("bm25"),
+            "no lexical leg exists to advertise to the model: {prompt}"
+        );
+        let ordered = order_candidates(&candidates, &[selection("f1"), selection("s2")], 20)
+            .expect("a dense-only response reranks");
+        let ordered_names: Vec<&str> = ordered
+            .iter()
+            .map(|selected| selected.candidate.name.as_str())
+            .collect();
+        assert_eq!(ordered_names, vec!["src/x.rs", "a.B.d"]);
+
+        // The diagnostics the trace record reads are absent, not zero: cimeval
+        // averages `realized_bm25` and must not count a leg that no longer
+        // exists as a leg that returned nothing.
+        assert!(diagnostic(&raw, "retrieval_profile").is_none());
+        assert!(diagnostic(&raw, "requested_leg_counts").is_some());
+        assert!(diagnostic(&raw, "timings").is_some());
+        assert!(raw.get("bm25_ranked").is_none());
+    }
+
+    /// An archived r26 response, or one from a bifrost older than c353c862,
+    /// still carries the lexical leg. Replay must keep folding it in.
     #[test]
     fn candidates_dedup_symbols_and_union_signals() {
         let raw = json!({
@@ -1492,6 +1572,74 @@ mod tests {
         assert_eq!(file.id, "f1");
         assert_eq!(file.kind, CandidateKind::File);
         assert_eq!(file.signals, vec!["coedit"]);
+    }
+
+    async fn traced(raw: &Value) -> Value {
+        let utility = crate::utility_model::UtilityModelSelection {
+            model: "test-model".to_string(),
+            reasoning_effort: Some("low".to_string()),
+            source: "test",
+        };
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let path = cwd.path().join("anvil-trace.jsonl");
+        crate::trace_logging::with_trace_path(&path, async {
+            trace_rerank(RerankTrace {
+                query: "q",
+                query_index: 0,
+                query_count: 1,
+                raw,
+                final_k: 20,
+                base_k: 40,
+                deduplicated_count: 0,
+                context_bytes: 0,
+                selected_count: 0,
+                final_count: 0,
+                signature_candidate_count: 0,
+                signature_locator_count: 0,
+                final_with_signature_count: 0,
+                declaration_fallback_count: 0,
+                failure_reason: None,
+                usage: TokenUsage::default(),
+                utility: &utility,
+            })
+        })
+        .await;
+        let lines = std::fs::read_to_string(&path).expect("trace written");
+        serde_json::from_str(lines.lines().next().expect("one record")).expect("valid json")
+    }
+
+    /// cimeval averages `realized_bm25` across a campaign and skips nulls. A
+    /// leg the response never carried must therefore be null, not zero: zero is
+    /// a real measurement (r26 ran the `semantic-coedit-2-1` budget, whose bm25
+    /// leg was present at depth zero) and conflating the two would silently
+    /// fold dense-only runs into the r26 mean.
+    #[tokio::test]
+    async fn a_removed_leg_traces_as_absent_and_an_empty_one_as_zero() {
+        let dense_only = traced(&json!({
+            "vector_ranked": [{ "fqfn": "a.B.c", "score": 0.9 }],
+            "coedit_ranked": [],
+            "requested_leg_counts": { "vector": 40, "coedit": 20 },
+        }))
+        .await;
+        assert_eq!(dense_only["realized_vector"], 1);
+        assert_eq!(dense_only["realized_coedit"], 0);
+        assert!(
+            dense_only["realized_bm25"].is_null(),
+            "a leg bifrost no longer has must not be reported as an empty one: {dense_only}"
+        );
+        assert!(dense_only["retrieval_profile"].is_null());
+        assert_eq!(dense_only["requested_leg_counts"]["vector"], 40);
+
+        let r26_shape = traced(&json!({
+            "vector_ranked": [{ "fqfn": "a.B.c", "score": 0.9 }],
+            "bm25_ranked": [],
+            "coedit_ranked": [],
+            "retrieval_profile": "semantic-coedit-2-1",
+            "requested_leg_counts": { "vector": 40, "bm25": 0, "coedit": 20 },
+        }))
+        .await;
+        assert_eq!(r26_shape["realized_bm25"], 0);
+        assert_eq!(r26_shape["retrieval_profile"], "semantic-coedit-2-1");
     }
 
     #[test]

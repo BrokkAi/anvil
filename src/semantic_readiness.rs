@@ -86,9 +86,12 @@ fn configured_timeout() -> Duration {
     }
 }
 
-/// `semantic_search_status`, as far as this poll cares. Bifrost also reports
-/// `materialized_files` / `materialize_total_files`, which ride along in the
-/// trace record untouched.
+/// `semantic_search_status`, as far as this poll cares: `phase` and
+/// `pending_batches`, both untouched by bifrost c353c862. Bifrost also reports
+/// a live-unit count -- `indexed_chunks` before that commit, `indexed_files`
+/// after -- and `materialized_files` / `materialize_total_files`. None of them
+/// gate readiness, so the whole status object rides into the trace record
+/// verbatim and neither spelling needs a reader here.
 fn ready_now(status: &Value) -> bool {
     status.get("phase").and_then(Value::as_str) == Some("ready")
         && status
@@ -271,7 +274,7 @@ for line in sys.stdin:
         ready = polls >= 2
         status = {"phase": "ready" if ready else "starting",
                   "pending_batches": 0 if ready else 4,
-                  "indexed_chunks": 7,
+                  "indexed_files": 7,
                   "materialized_files": 1,
                   "materialize_total_files": 1}
         send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": status}})
@@ -283,10 +286,31 @@ for line in sys.stdin:
 mod tests {
     use super::*;
 
+    /// Bifrost c353c862 renamed the status field `indexed_chunks` to
+    /// `indexed_files` (an exact live chunk count was the workspace-wide join
+    /// that change deletes). Readiness reads neither, so both spellings -- and
+    /// a server reporting neither -- must behave identically here.
+    #[test]
+    fn the_renamed_live_unit_count_does_not_gate_readiness() {
+        let ready = json!({"phase": "ready", "pending_batches": 0});
+        let old = json!({"phase": "ready", "pending_batches": 0, "indexed_chunks": 12});
+        let new = json!({"phase": "ready", "pending_batches": 0, "indexed_files": 12});
+        assert!(ready_now(&ready));
+        assert!(ready_now(&old));
+        assert!(ready_now(&new));
+        // Whatever the server reported reaches the trace record untouched, so a
+        // consumer can read either name without anvil translating it.
+        for status in [&ready, &old, &new] {
+            let record =
+                readiness_record(Readiness::Ready, None, Duration::from_millis(3), 1, status);
+            assert_eq!(record["status"], *status);
+        }
+    }
+
     #[test]
     fn ready_needs_the_ready_phase_and_a_drained_queue() {
         assert!(ready_now(
-            &json!({"phase": "ready", "pending_batches": 0, "indexed_chunks": 12})
+            &json!({"phase": "ready", "pending_batches": 0, "indexed_files": 12})
         ));
         // Still ingesting: the phase flips to ready before the queue drains.
         assert!(!ready_now(&json!({"phase": "ready", "pending_batches": 3})));
@@ -374,7 +398,7 @@ mod tests {
             "the wait must poll again after `starting`: {record:?}"
         );
         assert!(record["wait_ready_ms"].is_number());
-        assert_eq!(record["status"]["indexed_chunks"], 7);
+        assert_eq!(record["status"]["indexed_files"], 7);
         assert!(
             records
                 .iter()
