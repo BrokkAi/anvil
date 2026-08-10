@@ -35,7 +35,7 @@ use crate::terminal_notifications::{
 };
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots};
-use crate::trace_logging::append_trace_record;
+use crate::trace_logging::{append_trace_record, tool_timing_record};
 use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
@@ -3408,38 +3408,16 @@ async fn execute_step_tool_calls(
                         }
                         exec
                     } else if tool_name == "update_plan" {
-                        match serde_json::from_value::<crate::plan::UpdatePlanArgs>(
-                            parsed_input.clone(),
-                        ) {
-                            Err(error) => ToolExecution {
-                                output: format!("Invalid update_plan arguments: {error}"),
-                                failed: true,
-                            },
-                            Ok(_plan)
-                                if sessions
-                                    .snapshot(session_id, registry.cwd())
-                                    .await
-                                    .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
-                            {
-                                ToolExecution {
-                                    output: "update_plan is unavailable in Plan mode.".to_string(),
-                                    failed: true,
-                                }
-                            }
-                            Ok(plan) => {
-                                maybe_send_session_update(
-                                    notifications,
-                                    spawned_cx.cx(),
-                                    session_id,
-                                    SessionUpdate::Plan(plan.to_acp()),
-                                );
-                                *current_plan = Some(plan);
-                                ToolExecution {
-                                    output: "Plan updated".to_string(),
-                                    failed: false,
-                                }
-                            }
-                        }
+                        execute_update_plan(
+                            registry,
+                            &parsed_input,
+                            sessions,
+                            session_id,
+                            notifications,
+                            spawned_cx,
+                            current_plan,
+                        )
+                        .await
                     } else if tool_name == "semantic_search"
                         && registry.is_bifrost_tool("semantic_search")
                     {
@@ -5374,6 +5352,63 @@ async fn run_post_tool_use_hooks(
     }
 }
 
+/// `update_plan` mutates loop state (the live plan) rather than touching the
+/// filesystem, so the loop answers it directly instead of handing it to the
+/// registry. That keeps it out of `execute_tool`, which is where every other
+/// tool's `tool_timing` record comes from, so the record is written here.
+///
+/// `update_plan` is not concurrency-safe (`TOOLS` in `tools/mod.rs`), so the
+/// parallel batch never reaches it; this is its only dispatch site.
+#[allow(clippy::too_many_arguments)]
+async fn execute_update_plan(
+    registry: &ToolRegistry,
+    args: &serde_json::Value,
+    sessions: &SessionStore,
+    session_id: &str,
+    notifications: NotificationMode,
+    spawned_cx: &SpawnedCx<'_>,
+    current_plan: &mut Option<crate::plan::UpdatePlanArgs>,
+) -> ToolExecution {
+    let started = Instant::now();
+    let exec = match serde_json::from_value::<crate::plan::UpdatePlanArgs>(args.clone()) {
+        Err(error) => ToolExecution {
+            output: format!("Invalid update_plan arguments: {error}"),
+            failed: true,
+        },
+        Ok(_plan)
+            if sessions
+                .snapshot(session_id, registry.cwd())
+                .await
+                .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
+        {
+            ToolExecution {
+                output: "update_plan is unavailable in Plan mode.".to_string(),
+                failed: true,
+            }
+        }
+        Ok(plan) => {
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::Plan(plan.to_acp()),
+            );
+            *current_plan = Some(plan);
+            ToolExecution {
+                output: "Plan updated".to_string(),
+                failed: false,
+            }
+        }
+    };
+    append_trace_record(tool_timing_record(
+        "update_plan",
+        None,
+        started.elapsed(),
+        !exec.failed,
+    ));
+    exec
+}
+
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
     // Extract the (truncated) shell command before `args` is moved into
     // execution; cloning the whole args value would deep-copy large
@@ -5415,26 +5450,6 @@ fn shell_command_snippet(tool_name: &str, args: &serde_json::Value) -> Option<St
     args.get("command")
         .and_then(serde_json::Value::as_str)
         .map(|command| command.chars().take(120).collect())
-}
-
-fn tool_timing_record(
-    tool_name: &str,
-    shell_command: Option<&str>,
-    duration: Duration,
-    success: bool,
-) -> serde_json::Value {
-    let mut record = serde_json::Map::new();
-    record.insert("type".to_string(), serde_json::json!("tool_timing"));
-    record.insert("tool".to_string(), serde_json::json!(tool_name));
-    if let Some(command) = shell_command {
-        record.insert("command".to_string(), serde_json::json!(command));
-    }
-    record.insert(
-        "duration_ms".to_string(),
-        serde_json::json!(duration.as_millis()),
-    );
-    record.insert("success".to_string(), serde_json::json!(success));
-    serde_json::Value::Object(record)
 }
 
 fn tool_result_to_execution(
@@ -5555,8 +5570,59 @@ fn is_likely_sandbox_limitation(output: &str) -> bool {
 ///   * Progress notifications: `NotificationMode::Silent` suppresses
 ///     per-tool `SessionUpdate`s. Permission prompts still fire when
 ///     the gate escalates.
+///
+/// The loop dispatches `task` here instead of through `execute_tool`, so this
+/// wrapper owns the call's `tool_timing` record. `duration` spans the whole
+/// nested run, which is what the parent model waited for. Recording it here
+/// rather than at the two dispatch sites keeps the record attached to the work.
 #[allow(clippy::too_many_arguments)]
 async fn execute_subagent(
+    llm: &Arc<dyn LlmBackend>,
+    registry: &ToolRegistry,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    args: &Value,
+    max_turns: usize,
+    idle_timeout: IdleTimeouts,
+    cancel: CancellationToken,
+    spawned_cx: &SpawnedCx<'_>,
+    session_id: &str,
+    sessions: &SessionStore,
+    depth: usize,
+    parent_permission_override: Option<PermissionMode>,
+) -> (ToolExecution, TokenUsage, BTreeMap<String, TokenUsage>) {
+    let started = Instant::now();
+    let (exec, usage, usage_by_model) = run_subagent(
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        service_tier,
+        structured_output,
+        args,
+        max_turns,
+        idle_timeout,
+        cancel,
+        spawned_cx,
+        session_id,
+        sessions,
+        depth,
+        parent_permission_override,
+    )
+    .await;
+    append_trace_record(tool_timing_record(
+        "task",
+        None,
+        started.elapsed(),
+        !exec.failed,
+    ));
+    (exec, usage, usage_by_model)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
     llm: &Arc<dyn LlmBackend>,
     registry: &ToolRegistry,
     model: &str,

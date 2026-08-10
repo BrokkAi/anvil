@@ -36,7 +36,7 @@ use crate::llm_client::{
 };
 use crate::structured_output::StructuredOutputRequest;
 use crate::tools::ToolRegistry;
-use crate::trace_logging::append_trace_record;
+use crate::trace_logging::{append_trace_record, tool_timing_record};
 
 const DEFAULT_FINAL_K: usize = 20;
 const MAX_FINAL_K: usize = 20;
@@ -135,7 +135,51 @@ struct RankedCandidate<'a> {
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
 /// and render a unified, relevance-ordered hit list. Reranker failures return
 /// an explicit tool error and never substitute reciprocal-rank fusion.
+///
+/// The tool loop dispatches `semantic_search` here instead of through
+/// `execute_tool`, so this wrapper -- not the loop -- owns the call's
+/// `tool_timing` record. `duration` spans the whole model-visible call (search,
+/// candidate context fetch, and the disposable rerank turns), which is what
+/// `execute_tool` records for every other tool: the time the model waited.
+///
+/// Note that this counts calls the `semantic_search_batch` records cannot: the
+/// batch-start record is written only after `parse_final_k` and `parse_queries`
+/// accept the arguments, so a rejected call never opens a batch. In the r26
+/// CodeScaleBench arm the traces hold 55 batch starts against 64
+/// `semantic_search` calls the model issued; argument rejection is one
+/// mechanism for that gap, and it is not yet established that it is the only
+/// one. Do not read batch-start counts as a call census.
 pub(crate) async fn rerank_semantic_search(
+    llm: &Arc<dyn LlmBackend>,
+    model: &str,
+    registry: &ToolRegistry,
+    prior_messages: &[ChatMessage],
+    args: &Value,
+    idle_timeout: IdleTimeouts,
+    cancel: &CancellationToken,
+) -> RerankOutcome {
+    let call_started = Instant::now();
+    let outcome = run_rerank(
+        llm,
+        model,
+        registry,
+        prior_messages,
+        args,
+        idle_timeout,
+        cancel,
+    )
+    .await;
+    append_trace_record(tool_timing_record(
+        "semantic_search",
+        None,
+        call_started.elapsed(),
+        !outcome.failed,
+    ));
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_rerank(
     llm: &Arc<dyn LlmBackend>,
     model: &str,
     registry: &ToolRegistry,
@@ -1803,5 +1847,100 @@ mod tests {
             id: id.to_string(),
             declarations: Vec::new(),
         }
+    }
+
+    /// The tool loop dispatches `semantic_search` into the reranker instead of
+    /// `execute_tool`, so the reranker owns the `tool_timing` record. Without
+    /// it the tool is invisible to every trace consumer that counts calls per
+    /// tool. Rejected arguments are the cheapest path through the wrapper: the
+    /// batch never opens, no MCP server is needed, and the LLM is never
+    /// reached -- and that is exactly the case `semantic_search_batch` cannot
+    /// count.
+    #[tokio::test]
+    async fn rerank_records_tool_timing_like_every_other_tool() {
+        use futures::future::BoxFuture;
+
+        struct UnusedBackend;
+        impl LlmBackend for UnusedBackend {
+            fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("rejected arguments never reach the rerank turn")
+            }
+
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                unimplemented!("rejected arguments never reach the rerank turn")
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+        )
+        .await;
+        let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
+
+        let outcome = crate::trace_logging::with_trace_path(
+            &trace,
+            rerank_semantic_search(
+                &llm,
+                "test-model",
+                &registry,
+                &[],
+                &json!({"queries": []}),
+                IdleTimeouts {
+                    first_progress: std::time::Duration::from_secs(1),
+                    inter_chunk: std::time::Duration::from_secs(1),
+                },
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.failed,
+            "an empty query list is rejected: {}",
+            outcome.output
+        );
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let records: Vec<Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        let timings: Vec<&Value> = records
+            .iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("tool_timing"))
+            .collect();
+        assert_eq!(
+            timings.len(),
+            1,
+            "expected exactly one tool_timing record, got {records:?}"
+        );
+        let timing = timings[0];
+        assert_eq!(
+            timing.get("tool").and_then(Value::as_str),
+            Some("semantic_search")
+        );
+        assert_eq!(timing.get("success").and_then(Value::as_bool), Some(false));
+        assert!(
+            timing.get("duration_ms").is_some_and(Value::is_number),
+            "timing record needs the same duration_ms field every other tool writes: {timing:?}"
+        );
+        // The gap this closes: a rejected call opens no batch, so the
+        // semantic_search_batch records cannot see it.
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("type").and_then(Value::as_str)
+                    != Some("semantic_search_batch")),
+            "a rejected call must not have opened a batch: {records:?}"
+        );
     }
 }
