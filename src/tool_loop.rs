@@ -5704,8 +5704,61 @@ fn is_likely_sandbox_limitation(output: &str) -> bool {
 ///   * Progress notifications: `NotificationMode::Silent` suppresses
 ///     per-tool `SessionUpdate`s. Permission prompts still fire when
 ///     the gate escalates.
+///
+/// The loop dispatches `task` here instead of through `execute_tool`, so this
+/// wrapper owns the call's `tool_timing` record. `duration` spans the whole
+/// nested run, which is what the parent model waited for. Recording it here
+/// rather than at the two dispatch sites keeps the record attached to the work.
 #[allow(clippy::too_many_arguments)]
 async fn execute_subagent(
+    llm: &Arc<dyn LlmBackend>,
+    registry: &ToolRegistry,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    args: &Value,
+    max_turns: usize,
+    idle_timeout: IdleTimeouts,
+    cancel: CancellationToken,
+    event_sink: &dyn EventSink,
+    permission_broker: &dyn PermissionBroker,
+    session_id: &str,
+    sessions: &SessionStore,
+    depth: usize,
+    parent_permission_override: Option<PermissionMode>,
+) -> (ToolExecution, TokenUsage) {
+    let started = Instant::now();
+    let (exec, usage) = run_subagent(
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        service_tier,
+        structured_output,
+        args,
+        max_turns,
+        idle_timeout,
+        cancel,
+        event_sink,
+        permission_broker,
+        session_id,
+        sessions,
+        depth,
+        parent_permission_override,
+    )
+    .await;
+    append_trace_record(tool_timing_record(
+        "task",
+        None,
+        started.elapsed(),
+        !exec.failed,
+    ));
+    (exec, usage)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
     llm: &Arc<dyn LlmBackend>,
     registry: &ToolRegistry,
     model: &str,
@@ -8647,6 +8700,106 @@ mod tests {
         assert!(!exec.failed);
         assert!(exec.output.contains("raw reranked output"));
         assert!(exec.output.contains("review-feedback"));
+    }
+
+    /// `task` dispatches into a nested agent run instead of `execute_tool`, so
+    /// it has to write its own `tool_timing` record. Rejected arguments are the
+    /// cheapest path through the wrapper: no nested run, no LLM, no registry
+    /// lookup -- and the record has to be there for the failed call too.
+    #[tokio::test]
+    async fn task_records_tool_timing_like_every_other_tool() {
+        struct UnusedBackend;
+        impl LlmBackend for UnusedBackend {
+            fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("a rejected task never reaches the nested run")
+            }
+
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                unimplemented!("a rejected task never reaches the nested run")
+            }
+        }
+        struct SilentSink;
+        impl EventSink for SilentSink {
+            fn emit(&self, _session_id: &str, _event: RuntimeEvent) {}
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            false,
+        )
+        .await;
+        let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Cancelled,
+            prompt: Arc::new(Mutex::new(None)),
+        };
+        let sessions = SessionStore::new("m".to_string());
+
+        let (exec, _usage) = crate::trace_logging::with_trace_path(
+            &trace,
+            execute_subagent(
+                &llm,
+                &registry,
+                "test-model",
+                None,
+                None,
+                None,
+                &serde_json::json!({"subagent_type": "", "description": "d", "prompt": "p"}),
+                1,
+                IdleTimeouts {
+                    first_progress: Duration::from_secs(1),
+                    inter_chunk: Duration::from_secs(1),
+                },
+                CancellationToken::new(),
+                &SilentSink,
+                &broker,
+                "session-that-was-never-created",
+                &sessions,
+                0,
+                None,
+            ),
+        )
+        .await;
+        assert!(exec.failed, "an empty subagent_type is rejected");
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let timings: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| {
+                record.get("type").and_then(serde_json::Value::as_str) == Some("tool_timing")
+            })
+            .collect();
+        assert_eq!(
+            timings.len(),
+            1,
+            "expected exactly one tool_timing record, got {timings:?} from {lines:?}"
+        );
+        let timing = &timings[0];
+        assert_eq!(
+            timing.get("tool").and_then(serde_json::Value::as_str),
+            Some("task")
+        );
+        assert_eq!(
+            timing.get("success").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            timing
+                .get("duration_ms")
+                .is_some_and(serde_json::Value::is_number),
+            "timing record needs the same duration_ms field every other tool writes: {timing:?}"
+        );
     }
 
     /// `update_plan` is answered inside the loop rather than by `execute_tool`,
