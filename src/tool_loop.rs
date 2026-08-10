@@ -1876,7 +1876,7 @@ pub(crate) async fn run(
     registry
         .semantic_readiness_once()
         .get_or_init(|| async {
-            crate::semantic_readiness::wait_for_semantic_index(registry, &cancel).await;
+            crate::semantic_readiness::wait_for_semantic_index(registry, None, &cancel).await;
         })
         .await;
 
@@ -5556,6 +5556,7 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
     // execution; cloning the whole args value would deep-copy large
     // payloads (e.g. write_file content) on every tool call.
     let shell_command = shell_command_snippet(request.tool_name, &request.args);
+    let activated_workspace = activated_workspace(request.tool_name, &request.args);
     let args = request.args;
     let start = Instant::now();
     let result = registry
@@ -5576,6 +5577,19 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
         duration,
         success,
     ));
+    // Bifrost keeps one semantic index at a time: activating a workspace
+    // assembles a replacement session and closes the previous indexer, so the
+    // new workspace hydrates from scratch and the session's opening wait does
+    // not cover it. Wait again here, after the timing record, so the hydration
+    // stays out of tool time instead of landing inside the next search.
+    if success && let Some(workspace) = activated_workspace {
+        crate::semantic_readiness::wait_for_semantic_index(
+            registry,
+            Some(&workspace),
+            request.cancel,
+        )
+        .await;
+    }
     tool_result_to_execution(
         request.tool_name,
         request.shell_sandboxed,
@@ -5586,6 +5600,18 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
         registry.is_mcp_tool(request.tool_name),
         result,
     )
+}
+
+/// The workspace an `activate_workspace` call is switching to; `None` for
+/// every other tool. Read before `args` moves into the call, like the shell
+/// snippet above.
+fn activated_workspace(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if tool_name != "activate_workspace" {
+        return None;
+    }
+    args.get("workspace_path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// First 120 chars of the `command` argument for `run_shell_command`
@@ -8712,6 +8738,106 @@ mod tests {
         assert!(!exec.failed);
         assert!(exec.output.contains("raw reranked output"));
         assert!(exec.output.contains("review-feedback"));
+    }
+
+    /// Bifrost keeps one semantic index at a time, so switching workspaces
+    /// hydrates a new one and the session's opening wait cannot cover it. Every
+    /// activation must therefore produce its own prehydration record; without
+    /// the wait in `execute_tool` the switch is silent and the next search pays
+    /// the hydration inside its own duration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn activating_a_workspace_waits_for_its_index_again() {
+        use crate::mcp::{McpFraming, McpServerConfig};
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let script = cwd.path().join("fake_bifrost.py");
+        std::fs::write(&script, crate::semantic_readiness::FAKE_BIFROST).expect("write server");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            vec![McpServerConfig {
+                name: "bifrost".to_string(),
+                transport: Default::default(),
+                command: std::env::var("ANVIL_PYTHON").unwrap_or_else(|_| "python3".to_string()),
+                url: None,
+                headers: Vec::new(),
+                args: vec![script.to_string_lossy().into_owned()],
+                env: Vec::new(),
+                framing: McpFraming::Line,
+                enabled: true,
+            }],
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            false,
+        )
+        .await;
+        let cancel = CancellationToken::new();
+
+        crate::trace_logging::with_trace_path(&trace, async {
+            // The session's opening wait, as `run` performs it.
+            crate::semantic_readiness::wait_for_semantic_index(&registry, None, &cancel).await;
+            // Then the model switches workspaces.
+            let exec = execute_tool(
+                &registry,
+                ToolExecRequest {
+                    tool_name: "activate_workspace",
+                    args: serde_json::json!({"workspace_path": "/repos/kafka"}),
+                    policy: SandboxPolicy::ReadOnly,
+                    outside_sandbox_once: false,
+                    sandbox_mode: None,
+                    shell_sandboxed: false,
+                    cancel: &cancel,
+                },
+            )
+            .await;
+            assert!(!exec.failed, "activation must succeed: {}", exec.output);
+        })
+        .await;
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect();
+        let prehydration: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| {
+                record.get("type").and_then(serde_json::Value::as_str)
+                    == Some("semantic_index_prehydration")
+            })
+            .collect();
+        assert_eq!(
+            prehydration.len(),
+            2,
+            "one record for the opening wait and one per activation, got {records:?}"
+        );
+        assert!(prehydration[0]["workspace"].is_null());
+        assert_eq!(prehydration[1]["workspace"], "/repos/kafka");
+        assert_eq!(prehydration[1]["phase"], "ready");
+        assert_eq!(
+            prehydration[1]["polls"].as_u64(),
+            Some(2),
+            "the new workspace hydrates from scratch, so the poll repeats: {:?}",
+            prehydration[1]
+        );
+        // The wait must land after the activation's own timing record, so it is
+        // never counted as tool time.
+        let types: Vec<&str> = records
+            .iter()
+            .filter_map(|record| record.get("type").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "semantic_index_prehydration",
+                "tool_timing",
+                "semantic_index_prehydration"
+            ],
+            "records out of order: {records:?}"
+        );
     }
 
     /// `task` dispatches into a nested agent run instead of `execute_tool`, so

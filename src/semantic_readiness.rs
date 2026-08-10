@@ -108,8 +108,18 @@ fn terminal(status: &Value) -> bool {
 /// turn is cancelled. Returns `None` when there is nothing to wait for -- no
 /// bifrost server, or semantic tools not enabled for this session -- in which
 /// case no record is written either.
+///
+/// `workspace` labels the record. It is `None` for the session's opening wait,
+/// where the active workspace is whatever bifrost started with, and the
+/// activated path after an `activate_workspace` call. There is one wait per
+/// workspace because bifrost keeps one index at a time: `activate_workspace`
+/// assembles a replacement session and closes the previous indexer
+/// (`searchtools_service.rs`, `handle_activate_workspace`), so every switch
+/// hydrates again and would otherwise charge that hydration to whichever call
+/// arrived first.
 pub(crate) async fn wait_for_semantic_index(
     registry: &ToolRegistry,
+    workspace: Option<&str>,
     cancel: &CancellationToken,
 ) -> Option<Readiness> {
     // `semantic_search` is advertised only when bifrost has the nlp feature,
@@ -169,7 +179,13 @@ pub(crate) async fn wait_for_semantic_index(
             "semantic index still hydrating after the readiness bound; running anyway"
         );
     }
-    append_trace_record(readiness_record(readiness, waited, polls, &last_status));
+    append_trace_record(readiness_record(
+        readiness,
+        workspace,
+        waited,
+        polls,
+        &last_status,
+    ));
     Some(readiness)
 }
 
@@ -186,6 +202,7 @@ pub(crate) async fn wait_for_semantic_index(
 /// record's own `wait_ready_ms`.
 fn readiness_record(
     readiness: Readiness,
+    workspace: Option<&str>,
     waited: Duration,
     polls: u64,
     status: &Value,
@@ -193,11 +210,74 @@ fn readiness_record(
     json!({
         "type": "semantic_index_prehydration",
         "phase": readiness.label(),
+        "workspace": workspace,
         "wait_ready_ms": waited.as_millis(),
         "polls": polls,
         "status": status,
     })
 }
+
+/// A fake bifrost that advertises `semantic_search` and `activate_workspace`
+/// and answers the hidden readiness probe: `starting` with a non-empty queue on
+/// the first poll after a (re)build, `ready` afterwards. `activate_workspace`
+/// resets that counter, the way the real server closes the old indexer and
+/// hydrates the newly activated workspace from scratch. Line-framed so the
+/// script stays readable.
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) const FAKE_BIFROST: &str = r#"
+import json, sys
+
+polls = 0
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "bifrost", "version": "0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": "semantic_search", "description": "fake",
+             "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "activate_workspace", "description": "fake",
+             "inputSchema": {"type": "object",
+                             "properties": {"workspace_path": {"type": "string"}}}}]}})
+    elif method == "tools/call":
+        name = msg["params"]["name"]
+        if name == "activate_workspace":
+            polls = 0
+            path = msg["params"].get("arguments", {}).get("workspace_path", "")
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "structuredContent": {"workspace_path": path},
+                "content": [{"type": "text", "text": "activated " + path}]}})
+            continue
+        if name != "semantic_search_status":
+            send({"jsonrpc": "2.0", "id": mid,
+                  "error": {"code": -32601, "message": "unexpected tool " + name}})
+            continue
+        polls += 1
+        ready = polls >= 2
+        status = {"phase": "ready" if ready else "starting",
+                  "pending_batches": 0 if ready else 4,
+                  "indexed_chunks": 7,
+                  "materialized_files": 1,
+                  "materialize_total_files": 1}
+        send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": status}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}})
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -224,54 +304,6 @@ mod tests {
         assert!(!terminal(&json!({"phase": "starting"})));
         assert!(!terminal(&json!({"phase": "ready"})));
     }
-
-    /// A fake bifrost that advertises `semantic_search` and answers the hidden
-    /// readiness probe: `starting` with a non-empty queue on the first poll,
-    /// `ready` afterwards. Line-framed so the script stays readable.
-    #[cfg(unix)]
-    const FAKE_BIFROST: &str = r#"
-import json, sys
-
-polls = 0
-def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    msg = json.loads(line)
-    mid = msg.get("id")
-    method = msg.get("method")
-    if mid is None:
-        continue
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "bifrost", "version": "0"}}})
-    elif method == "tools/list":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
-            {"name": "semantic_search", "description": "fake",
-             "inputSchema": {"type": "object", "properties": {}}}]}})
-    elif method == "tools/call":
-        name = msg["params"]["name"]
-        if name != "semantic_search_status":
-            send({"jsonrpc": "2.0", "id": mid,
-                  "error": {"code": -32601, "message": "unexpected tool " + name}})
-            continue
-        polls += 1
-        ready = polls >= 2
-        status = {"phase": "ready" if ready else "starting",
-                  "pending_batches": 0 if ready else 4,
-                  "indexed_chunks": 7,
-                  "materialized_files": 1,
-                  "materialize_total_files": 1}
-        send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": status}})
-    else:
-        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}})
-"#;
 
     /// End to end over a real stdio MCP connection: the wait must poll until
     /// the index reports ready, and must leave the wait in the trace as its own
@@ -314,7 +346,7 @@ for line in sys.stdin:
 
         let readiness = crate::trace_logging::with_trace_path(
             &trace,
-            wait_for_semantic_index(&registry, &CancellationToken::new()),
+            wait_for_semantic_index(&registry, None, &CancellationToken::new()),
         )
         .await;
         assert_eq!(readiness, Some(Readiness::Ready));
@@ -356,12 +388,14 @@ for line in sys.stdin:
     fn the_record_reports_the_wait_outside_any_retrieval_timings() {
         let record = readiness_record(
             Readiness::TimedOut,
+            Some("/repos/kafka"),
             Duration::from_millis(1500),
             4,
             &json!({"phase": "starting", "pending_batches": 7}),
         );
         assert_eq!(record["type"], "semantic_index_prehydration");
         assert_eq!(record["phase"], "timed_out");
+        assert_eq!(record["workspace"], "/repos/kafka");
         assert_eq!(record["wait_ready_ms"], 1500);
         assert_eq!(record["polls"], 4);
         assert_eq!(record["status"]["pending_batches"], 7);
