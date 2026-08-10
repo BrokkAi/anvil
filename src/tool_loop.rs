@@ -40,7 +40,7 @@ use crate::terminal_notifications::{
 };
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots, tool_result_failed};
-use crate::trace_logging::append_trace_record;
+use crate::trace_logging::{append_trace_record, tool_timing_record};
 use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
@@ -5550,26 +5550,6 @@ fn shell_command_snippet(tool_name: &str, args: &serde_json::Value) -> Option<St
     args.get("command")
         .and_then(serde_json::Value::as_str)
         .map(|command| command.chars().take(120).collect())
-}
-
-fn tool_timing_record(
-    tool_name: &str,
-    shell_command: Option<&str>,
-    duration: Duration,
-    success: bool,
-) -> serde_json::Value {
-    let mut record = serde_json::Map::new();
-    record.insert("type".to_string(), serde_json::json!("tool_timing"));
-    record.insert("tool".to_string(), serde_json::json!(tool_name));
-    if let Some(command) = shell_command {
-        record.insert("command".to_string(), serde_json::json!(command));
-    }
-    record.insert(
-        "duration_ms".to_string(),
-        serde_json::json!(duration.as_millis()),
-    );
-    record.insert("success".to_string(), serde_json::json!(success));
-    serde_json::Value::Object(record)
 }
 
 fn tool_result_to_execution(

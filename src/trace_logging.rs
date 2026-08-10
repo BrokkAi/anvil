@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::Mutex;
+use std::time::Duration;
 const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
 static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -11,6 +12,47 @@ struct TraceContext {
 
 tokio::task_local! {
     static TRACE_CONTEXT: TraceContext;
+}
+
+/// The one `tool_timing` shape every model-visible tool call must leave behind.
+/// Trace consumers count calls per tool by `tool` and sum `duration_ms`, so a
+/// dispatch path that skips this record makes its tool look unused.
+pub(crate) fn tool_timing_record(
+    tool_name: &str,
+    shell_command: Option<&str>,
+    duration: Duration,
+    success: bool,
+) -> serde_json::Value {
+    let mut record = serde_json::Map::new();
+    record.insert("type".to_string(), serde_json::json!("tool_timing"));
+    record.insert("tool".to_string(), serde_json::json!(tool_name));
+    if let Some(command) = shell_command {
+        record.insert("command".to_string(), serde_json::json!(command));
+    }
+    record.insert(
+        "duration_ms".to_string(),
+        serde_json::json!(duration.as_millis()),
+    );
+    record.insert("success".to_string(), serde_json::json!(success));
+    serde_json::Value::Object(record)
+}
+
+/// Route the records written by `future` to `path` for this task only, so a
+/// test can read them back without setting the process-global trace env var.
+#[cfg(test)]
+pub(crate) async fn with_trace_path<F: std::future::Future>(
+    path: &std::path::Path,
+    future: F,
+) -> F::Output {
+    TRACE_CONTEXT
+        .scope(
+            TraceContext {
+                path: path.to_string_lossy().into_owned(),
+                run_id: None,
+            },
+            future,
+        )
+        .await
 }
 
 pub fn append_trace_record(record: serde_json::Value) {

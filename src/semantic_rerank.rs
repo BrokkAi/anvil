@@ -31,6 +31,7 @@ use crate::llm_client::{
 };
 use crate::structured_output::StructuredOutputRequest;
 use crate::tools::ToolRegistry;
+use crate::trace_logging::{append_trace_record, tool_timing_record};
 
 /// Cap on how many symbol / file candidates we fetch context for and feed to
 /// the rerank turn. `semantic_search` returns at most `k` per leg (model
@@ -96,7 +97,42 @@ struct Candidate {
 /// Run `semantic_search`, then rerank its candidates with a disposable LLM turn
 /// and render a unified, relevance-ordered hit list. Falls back to bifrost's raw
 /// payload on any error or empty selection.
+///
+/// The tool loop routes `semantic_search` here instead of through
+/// `execute_tool`, so this wrapper -- not the loop -- owns the call's
+/// `tool_timing` trace record. `duration` spans the whole model-visible call
+/// (search, candidate context fetch, and the disposable rerank turn), which is
+/// what `execute_tool` records for every other tool: the time the model waited.
 pub(crate) async fn rerank_semantic_search(
+    llm: &Arc<dyn LlmBackend>,
+    model: &str,
+    registry: &ToolRegistry,
+    prior_messages: &[ChatMessage],
+    args: &Value,
+    idle_timeout: IdleTimeouts,
+    cancel: &CancellationToken,
+) -> RerankOutcome {
+    let started = std::time::Instant::now();
+    let outcome = run_rerank(
+        llm,
+        model,
+        registry,
+        prior_messages,
+        args,
+        idle_timeout,
+        cancel,
+    )
+    .await;
+    append_trace_record(tool_timing_record(
+        "semantic_search",
+        None,
+        started.elapsed(),
+        !outcome.failed,
+    ));
+    outcome
+}
+
+async fn run_rerank(
     llm: &Arc<dyn LlmBackend>,
     model: &str,
     registry: &ToolRegistry,
@@ -788,6 +824,90 @@ mod tests {
         assert!(
             !selected.iter().any(|id| id == "f2"),
             "did not expect the UI button file to be relevant, got {selected:?}"
+        );
+    }
+
+    /// The tool loop dispatches `semantic_search` into the reranker instead of
+    /// `execute_tool`, so the reranker owns the `tool_timing` record. Without
+    /// it the tool is invisible to every trace consumer that counts calls per
+    /// tool. This drives the reranker down its no-bifrost error path, which
+    /// needs no MCP server and never reaches the LLM.
+    #[tokio::test]
+    async fn rerank_records_tool_timing_like_every_other_tool() {
+        struct UnusedBackend;
+        impl LlmBackend for UnusedBackend {
+            fn list_models(&self) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("the rerank turn is never reached in this test")
+            }
+
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                unimplemented!("the rerank turn is never reached in this test")
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            false,
+        )
+        .await;
+        let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
+
+        let outcome = crate::trace_logging::with_trace_path(
+            &trace,
+            rerank_semantic_search(
+                &llm,
+                "test-model",
+                &registry,
+                &[],
+                &json!({"query": "where is the retry budget applied"}),
+                IdleTimeouts {
+                    first_progress: std::time::Duration::from_secs(1),
+                    inter_chunk: std::time::Duration::from_secs(1),
+                },
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.failed,
+            "no bifrost server is registered, so the search must fail: {}",
+            outcome.output
+        );
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let timings: Vec<Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("tool_timing"))
+            .collect();
+        assert_eq!(
+            timings.len(),
+            1,
+            "expected exactly one tool_timing record, got {timings:?} from {lines:?}"
+        );
+        let timing = &timings[0];
+        assert_eq!(
+            timing.get("tool").and_then(Value::as_str),
+            Some("semantic_search")
+        );
+        assert_eq!(timing.get("success").and_then(Value::as_bool), Some(false));
+        assert!(
+            timing.get("duration_ms").is_some_and(Value::is_number),
+            "timing record needs the same duration_ms field every other tool writes: {timing:?}"
+        );
+        assert!(
+            timing.get("timestamp").and_then(Value::as_str).is_some(),
+            "timing record needs the timestamp the trace writer stamps: {timing:?}"
         );
     }
 }
