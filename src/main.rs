@@ -38,6 +38,7 @@ mod plugins;
 mod responses_api;
 mod sandbox_backend;
 mod secrets;
+mod semantic_readiness;
 mod semantic_rerank;
 mod session;
 mod setup_state;
