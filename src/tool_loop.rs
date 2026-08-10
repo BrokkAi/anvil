@@ -3408,38 +3408,16 @@ async fn execute_step_tool_calls(
                         turn_usage.add(nested_usage);
                         exec
                     } else if tool_name == "update_plan" {
-                        match serde_json::from_value::<crate::plan::UpdatePlanArgs>(
-                            parsed_input.clone(),
-                        ) {
-                            Err(error) => ToolExecution {
-                                output: format!("Invalid update_plan arguments: {error}"),
-                                failed: true,
-                            },
-                            Ok(_plan)
-                                if sessions
-                                    .snapshot(session_id, registry.cwd())
-                                    .await
-                                    .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
-                            {
-                                ToolExecution {
-                                    output: "update_plan is unavailable in Plan mode.".to_string(),
-                                    failed: true,
-                                }
-                            }
-                            Ok(plan) => {
-                                maybe_emit_runtime_event(
-                                    notifications,
-                                    event_sink,
-                                    session_id,
-                                    RuntimeEvent::Plan(plan.clone()),
-                                );
-                                *current_plan = Some(plan);
-                                ToolExecution {
-                                    output: "Plan updated".to_string(),
-                                    failed: false,
-                                }
-                            }
-                        }
+                        execute_update_plan(
+                            registry,
+                            &parsed_input,
+                            sessions,
+                            session_id,
+                            notifications,
+                            event_sink,
+                            current_plan,
+                        )
+                        .await
                     } else if tool_name == "semantic_search"
                         && registry.is_bifrost_tool("semantic_search")
                     {
@@ -5502,6 +5480,63 @@ async fn run_post_tool_use_hooks(
             decision.reasons.join("\n")
         ));
     }
+}
+
+/// `update_plan` mutates loop state (the live plan) rather than touching the
+/// filesystem, so the loop answers it directly instead of handing it to the
+/// registry. That keeps it out of `execute_tool`, which is where every other
+/// tool's `tool_timing` record comes from, so the record is written here.
+///
+/// `update_plan` is not concurrency-safe (`TOOLS` in `tools/mod.rs`), so the
+/// parallel batch never reaches it; this is its only dispatch site.
+#[allow(clippy::too_many_arguments)]
+async fn execute_update_plan(
+    registry: &ToolRegistry,
+    args: &serde_json::Value,
+    sessions: &SessionStore,
+    session_id: &str,
+    notifications: NotificationMode,
+    event_sink: &dyn EventSink,
+    current_plan: &mut Option<crate::plan::UpdatePlanArgs>,
+) -> ToolExecution {
+    let started = Instant::now();
+    let exec = match serde_json::from_value::<crate::plan::UpdatePlanArgs>(args.clone()) {
+        Err(error) => ToolExecution {
+            output: format!("Invalid update_plan arguments: {error}"),
+            failed: true,
+        },
+        Ok(_plan)
+            if sessions
+                .snapshot(session_id, registry.cwd())
+                .await
+                .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
+        {
+            ToolExecution {
+                output: "update_plan is unavailable in Plan mode.".to_string(),
+                failed: true,
+            }
+        }
+        Ok(plan) => {
+            maybe_emit_runtime_event(
+                notifications,
+                event_sink,
+                session_id,
+                RuntimeEvent::Plan(plan.clone()),
+            );
+            *current_plan = Some(plan);
+            ToolExecution {
+                output: "Plan updated".to_string(),
+                failed: false,
+            }
+        }
+    };
+    append_trace_record(tool_timing_record(
+        "update_plan",
+        None,
+        started.elapsed(),
+        !exec.failed,
+    ));
+    exec
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
@@ -8612,6 +8647,77 @@ mod tests {
         assert!(!exec.failed);
         assert!(exec.output.contains("raw reranked output"));
         assert!(exec.output.contains("review-feedback"));
+    }
+
+    /// `update_plan` is answered inside the loop rather than by `execute_tool`,
+    /// so it has to write its own `tool_timing` record; without one the tool is
+    /// invisible to every trace consumer that counts calls per tool.
+    #[tokio::test]
+    async fn update_plan_records_tool_timing_like_every_other_tool() {
+        struct SilentSink;
+        impl EventSink for SilentSink {
+            fn emit(&self, _session_id: &str, _event: RuntimeEvent) {}
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            false,
+        )
+        .await;
+        let sessions = SessionStore::new("m".to_string());
+        let mut current_plan = None;
+
+        let exec = crate::trace_logging::with_trace_path(
+            &trace,
+            execute_update_plan(
+                &registry,
+                &serde_json::json!({"plan": [{"step": "first", "status": "in_progress"}]}),
+                &sessions,
+                "session-that-was-never-created",
+                NotificationMode::Silent,
+                &SilentSink,
+                &mut current_plan,
+            ),
+        )
+        .await;
+        assert!(!exec.failed, "a well-formed plan updates: {}", exec.output);
+        assert!(current_plan.is_some(), "the plan must reach the loop state");
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let timings: Vec<serde_json::Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| {
+                record.get("type").and_then(serde_json::Value::as_str) == Some("tool_timing")
+            })
+            .collect();
+        assert_eq!(
+            timings.len(),
+            1,
+            "expected exactly one tool_timing record, got {timings:?} from {lines:?}"
+        );
+        let timing = &timings[0];
+        assert_eq!(
+            timing.get("tool").and_then(serde_json::Value::as_str),
+            Some("update_plan")
+        );
+        assert_eq!(
+            timing.get("success").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            timing
+                .get("duration_ms")
+                .is_some_and(serde_json::Value::is_number),
+            "timing record needs the same duration_ms field every other tool writes: {timing:?}"
+        );
     }
 
     #[tokio::test]
