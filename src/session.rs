@@ -6279,6 +6279,11 @@ mod tests {
         use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
 
+        // `create_session` mints `permission_mode` via `initial_permission_mode`,
+        // which reads the process-wide `BROKK_ACP_PERMISSION_MODE` that the
+        // `initial_permission_mode_*` tests install. Same guard, same reason as
+        // `get_session_loads_from_disk_when_cold`.
+        let _env_guard = ENV_GUARD.lock().await;
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         write_legacy_session_config_setup(config_dir.path());
@@ -6527,6 +6532,10 @@ mod tests {
     /// never be persisted as the install-level preference.
     #[tokio::test(flavor = "current_thread")]
     async fn set_permission_mode_never_persists_to_setup_state() {
+        // The fresh session this test mints below must read the default
+        // permission mode, not the `BROKK_ACP_PERMISSION_MODE` that the
+        // `initial_permission_mode_*` tests install process-wide.
+        let _env_guard = ENV_GUARD.lock().await;
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
