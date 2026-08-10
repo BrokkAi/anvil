@@ -838,9 +838,14 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 ///
 /// `semantic_search` results are transparently reranked by the harness (see
 /// `crate::semantic_rerank`), so the model receives a single relevance-ordered
-/// list of hits with source/summaries -- not bifrost's three raw ranked lists.
+/// list of hits with source/summaries -- not bifrost's raw ranked lists.
+///
+/// The description says "semantic", not "semantic + lexical": bifrost deleted
+/// its BM25 arm in c353c862, so promising the model a lexical leg would
+/// misdescribe the tool and invite keyword-shaped queries that dense retrieval
+/// handles worst.
 fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
-    const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Given a natural-language \
+    const SEMANTIC_SEARCH: &str = "Semantic code search. Given a natural-language \
         query, returns a single relevance-ordered list of the most relevant symbols and files, \
         each with its source or a summary. Results are reranked for relevance to your query and \
         the current task, so prefer the order given and start from the top.";
@@ -2492,6 +2497,12 @@ mod tests {
         let overridden = mcp_tool_description("semantic_search", "bifrost's raw description");
         assert!(overridden.contains("relevance-ordered"));
         assert_ne!(overridden, "bifrost's raw description");
+        // Bifrost has no lexical arm since c353c862. Do not tell the model it
+        // does.
+        assert!(
+            !overridden.to_lowercase().contains("lexical"),
+            "the description must not advertise a retrieval leg bifrost removed: {overridden}"
+        );
         // Other tools keep bifrost's description unchanged.
         assert_eq!(
             mcp_tool_description("search_symbols", "bifrost's raw description"),

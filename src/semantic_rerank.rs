@@ -1,10 +1,10 @@
 //! LLM relevance reranker wrapped transparently around bifrost's
 //! `semantic_search` MCP tool.
 //!
-//! `semantic_search` returns three independent, un-fused ranked lists
-//! (`vector_ranked` and `bm25_ranked` over symbols, `coedit_ranked` over
-//! files) and explicitly leaves fusion to the caller. Rather than dump all
-//! three raw lists into the model's context, the harness runs one *disposable*
+//! `semantic_search` returns independent, un-fused ranked lists
+//! (`vector_ranked` over symbols, `coedit_ranked` over files) and explicitly
+//! leaves fusion to the caller. Rather than dump the raw lists into the
+//! model's context, the harness runs one *disposable*
 //! LLM turn on top of the live conversation: it shows the active model each
 //! candidate together with its (truncated) source or file summary and asks it
 //! to return just the relevant ones, best-first. The model then sees a single
@@ -18,6 +18,14 @@
 //!
 //! Every failure mode degrades to passing through bifrost's raw result, so the
 //! wrapper can only improve search, never break it.
+//!
+//! Bifrost used to return a third list, `bm25_ranked`, from a lexical arm fused
+//! alongside the dense one. That arm was deleted outright in bifrost c353c862
+//! after the hybrid A/B lost on tokens and money with no measurable task
+//! benefit, so a current server never sends the key. This module still reads it
+//! where it appears: replaying an archived response, or pointing the harness at
+//! an older bifrost build, are ordinary inputs, and the leg's absence is normal
+//! rather than an error. Nothing branches on which shape arrived.
 
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -85,8 +93,8 @@ struct Candidate {
     kind: CandidateKind,
     /// Fully-qualified symbol name or workspace-relative file path.
     name: String,
-    /// Which retrieval legs surfaced it (`vector`/`bm25` for symbols,
-    /// `coedit` for files).
+    /// Which retrieval legs surfaced it (`vector` for symbols, `coedit` for
+    /// files; `bm25` only when replaying a pre-c353c862 bifrost response).
     signals: Vec<&'static str>,
     /// `path:start-end` for symbols (from `get_symbol_sources`), if known.
     location: Option<String>,
@@ -233,12 +241,18 @@ async fn run_rerank(
     RerankOutcome::passthrough(output, usage)
 }
 
-/// Parse `semantic_search`'s three legs into a deduplicated candidate list:
-/// symbols (vector ∪ bm25, max score, unioned signals) then files (coedit).
+/// Symbol legs, in the order they are folded together. `vector_ranked` is the
+/// only one a current bifrost sends; `bm25_ranked` is read for replayed and
+/// older-server responses (see the module docs). A leg the response omits
+/// simply contributes nothing.
+const SYMBOL_LEGS: [(&str, &str); 2] = [("vector_ranked", "vector"), ("bm25_ranked", "bm25")];
+
+/// Parse `semantic_search`'s legs into a deduplicated candidate list: symbols
+/// (max score, unioned signals) then files (coedit).
 fn parse_candidates(raw: &Value) -> Vec<Candidate> {
     let mut symbols: Vec<(String, f32, Vec<&'static str>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    for (key, signal) in [("vector_ranked", "vector"), ("bm25_ranked", "bm25")] {
+    for (key, signal) in SYMBOL_LEGS {
         let Some(array) = raw.get(key).and_then(Value::as_array) else {
             continue;
         };
@@ -641,6 +655,48 @@ mod tests {
         assert!(clamped.len() < wide.len());
     }
 
+    /// The shape a current bifrost sends: dense symbols plus co-edited files,
+    /// no `bm25_ranked` key at all. Its absence must read as "that leg does not
+    /// exist", not as a parse failure or an empty result.
+    #[test]
+    fn dense_only_response_parses_without_the_removed_bm25_leg() {
+        let raw = json!({
+            "vector_ranked": [
+                { "fqfn": "a.B.c", "score": 0.9 },
+                { "fqfn": "a.B.d", "score": 0.5 }
+            ],
+            "coedit_ranked": [
+                { "path": "src/x.rs", "score": 0.3 }
+            ],
+            "requested_leg_counts": { "vector": 20, "coedit": 10 },
+            "timings": { "total_ms": 12 },
+            "notes": []
+        });
+        let candidates = parse_candidates(&raw);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a.B.c", "a.B.d", "src/x.rs"]);
+        for candidate in &candidates {
+            let expected = match candidate.kind {
+                CandidateKind::Symbol => vec!["vector"],
+                CandidateKind::File => vec!["coedit"],
+            };
+            assert_eq!(candidate.signals, expected, "{}", candidate.name);
+        }
+        // The rerank prompt is built from exactly these candidates, so a
+        // dense-only response still produces a full, model-ready turn.
+        let prompt = build_rerank_prompt("find the retry budget", &candidates);
+        for candidate in &candidates {
+            assert!(prompt.contains(&format!("[{}]", candidate.id)));
+            assert!(prompt.contains(&candidate.name));
+        }
+        assert!(
+            !prompt.contains("bm25"),
+            "no lexical leg exists to advertise to the model: {prompt}"
+        );
+    }
+
+    /// An archived response, or one from a bifrost older than c353c862, still
+    /// carries the lexical leg. Replay must keep folding it in.
     #[test]
     fn candidates_dedup_symbols_and_union_signals() {
         let raw = json!({
