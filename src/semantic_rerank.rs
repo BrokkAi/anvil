@@ -913,7 +913,10 @@ mod tests {
             Arc::new(crate::skills::SkillRegistry::default()),
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
-            false,
+            crate::tools::ToolRegistryOptions {
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
         )
         .await;
         let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
