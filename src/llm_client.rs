@@ -832,7 +832,7 @@ impl Serialize for ChatContentPart {
 /// Mirrors the `supported_reasoning_levels[]` entries returned by the
 /// ChatGPT `/models` endpoint. Backends without per-effort presets (Ollama,
 /// OpenAI `/v1/models`) simply leave the per-model vec empty.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReasoningLevelPreset {
     pub effort: String,
     pub description: String,
@@ -840,7 +840,7 @@ pub struct ReasoningLevelPreset {
 
 /// One optional service tier advertised by a provider for a model.
 /// Codex's ChatGPT subscription catalog uses this for fast/priority mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelServiceTier {
     pub id: String,
     pub name: String,
@@ -850,7 +850,7 @@ pub struct ModelServiceTier {
 /// Per-token USD pricing published by a provider's model catalog.
 ///
 /// OpenRouter and other providers may populate this from their model catalogs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct ModelPricing {
     pub input_cost_per_token_usd: f64,
     pub output_cost_per_token_usd: f64,
@@ -883,7 +883,7 @@ pub struct ModelDiscoveryNotice {
 /// The `id` is the wire identifier the backend expects in `stream_chat`;
 /// the optional reasoning fields are populated only for backends whose
 /// catalog publishes them (today: `CodexClient`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelMetadata {
     pub id: String,
     pub default_reasoning_level: Option<String>,

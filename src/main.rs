@@ -257,6 +257,15 @@ enum Command {
     /// (sessions, models, tools, runs) on a loopback listener.
     #[cfg(feature = "http-api")]
     Serve(http_api::ServeArgs),
+    /// List every model currently discoverable from the configured providers
+    /// (Codex, Ollama, DeepSeek, Kimi, OpenRouter, Bedrock, generic
+    /// OpenAI-compatible providers, ds4). Prints one wire id per line by
+    /// default; `--json` prints the full catalog metadata.
+    Models {
+        /// Print the full catalog as JSON instead of plain wire ids.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl std::fmt::Debug for Args {
@@ -627,6 +636,114 @@ fn build_bedrock_backend(
     Some(backend)
 }
 
+/// Build the full model catalog backend set from every configured provider
+/// (Codex, Ollama, hosted DeepSeek, Kimi, OpenRouter, Bedrock, generic
+/// OpenAI-compatible providers, ds4). Shared by the main agent path and the
+/// `models` CLI subcommand so both always see the same set of backends.
+async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>> {
+    // Fold any pre-consolidation per-provider credential files into the
+    // single secrets store before the backends read their credentials.
+    secrets::migrate_legacy_files();
+
+    let bedrock_catalog_mode = if transient_setup {
+        setup_state::BedrockCatalogMode::default()
+    } else {
+        setup_state::bedrock_catalog_mode()
+    };
+    let bedrock_backend = build_bedrock_backend(bedrock_catalog_mode);
+    let codex_backend = build_codex_backend().await;
+    let deepseek_backend = build_deepseek_backend();
+    let kimi_backend = build_kimi_backend();
+    let openai_backend = build_openai_compatible_backend()?;
+    let openrouter_backend = build_openrouter_backend();
+    let ollama_backend = Some(build_ollama_backend());
+
+    if bedrock_backend.is_none() {
+        tracing::info!(
+            "Bedrock backend not available; set {} or run `/setup bedrock key <token>` from a session to enable it.",
+            bedrock_client::BEDROCK_API_KEY_ENV
+        );
+    }
+    if codex_backend.is_none() {
+        tracing::info!(
+            "Codex backend not available; the picker will fall back to Ollama \
+             and hosted providers (if discovered). Run /setup codex from a session to add \
+             Codex -- the new credentials are picked up on the next discovery \
+             refresh, no restart required."
+        );
+    }
+    if deepseek_backend.is_none() {
+        tracing::info!(
+            "DeepSeek backend not available; set {} or run `/setup deepseek key <key>` \
+             from a session to enable hosted DeepSeek.",
+            discovery::DEEPSEEK_API_KEY_ENV
+        );
+    }
+    if kimi_backend.is_none() {
+        tracing::info!(
+            "Kimi backend not available; set {} or run `kimi login` to create {}.",
+            kimi_auth::KIMI_API_KEY_ENV,
+            kimi_auth::credentials_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "the Kimi Code credential file".to_string())
+        );
+    }
+    if openrouter_backend.is_none() {
+        tracing::info!(
+            "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
+             from a session to enable it.",
+            discovery::OPENROUTER_API_KEY_ENV
+        );
+    }
+
+    Ok(Arc::new(MultiBackend::new(vec![
+        BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
+        BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OLLAMA,
+            "Local models",
+            ollama_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::DS4, "ds4", None),
+        BackendRegistration::new(
+            discovery::ModelSource::DEEPSEEK,
+            "DeepSeek",
+            deepseek_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENAI,
+            "OpenAI-compatible",
+            openai_backend,
+        ),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENROUTER,
+            "OpenRouter",
+            openrouter_backend,
+        ),
+    ])))
+}
+
+/// `anvil models`: discover all models from the configured providers and
+/// print the resulting catalog, one wire id per line (`--json` for the full
+/// metadata). Mirrors the catalog a session's model picker shows.
+async fn run_models(transient_setup: bool, json: bool) -> Result<()> {
+    let llm = build_multi_backend(transient_setup).await?;
+    let models = llm.list_model_metadata().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&models)?);
+        return Ok(());
+    }
+    if models.is_empty() {
+        eprintln!("No models discovered from the configured providers.");
+        return Ok(());
+    }
+    for model in &models {
+        println!("{}", model.id);
+    }
+    Ok(())
+}
+
 fn main() {
     // The ACP connection + model-discovery path recurses deeply enough to
     // overflow the 1MB main-thread stack Windows gives executables (the
@@ -681,6 +798,9 @@ async fn anvil_main() -> Result<()> {
     }
     if let Some(Command::Infer(infer_args)) = &args.command {
         return infer::run(infer_args).await;
+    }
+    if let Some(Command::Models { json }) = &args.command {
+        return run_models(args.transient_setup, *json).await;
     }
 
     // Install the parser sandbox before any code that might load a SKILL.md
@@ -765,87 +885,7 @@ async fn anvil_main() -> Result<()> {
         ),
     }
 
-    // Fold any pre-consolidation per-provider credential files into the
-    // single secrets store before the backends read their credentials.
-    secrets::migrate_legacy_files();
-
-    let bedrock_catalog_mode = if args.transient_setup {
-        setup_state::BedrockCatalogMode::default()
-    } else {
-        setup_state::bedrock_catalog_mode()
-    };
-    let bedrock_backend = build_bedrock_backend(bedrock_catalog_mode);
-    let codex_backend = build_codex_backend().await;
-    let deepseek_backend = build_deepseek_backend();
-    let kimi_backend = build_kimi_backend();
-    let openai_backend = build_openai_compatible_backend()?;
-    let openrouter_backend = build_openrouter_backend();
-    let ollama_backend = Some(build_ollama_backend());
-
-    if bedrock_backend.is_none() {
-        tracing::info!(
-            "Bedrock backend not available; set {} or run `/setup bedrock key <token>` from a session to enable it.",
-            bedrock_client::BEDROCK_API_KEY_ENV
-        );
-    }
-    if codex_backend.is_none() {
-        tracing::info!(
-            "Codex backend not available; the picker will fall back to Ollama \
-             and hosted providers (if discovered). Run /setup codex from a session to add \
-             Codex -- the new credentials are picked up on the next discovery \
-             refresh, no restart required."
-        );
-    }
-    if deepseek_backend.is_none() {
-        tracing::info!(
-            "DeepSeek backend not available; set {} or run `/setup deepseek key <key>` \
-             from a session to enable hosted DeepSeek.",
-            discovery::DEEPSEEK_API_KEY_ENV
-        );
-    }
-    if kimi_backend.is_none() {
-        tracing::info!(
-            "Kimi backend not available; set {} or run `kimi login` to create {}.",
-            kimi_auth::KIMI_API_KEY_ENV,
-            kimi_auth::credentials_path()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|_| "the Kimi Code credential file".to_string())
-        );
-    }
-    if openrouter_backend.is_none() {
-        tracing::info!(
-            "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
-             from a session to enable it.",
-            discovery::OPENROUTER_API_KEY_ENV
-        );
-    }
-
-    let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(vec![
-        BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
-        BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
-        BackendRegistration::new(
-            discovery::ModelSource::OLLAMA,
-            "Local models",
-            ollama_backend,
-        ),
-        BackendRegistration::new(discovery::ModelSource::DS4, "ds4", None),
-        BackendRegistration::new(
-            discovery::ModelSource::DEEPSEEK,
-            "DeepSeek",
-            deepseek_backend,
-        ),
-        BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
-        BackendRegistration::new(
-            discovery::ModelSource::OPENAI,
-            "OpenAI-compatible",
-            openai_backend,
-        ),
-        BackendRegistration::new(
-            discovery::ModelSource::OPENROUTER,
-            "OpenRouter",
-            openrouter_backend,
-        ),
-    ]));
+    let llm = build_multi_backend(args.transient_setup).await?;
 
     // Kick off model discovery eagerly so any provider errors ("skipped"
     // log lines with HTTP status codes) appear immediately in the startup
@@ -940,6 +980,37 @@ async fn anvil_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_subcommand_parses_plain_and_json() {
+        let plain = Args::parse_from(["anvil", "models"]);
+        assert!(matches!(
+            plain.command,
+            Some(Command::Models { json: false })
+        ));
+        let json = Args::parse_from(["anvil", "models", "--json"]);
+        assert!(matches!(json.command, Some(Command::Models { json: true })));
+    }
+
+    #[test]
+    fn model_metadata_serializes_to_json() {
+        let m = llm_client::ModelMetadata {
+            id: "codex::gpt-5-codex".to_string(),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![llm_client::ReasoningLevelPreset {
+                effort: "high".to_string(),
+                description: "More thinking".to_string(),
+            }],
+            service_tiers: vec![],
+            supports_images: None,
+            context_length: None,
+            pricing: None,
+        };
+        let v = serde_json::to_value(&m).expect("metadata serializes");
+        assert_eq!(v["id"], "codex::gpt-5-codex");
+        assert_eq!(v["default_reasoning_level"], "medium");
+        assert_eq!(v["supported_reasoning_levels"][0]["effort"], "high");
+    }
 
     #[tokio::test]
     #[ignore = "live network smoke test; requires DEEPSEEK_API_KEY"]
