@@ -1034,7 +1034,8 @@ Each candidate has an id, the symbol or file it refers to, structured declaratio
 with ids, and (when available) private source or file-summary context. Decide which candidates \
 are genuinely relevant to the query and the task in this conversation. For every selected \
 candidate that has declaration ids, choose the one through five declarations most useful for \
-locating the relevant implementation. Omit irrelevant candidates.\n\n",
+locating the relevant implementation. Omit irrelevant candidates. Order all selected candidates \
+from strongest direct evidence to weakest supporting evidence.\n\n",
     );
     out.push_str(&format!(
         "Respond with ONLY a JSON object of the form {{\"relevant\": \
@@ -1580,6 +1581,7 @@ mod tests {
             assert!(prompt.contains(&format!("[{}]", candidate.id)));
             assert!(prompt.contains(&candidate.name));
         }
+        assert!(prompt.contains("strongest direct evidence to weakest supporting evidence"));
     }
 
     #[test]
