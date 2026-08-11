@@ -85,15 +85,18 @@ shell before launching brokk-acp to replace the discovered PATH.";
 ///
 /// Defaults are deliberately generous to accommodate JVM tooling
 /// (`mvn`, `gradle`), Go binaries (which reserve large virtual ranges),
-/// `rustc` LTO builds, and shared dev/CI hosts where `RLIMIT_NPROC` is
-/// counted per-UID across all sessions. Values are clamped to the
-/// parent's hard limit at spawn time, so requests above what the host
-/// permits land at the host limit (with a warning) instead of failing
-/// silently with EPERM inside `pre_exec`.
+/// and `rustc` LTO builds. NPROC is inherited by default because Linux
+/// counts it per real UID across the entire host, not per command or PID
+/// namespace: lowering it below unrelated host activity makes a healthy
+/// child unable to fork at all. Operators can still set an explicit NPROC
+/// cap; a true per-command process boundary belongs in a cgroup/PID namespace.
+/// Values are clamped to the parent's hard limit at spawn time, so requests
+/// above what the host permits land at the host limit (with a warning) instead
+/// of failing silently with EPERM inside `pre_exec`.
 #[cfg(unix)]
 const DEFAULT_RLIMIT_AS_BYTES: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB virtual address space per child
 #[cfg(unix)]
-const DEFAULT_RLIMIT_NPROC: u64 = 8192; // user-wide process count (Linux: per real UID across all sessions)
+const DEFAULT_RLIMIT_NPROC: u64 = libc::RLIM_INFINITY; // inherit the user-wide host limit
 #[cfg(unix)]
 const DEFAULT_RLIMIT_NOFILE: u64 = 4096; // open file descriptors per child
 #[cfg(unix)]
@@ -1087,6 +1090,11 @@ mod tests {
         assert_eq!(parse_rlimit_value("X", "lots", 999), 999);
         assert_eq!(parse_rlimit_value("X", "-1", 999), 999);
         assert_eq!(parse_rlimit_value("X", "1.5", 999), 999);
+    }
+
+    #[test]
+    fn nproc_is_uncapped_by_default_because_it_is_user_wide() {
+        assert_eq!(DEFAULT_RLIMIT_NPROC, libc::RLIM_INFINITY);
     }
 
     #[test]
