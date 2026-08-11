@@ -70,6 +70,15 @@ pub struct HistoryCompaction {
     pub after_tokens: usize,
 }
 
+/// Exact messages that compaction must retain outside the generated snapshot.
+///
+/// A long active turn must keep its user request verbatim. The request can
+/// contain an output schema or another exact contract that a summary can lose.
+pub struct HistoryPins<'a> {
+    pub current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
+    pub active_user_message: Option<&'a ChatMessage>,
+}
+
 const HISTORY_SNAPSHOT_PROMPT: &str = "You maintain the working memory of an AI coding agent. \
 Rewrite the supplied conversation history as a precise state snapshot that another agent can \
 continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
@@ -105,7 +114,7 @@ pub async fn compact_history(
     llm: &dyn LlmBackend,
     model: &str,
     history: &[ChatMessage],
-    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    pins: HistoryPins<'_>,
     context_length: Option<u32>,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
@@ -114,16 +123,27 @@ pub async fn compact_history(
         anyhow::bail!("cannot compact empty history");
     }
     let before_tokens = approximate_tokens_messages(history);
+    let mut compactable_history = history.to_vec();
+    if let Some(active_user_message) = pins.active_user_message {
+        let index = compactable_history
+            .iter()
+            .rposition(|message| message == active_user_message)
+            .ok_or_else(|| anyhow::anyhow!("active user message is not in compacted history"))?;
+        compactable_history.remove(index);
+    }
+    if compactable_history.is_empty() {
+        anyhow::bail!("cannot compact history with only a pinned user message");
+    }
     let budget = summarizer_input_budget(context_length);
     let mut usage = TokenUsage::default();
-    let tail_start = exact_tail_start(history, context_length);
-    let (history_to_summarize, exact_tail) = history.split_at(tail_start);
+    let tail_start = exact_tail_start(&compactable_history, context_length);
+    let (history_to_summarize, exact_tail) = compactable_history.split_at(tail_start);
     let history_to_summarize = if history_to_summarize.is_empty() {
-        history
+        &compactable_history[..]
     } else {
         history_to_summarize
     };
-    let exact_tail = if history_to_summarize.len() == history.len() {
+    let exact_tail = if history_to_summarize.len() == compactable_history.len() {
         &[][..]
     } else {
         exact_tail
@@ -141,8 +161,12 @@ pub async fn compact_history(
                     .await?;
             usage.add(call_usage);
             let snapshot = normalize_state_snapshot(&snapshot)?;
-            let mut checkpoint_messages = vec![ChatMessage::user(snapshot)];
-            if let Some(plan) = current_plan {
+            let mut checkpoint_messages = Vec::new();
+            if let Some(active_user_message) = pins.active_user_message {
+                checkpoint_messages.push(active_user_message.clone());
+            }
+            checkpoint_messages.push(ChatMessage::user(snapshot));
+            if let Some(plan) = pins.current_plan {
                 checkpoint_messages.push(ChatMessage::user(format!(
                     "<current_plan>\n{}\n</current_plan>",
                     serde_json::to_string_pretty(plan)?
@@ -1436,13 +1460,14 @@ mod tests {
     async fn compact_history_emits_snapshot_then_exact_tail() {
         use crate::llm_client::{FunctionCall, ToolCall};
 
-        let (backend, _, _) = ScriptedBackend::new(
+        let (backend, _, seen) = ScriptedBackend::new(
             "<state_snapshot><pending_tasks>finish parser</pending_tasks></state_snapshot>",
             "- extracted history",
             "- combined history",
         );
         let history = vec![
             ChatMessage::user("older evidence ".repeat(6_000)),
+            ChatMessage::user("Return only {\"files\": []}"),
             ChatMessage::assistant_tool_calls(vec![ToolCall {
                 id: "c1".into(),
                 r#type: "function".into(),
@@ -1457,7 +1482,10 @@ mod tests {
             &backend,
             "mock",
             &history,
-            None,
+            HistoryPins {
+                current_plan: None,
+                active_user_message: Some(&history[1]),
+            },
             Some(8_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
@@ -1465,17 +1493,28 @@ mod tests {
         .await
         .expect("compaction succeeds");
 
+        assert_eq!(
+            compacted.checkpoint_messages[0].text_content(),
+            Some("Return only {\"files\": []}")
+        );
         assert!(
-            compacted.checkpoint_messages[0]
+            compacted.checkpoint_messages[1]
                 .text_content()
                 .unwrap()
                 .contains("<state_snapshot>")
         );
-        assert_eq!(compacted.checkpoint_messages[1].role, "assistant");
-        assert_eq!(compacted.checkpoint_messages[2].role, "tool");
+        assert_eq!(compacted.checkpoint_messages[2].role, "assistant");
+        assert_eq!(compacted.checkpoint_messages[3].role, "tool");
         assert_eq!(
-            compacted.checkpoint_messages[2].text_content(),
+            compacted.checkpoint_messages[3].text_content(),
             Some("exact recent result")
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|prompt| !prompt.contains("{\"files\": []}")),
+            "the pinned user contract must not enter the generated snapshot"
         );
         assert!(compacted.after_tokens < compacted.before_tokens);
     }

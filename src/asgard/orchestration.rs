@@ -349,6 +349,10 @@ pub(crate) async fn run_asgard_trajectory_loop(
         registries.push(registry);
     }
     let mut common_messages = initial_messages;
+    let active_user_message = common_messages[context_prefix_len.min(common_messages.len())..]
+        .iter()
+        .rfind(|message| message.role == "user")
+        .cloned();
     let original_task = asgard_original_task(&common_messages);
     let mut selected_trajectory_initial = common_messages.clone();
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
@@ -1016,7 +1020,10 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 llm.as_ref(),
                 &winner.model,
                 &dynamic,
-                canonical_plan.as_ref(),
+                crate::context_manager::HistoryPins {
+                    current_plan: canonical_plan.as_ref(),
+                    active_user_message: active_user_message.as_ref(),
+                },
                 context_length,
                 idle_timeout,
                 cancel.clone(),

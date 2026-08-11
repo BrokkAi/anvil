@@ -1827,6 +1827,10 @@ pub(crate) async fn run(
     let train_bifrost = train_bifrost_enabled();
     let mut current_plan = initial_plan;
     let mut history_compacted = false;
+    let active_user_message = messages[context_prefix_len.min(messages.len())..]
+        .iter()
+        .rfind(|message| message.role == "user")
+        .cloned();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
         Err(error) => {
@@ -2246,7 +2250,10 @@ pub(crate) async fn run(
                 llm.as_ref(),
                 model,
                 &dynamic_history,
-                current_plan.as_ref(),
+                crate::context_manager::HistoryPins {
+                    current_plan: current_plan.as_ref(),
+                    active_user_message: active_user_message.as_ref(),
+                },
                 context_length,
                 idle_timeout,
                 cancel.clone(),

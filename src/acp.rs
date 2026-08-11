@@ -4365,7 +4365,7 @@ async fn build_prompt_messages_with_compression(
     idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
 ) -> PreparedPrompt {
-    use crate::context_manager::{compact_history, context_budget};
+    use crate::context_manager::{HistoryPins, compact_history, context_budget};
 
     let budget = context_budget(context_length);
     let prefix_len = prompt_prefix_messages(snap, snap.mode).len();
@@ -4391,7 +4391,10 @@ async fn build_prompt_messages_with_compression(
         llm,
         &snap.model,
         &history_messages,
-        current_plan.as_ref(),
+        HistoryPins {
+            current_plan: current_plan.as_ref(),
+            active_user_message: None,
+        },
         context_length,
         idle_timeout,
         cancel,
@@ -9718,7 +9721,10 @@ async fn handle_compress(
         llm,
         &snap.model,
         &history,
-        current_plan,
+        crate::context_manager::HistoryPins {
+            current_plan,
+            active_user_message: None,
+        },
         context_length,
         idle_timeout,
         cancel,
