@@ -699,9 +699,17 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
     Ok(Arc::new(MultiBackend::new(vec![
         BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
         BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
-        BackendRegistration::new(discovery::ModelSource::OLLAMA, "Local models", ollama_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OLLAMA,
+            "Local models",
+            ollama_backend,
+        ),
         BackendRegistration::new(discovery::ModelSource::DS4, "ds4", None),
-        BackendRegistration::new(discovery::ModelSource::DEEPSEEK, "DeepSeek", deepseek_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::DEEPSEEK,
+            "DeepSeek",
+            deepseek_backend,
+        ),
         BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
         BackendRegistration::new(
             discovery::ModelSource::OPENAI,
@@ -976,7 +984,10 @@ mod tests {
     #[test]
     fn models_subcommand_parses_plain_and_json() {
         let plain = Args::parse_from(["anvil", "models"]);
-        assert!(matches!(plain.command, Some(Command::Models { json: false })));
+        assert!(matches!(
+            plain.command,
+            Some(Command::Models { json: false })
+        ));
         let json = Args::parse_from(["anvil", "models", "--json"]);
         assert!(matches!(json.command, Some(Command::Models { json: true })));
     }
@@ -998,10 +1009,7 @@ mod tests {
         let v = serde_json::to_value(&m).expect("metadata serializes");
         assert_eq!(v["id"], "codex::gpt-5-codex");
         assert_eq!(v["default_reasoning_level"], "medium");
-        assert_eq!(
-            v["supported_reasoning_levels"][0]["effort"],
-            "high"
-        );
+        assert_eq!(v["supported_reasoning_levels"][0]["effort"], "high");
     }
 
     #[tokio::test]
