@@ -1317,19 +1317,21 @@ impl ToolRegistry {
     /// dispatch path. This is for harness-internal orchestration (e.g. the
     /// `semantic_search` reranker) that needs to read the structured payload
     /// (`vector_ranked`, `sources`, `summaries`, ...) rather than a
-    /// pretty-printed blob. The tool runs without any permission gate, so only
-    /// call it for read-only bifrost tools on harness initiative.
+    /// pretty-printed blob. Bifrost can accept internal tools that it omits
+    /// from `tools/list`, so select the server itself instead of the advertised
+    /// tool map. The tool runs without any permission gate, so only call it for
+    /// read-only bifrost tools on harness initiative.
     pub(crate) async fn call_bifrost_tool_raw(
         &self,
         name: &str,
         args: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let client = self
-            .mcp_tool_servers
-            .get(name)
-            .filter(|client| client.name() == "bifrost")
+            .mcp_clients
+            .iter()
+            .find(|client| client.name() == "bifrost")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("bifrost tool '{name}' is not available"))?;
+            .ok_or_else(|| anyhow::anyhow!("bifrost MCP server is not available"))?;
         let args = match client.tools().iter().find(|tool| tool.name == name) {
             Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
             None => args,
@@ -2332,6 +2334,73 @@ mod tests {
             mcp_tool_description("search_symbols", "bifrost's raw description", false),
             "bifrost's raw description"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_bifrost_calls_can_use_unadvertised_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script = temp.path().join("fake-bifrost.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{}}}"
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"semantic_search\",\"description\":\"Fake\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      ;;
+    *'"method":"tools/call"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"structuredContent\":{\"hidden_call_succeeded\":true}}}"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write fake Bifrost");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("stat fake Bifrost")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make fake Bifrost executable");
+
+        let config = McpServerConfig {
+            name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
+            command: script.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        };
+        let registry = ToolRegistry::new(
+            temp.path().to_path_buf(),
+            Vec::new(),
+            None,
+            vec![config],
+            Arc::new(SkillRegistry::default()),
+            Arc::new(AgentRegistry::default()),
+            Vec::new(),
+        )
+        .await;
+
+        assert!(registry.is_bifrost_tool("semantic_search"));
+        assert!(!registry.is_bifrost_tool("get_symbol_sources"));
+        let result = registry
+            .call_bifrost_tool_raw(
+                "get_symbol_sources",
+                json!({ "symbols": ["example.Type.method"] }),
+            )
+            .await
+            .expect("hidden Bifrost tool call succeeds");
+        assert_eq!(result, json!({ "hidden_call_succeeded": true }));
     }
 
     #[test]

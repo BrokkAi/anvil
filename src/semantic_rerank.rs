@@ -22,6 +22,7 @@
 //! silently change the result into a different retrieval treatment.
 //! Bifrost's raw three-list payload is never exposed to the model.
 
+use anyhow::Context;
 use futures::future::join_all;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -305,7 +306,7 @@ async fn rerank_one_semantic_search(
         );
     }
 
-    // 3. Fetch source / summaries for the candidates (best effort).
+    // 3. Fetch source / summaries for the candidates.
     trace_phase(
         "context_fetch_start",
         query,
@@ -315,7 +316,20 @@ async fn rerank_one_semantic_search(
         started,
         None,
     );
-    fetch_context(registry, &mut candidates, workspace).await;
+    if let Err(err) = fetch_context(registry, &mut candidates, workspace).await {
+        trace_phase(
+            "context_fetch_error",
+            query,
+            query_index,
+            query_count,
+            &utility,
+            started,
+            Some(&format!("{err:#}")),
+        );
+        return RerankOutcome::error(format!(
+            "Error: semantic_search context fetch failed: {err:#}"
+        ));
+    }
     trace_phase(
         "context_fetch_complete",
         query,
@@ -694,14 +708,14 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
 }
 
 /// Batch-fetch symbol source (`get_symbol_sources`) and file summaries
-/// (`get_summaries`) for the candidates and attach truncated context. Partial
-/// or total failure is non-fatal: a candidate without context still appears by
-/// name in the rerank prompt.
+/// (`get_summaries`) for the candidates and attach truncated context. A Bifrost
+/// error fails the semantic-search call. Name-only results are a different tool
+/// contract, not a valid fallback for failed context enrichment.
 async fn fetch_context(
     registry: &ToolRegistry,
     candidates: &mut [Candidate],
     workspace: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     for start in (0..candidates.len()).step_by(CONTEXT_FETCH_BATCH) {
         let end = (start + CONTEXT_FETCH_BATCH).min(candidates.len());
         let symbols: Vec<String> = candidates[start..end]
@@ -717,10 +731,11 @@ async fn fetch_context(
         let summary_targets: Vec<String> = symbols.iter().chain(&files).cloned().collect();
 
         if available_private_context_bytes(candidates) < MAX_TOTAL_CONTEXT_BYTES {
-            fetch_symbol_context(registry, candidates, &symbols, workspace).await;
+            fetch_symbol_context(registry, candidates, &symbols, workspace).await?;
         }
-        fetch_summary_context(registry, candidates, &summary_targets, workspace).await;
+        fetch_summary_context(registry, candidates, &summary_targets, workspace).await?;
     }
+    Ok(())
 }
 
 async fn fetch_symbol_context(
@@ -728,33 +743,19 @@ async fn fetch_symbol_context(
     candidates: &mut [Candidate],
     symbols: &[String],
     workspace: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     if symbols.is_empty() {
-        return;
+        return Ok(());
     }
-    match registry
+    let value = registry
         .call_bifrost_tool_raw(
             "get_symbol_sources",
             bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
         )
         .await
-    {
-        Ok(value) => attach_symbol_sources(candidates, &value),
-        Err(_) if symbols.len() > 1 => {
-            for symbol in symbols {
-                if let Ok(value) = registry
-                    .call_bifrost_tool_raw(
-                        "get_symbol_sources",
-                        bifrost_args_with_workspace(json!({ "symbols": [symbol] }), workspace),
-                    )
-                    .await
-                {
-                    attach_symbol_sources(candidates, &value);
-                }
-            }
-        }
-        Err(_) => {}
-    }
+        .context("get_symbol_sources failed during semantic-search enrichment")?;
+    attach_symbol_sources(candidates, &value);
+    Ok(())
 }
 
 async fn fetch_summary_context(
@@ -762,9 +763,9 @@ async fn fetch_summary_context(
     candidates: &mut [Candidate],
     targets: &[String],
     workspace: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     if targets.is_empty() {
-        return;
+        return Ok(());
     }
     // Bifrost deliberately degrades an oversized aggregate summary to compact
     // file outlines. That is useful for an interactive caller, but discards the
@@ -778,9 +779,13 @@ async fn fetch_summary_context(
         )
     }))
     .await;
-    for value in summaries.into_iter().flatten() {
+    for (target, value) in targets.iter().zip(summaries) {
+        let value = value.with_context(|| {
+            format!("get_summaries failed for '{target}' during semantic-search enrichment")
+        })?;
         attach_summaries(candidates, &value);
     }
+    Ok(())
 }
 
 fn available_private_context_bytes(candidates: &[Candidate]) -> usize {
@@ -1423,6 +1428,35 @@ fn clamp_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn context_fetch_reports_bifrost_errors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let registry = ToolRegistry::new(
+            temp.path().to_path_buf(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+        )
+        .await;
+        let mut candidates = parse_candidates(&json!({
+            "vector_ranked": [
+                { "fqfn": "example.Type.method", "score": 1.0 }
+            ],
+            "coedit_ranked": []
+        }));
+
+        let error = fetch_context(&registry, &mut candidates, Some("backend"))
+            .await
+            .expect_err("missing Bifrost context service must fail enrichment");
+        assert!(
+            format!("{error:#}").contains("get_symbol_sources failed"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[test]
     fn short_source_is_unchanged() {
