@@ -96,8 +96,10 @@ struct Candidate {
     /// Which retrieval legs surfaced it (`vector`/`bm25` for symbols,
     /// `coedit` for files).
     signals: Vec<&'static str>,
-    /// `path:start-end` for symbols (from `get_symbol_sources`), if known.
-    location: Option<String>,
+    /// Where the retrieved chunk sits, for symbols (from `get_symbol_sources`).
+    /// Kept structured so the agent-facing renderer can ask whether a
+    /// declaration is in the same file without re-parsing a rendered string.
+    location: Option<ChunkLocation>,
     /// Truncated source (symbols) or rendered summary (files), if fetched.
     context: Option<String>,
     /// Structured declaration signatures supplied by bifrost. These are
@@ -108,6 +110,22 @@ struct Candidate {
     rrf_score: f64,
     /// First raw-list position, used to make equal RRF scores deterministic.
     first_seen: usize,
+}
+
+/// The chunk range bifrost retrieved, before any declaration refines it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkLocation {
+    path: String,
+    lines: Option<(u64, u64)>,
+}
+
+impl std::fmt::Display for ChunkLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.lines {
+            Some((start, end)) => write!(f, "{}:{start}-{end}", self.path),
+            None => write!(f, "{}", self.path),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -867,11 +885,10 @@ fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
         let path = block.get("path").and_then(Value::as_str);
         let start = block.get("start_line").and_then(Value::as_u64);
         let end = block.get("end_line").and_then(Value::as_u64);
-        candidate.location = match (path, start, end) {
-            (Some(path), Some(start), Some(end)) => Some(format!("{path}:{start}-{end}")),
-            (Some(path), _, _) => Some(path.to_string()),
-            _ => None,
-        };
+        candidate.location = path.map(|path| ChunkLocation {
+            path: path.to_string(),
+            lines: start.zip(end),
+        });
     }
 }
 
@@ -1065,7 +1082,7 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
     let signals = candidate.signals.join(", ");
     let mut out = format!("[{}] {kind} {} ({signals})\n", candidate.id, candidate.name);
     if let Some(location) = &candidate.location {
-        out.push_str(location);
+        out.push_str(&location.to_string());
         out.push('\n');
     }
     if candidate.declarations.is_empty() {
@@ -1292,17 +1309,42 @@ fn render_unified(
             candidate.name,
             candidate.signals.join(", ")
         ));
-        if let Some(location) = &candidate.location {
+        // A declaration carries its own path and a range that is tighter than
+        // the chunk's, so the chunk location only earns a line when it names a
+        // file no declaration names. That happens on a C++ header/implementation
+        // split, where the chunk is the .cpp body and the declaration the .h.
+        let location_names_another_file = match &candidate.location {
+            None => false,
+            Some(location) => {
+                selected.declarations.is_empty()
+                    || selected
+                        .declarations
+                        .iter()
+                        .any(|declaration| declaration.path != location.path)
+            }
+        };
+        if let Some(location) = &candidate.location
+            && location_names_another_file
+        {
             out.push_str(&format!("   {location}\n"));
         }
         if selected.declarations.is_empty() {
             out.push_str("   signature unavailable\n");
         } else {
             for declaration in &selected.declarations {
+                // For a symbol candidate bifrost returns the declaration of the
+                // symbol that was asked for, so repeating the name here says
+                // nothing. A file candidate's declarations name the symbols
+                // inside that file, which the header line does not, so they stay.
+                let named = if declaration.symbol == candidate.name {
+                    String::new()
+                } else {
+                    format!(" {}", declaration.symbol)
+                };
                 out.push_str(&format!(
-                    "   {} {} at {}:{}-{}\n",
+                    "   {}{} at {}:{}-{}\n",
                     declaration.kind,
-                    declaration.symbol,
+                    named,
                     declaration.path,
                     declaration.start_line,
                     declaration.end_line
@@ -1739,6 +1781,71 @@ mod tests {
         let fallback = order_candidates(&candidates, &[selection("f1")], 20).unwrap();
         assert!(fallback[0].declaration_fallback);
         assert_eq!(fallback[0].declarations.len(), 2);
+    }
+
+    /// The agent card must not say the same thing twice. Measured over a
+    /// 16-task CodeScale arm, the declaration line repeated the candidate name
+    /// on all 1,376 declarations, and repeated the chunk's file on 88 percent
+    /// of them. The remaining 12 percent are a C++ header/implementation split,
+    /// where the chunk is the .cpp body and the declaration the .h, and there
+    /// the chunk location is the only place the .cpp appears.
+    #[test]
+    fn agent_card_drops_the_repeated_name_but_keeps_a_second_file() {
+        let card = |raw: Value, summaries: Value, id: &str| {
+            let mut candidates = parse_candidates(&raw);
+            attach_symbol_sources(&mut candidates, &summaries);
+            attach_summaries(&mut candidates, &summaries);
+            let ordered = order_candidates(&candidates, &[selection(id)], 20).unwrap();
+            render_unified("q", &ordered, 1, None)
+        };
+
+        // Declaration in the same file as the chunk: the name and the file are
+        // stated once each.
+        let same_file = card(
+            json!({ "vector_ranked": [{ "fqfn": "app.handlers.load", "score": 1.0 }] }),
+            json!({
+                "sources": [{"label":"app.handlers.load","path":"app/handlers.py","start_line":27,"end_line":104,"text":"body"}],
+                "summaries": [{"label":"app.handlers.load","path":"app/handlers.py","elements":[
+                    {"path":"app/handlers.py","symbol":"app.handlers.load","kind":"function","start_line":27,"end_line":104,"text":"def load(self):"}
+                ]}]
+            }),
+            "s1",
+        );
+        assert!(same_file.contains("1. symbol app.handlers.load [vector]"));
+        assert!(same_file.contains("   function at app/handlers.py:27-104"));
+        assert!(same_file.contains("def load(self):"));
+        assert_eq!(same_file.matches("app.handlers.load").count(), 1);
+        assert_eq!(same_file.matches("app/handlers.py").count(), 1);
+
+        // Declaration in a different file: both files survive, the name still
+        // appears once.
+        let split = card(
+            json!({ "vector_ranked": [{ "fqfn": "llvm.IntegerType.get", "score": 1.0 }] }),
+            json!({
+                "sources": [{"label":"llvm.IntegerType.get","path":"lib/IR/Type.cpp","start_line":318,"end_line":340,"text":"body"}],
+                "summaries": [{"label":"llvm.IntegerType.get","path":"lib/IR/Type.cpp","elements":[
+                    {"path":"include/llvm/IR/DerivedTypes.h","symbol":"llvm.IntegerType.get","kind":"function","start_line":66,"end_line":66,"text":"static IntegerType *get();"}
+                ]}]
+            }),
+            "s1",
+        );
+        assert!(split.contains("   lib/IR/Type.cpp:318-340"));
+        assert!(split.contains("   function at include/llvm/IR/DerivedTypes.h:66-66"));
+        assert_eq!(split.matches("llvm.IntegerType.get").count(), 1);
+
+        // A file candidate's declarations name symbols the header line does not,
+        // so those names must stay.
+        let file = card(
+            json!({ "coedit_ranked": [{ "path": "src/config.rs", "score": 1.0 }] }),
+            json!({
+                "summaries": [{"label":"src/config.rs","path":"src/config.rs","elements":[
+                    {"path":"src/config.rs","symbol":"load","kind":"function","start_line":10,"end_line":12,"text":"fn load()"}
+                ]}]
+            }),
+            "f1",
+        );
+        assert!(file.contains("1. file src/config.rs [coedit]"));
+        assert!(file.contains("   function load at src/config.rs:10-12"));
     }
 
     fn live_candidate(
