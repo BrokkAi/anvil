@@ -828,11 +828,21 @@ fn executable_additional_directories_from_manifest(_manifest: &SessionManifest) 
 // Per-session state (in-memory)
 // ---------------------------------------------------------------------------
 
+/// A stable model-facing name for one repository that Bifrost can analyze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisWorkspace {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    /// Explicit analysis workspaces from the current ACP lifecycle request.
+    /// This authority is never restored from an untrusted saved session.
+    pub analysis_workspaces: Option<Vec<AnalysisWorkspace>>,
     permission_scope_root: PathBuf,
     pub mode: SessionMode,
     pub model: String,
@@ -933,6 +943,7 @@ pub struct Session {
 struct WorkspaceRootsRollback {
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    analysis_workspaces: Option<Vec<AnalysisWorkspace>>,
     manifest_cwd: Option<String>,
     manifest_additional_directories: Option<Vec<String>>,
     permission_scope_root: PathBuf,
@@ -1025,6 +1036,7 @@ impl Session {
             id,
             cwd,
             additional_directories,
+            analysis_workspaces: None,
             permission_scope_root,
             mode,
             model,
@@ -1111,6 +1123,7 @@ impl Session {
             id,
             cwd,
             additional_directories,
+            analysis_workspaces: None,
             permission_scope_root,
             mode,
             model,
@@ -1183,6 +1196,7 @@ impl std::error::Error for SessionIdMismatch {}
 pub struct SessionSnapshot {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    pub analysis_workspaces: Option<Vec<AnalysisWorkspace>>,
     pub mode: SessionMode,
     pub model: String,
     pub history: Vec<ConversationTurn>,
@@ -3385,7 +3399,14 @@ impl SessionStore {
         cwd: PathBuf,
     ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents, mcp_servers, additional_directories, lsp_settings) = {
+        let (
+            skills,
+            agents,
+            mcp_servers,
+            additional_directories,
+            lsp_settings,
+            analysis_workspaces,
+        ) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.closed_sessions.read().await.contains(session_id) {
                 return None;
@@ -3398,14 +3419,21 @@ impl SessionStore {
                 effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
                 session.additional_directories.clone(),
                 self.setup_state_snapshot().lsp.unwrap_or_default(),
+                session.analysis_workspaces.clone(),
             )
         };
         let normalized_additional_directories =
             normalize_additional_directories(&additional_directories);
+        let analysis_workspaces = crate::mcp::effective_analysis_workspaces(
+            &normalized_cwd,
+            &normalized_additional_directories,
+            analysis_workspaces.as_deref(),
+        );
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
             && existing.cwd() == normalized_cwd.as_path()
             && existing.additional_roots() == normalized_additional_directories.as_slice()
+            && existing.analysis_workspaces() == analysis_workspaces.as_deref()
         {
             existing.set_skills(skills).await;
             existing.set_agents(agents).await;
@@ -3428,6 +3456,7 @@ impl SessionStore {
                 agents,
                 plugin_hooks,
                 ToolRegistryOptions {
+                    analysis_workspaces,
                     lsp_settings,
                     shell_minimizer_enabled: self.shell_minimizer_enabled,
                 },
@@ -3980,6 +4009,7 @@ impl SessionStore {
                 (
                     s.cwd.clone(),
                     s.additional_directories.clone(),
+                    s.analysis_workspaces.clone(),
                     s.mode,
                     s.model.clone(),
                     s.history.clone(),
@@ -3991,7 +4021,7 @@ impl SessionStore {
                 s.skills.clone(),
             )
         };
-        let (cwd, additional_directories, mode, model, history) = snap_base;
+        let (cwd, additional_directories, analysis_workspaces, mode, model, history) = snap_base;
         // Resolve "user has no pick" to the model's
         // default_reasoning_level so the backend gets a concrete
         // intent. Models that publish no presets resolve to None and
@@ -4013,6 +4043,7 @@ impl SessionStore {
         Some(SessionSnapshot {
             cwd,
             additional_directories,
+            analysis_workspaces,
             mode,
             model,
             history,
@@ -4141,6 +4172,7 @@ impl SessionStore {
             let previous = WorkspaceRootsRollback {
                 cwd: session.cwd.clone(),
                 additional_directories: session.additional_directories.clone(),
+                analysis_workspaces: session.analysis_workspaces.clone(),
                 manifest_cwd: session.manifest.cwd.clone(),
                 manifest_additional_directories: session.manifest.additional_directories.clone(),
                 permission_scope_root: session.permission_scope_root.clone(),
@@ -4153,6 +4185,7 @@ impl SessionStore {
             };
             session.cwd = cwd;
             session.additional_directories = additional_directories.clone();
+            session.analysis_workspaces = None;
             session.manifest.cwd = Some(session.cwd.to_string_lossy().into_owned());
             session.manifest.additional_directories =
                 additional_directories_manifest(&additional_directories);
@@ -4192,6 +4225,7 @@ impl SessionStore {
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = previous.cwd;
             session.additional_directories = previous.additional_directories;
+            session.analysis_workspaces = previous.analysis_workspaces;
             session.manifest.cwd = previous.manifest_cwd;
             session.manifest.additional_directories = previous.manifest_additional_directories;
             session.permission_scope_root = previous.permission_scope_root;
@@ -4203,6 +4237,26 @@ impl SessionStore {
             session.activated_skills = previous.activated_skills;
         }
         self.invalidate_registry(id).await;
+    }
+
+    pub async fn set_analysis_workspaces(
+        &self,
+        id: &str,
+        analysis_workspaces: Option<Vec<AnalysisWorkspace>>,
+    ) {
+        let changed = if let Some(session) = self.sessions.write().await.get_mut(id) {
+            if session.analysis_workspaces == analysis_workspaces {
+                false
+            } else {
+                session.analysis_workspaces = analysis_workspaces;
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.invalidate_registry(id).await;
+        }
     }
 
     /// Mark a skill as activated for this session so the
@@ -8386,7 +8440,7 @@ done
 
     #[cfg(unix)]
     fn bifrost_spawn_args(cwd: &Path) -> Vec<String> {
-        crate::mcp::McpServerConfig::bifrost().rendered_args(&normalize_cwd(cwd))
+        crate::mcp::McpServerConfig::bifrost().rendered_args(&normalize_cwd(cwd), None)
     }
 
     #[cfg(unix)]

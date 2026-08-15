@@ -80,6 +80,16 @@ pub struct HistoryCompaction {
     pub after_tokens: usize,
 }
 
+/// Exact messages that compaction must retain outside the generated snapshot.
+///
+/// A long active turn must keep its user request verbatim. The request can
+/// contain an output schema or another exact contract that a summary can lose.
+#[derive(Default)]
+pub struct HistoryPins<'a> {
+    pub current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
+    pub active_user_message: Option<&'a ChatMessage>,
+}
+
 /// The `<state_snapshot>` XML schema, shared verbatim by the rendered
 /// fallback prompt and the native in-conversation instruction so the tag
 /// list has exactly one source of truth.
@@ -184,7 +194,7 @@ pub async fn compact_history(
     all_messages: &[ChatMessage],
     dynamic_start: usize,
     tools: Option<&[ToolDefinition]>,
-    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    pins: HistoryPins<'_>,
     reasoning_effort: Option<String>,
     context_length: Option<u32>,
     idle_timeout: IdleTimeouts,
@@ -195,16 +205,27 @@ pub async fn compact_history(
         anyhow::bail!("cannot compact empty history");
     }
     let before_tokens = approximate_tokens_messages(history);
+    let mut compactable_history = history.to_vec();
+    if let Some(active_user_message) = pins.active_user_message {
+        let index = compactable_history
+            .iter()
+            .rposition(|message| message == active_user_message)
+            .ok_or_else(|| anyhow::anyhow!("active user message is not in compacted history"))?;
+        compactable_history.remove(index);
+    }
+    if compactable_history.is_empty() {
+        anyhow::bail!("cannot compact history with only a pinned user message");
+    }
     let budget = summarizer_input_budget(context_length);
     let mut usage = TokenUsage::default();
-    let tail_start = exact_tail_start(history, context_length);
-    let (history_to_summarize, exact_tail) = history.split_at(tail_start);
+    let tail_start = exact_tail_start(&compactable_history, context_length);
+    let (history_to_summarize, exact_tail) = compactable_history.split_at(tail_start);
     let history_to_summarize = if history_to_summarize.is_empty() {
-        history
+        &compactable_history[..]
     } else {
         history_to_summarize
     };
-    let exact_tail = if history_to_summarize.len() == history.len() {
+    let exact_tail = if history_to_summarize.len() == compactable_history.len() {
         &[][..]
     } else {
         exact_tail
@@ -238,8 +259,7 @@ pub async fn compact_history(
         {
             Ok((snapshot, call_usage)) => {
                 usage.add(call_usage);
-                match build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)
-                {
+                match build_checkpoint(&snapshot, &digests, &pins, exact_tail, before_tokens) {
                     Ok((checkpoint_messages, after_tokens)) => {
                         return Ok(HistoryCompaction {
                             checkpoint_messages,
@@ -293,7 +313,7 @@ pub async fn compact_history(
             .await?;
             usage.add(call_usage);
             let (checkpoint_messages, after_tokens) =
-                build_checkpoint(&snapshot, &digests, current_plan, exact_tail, before_tokens)?;
+                build_checkpoint(&snapshot, &digests, &pins, exact_tail, before_tokens)?;
             return Ok(HistoryCompaction {
                 checkpoint_messages,
                 usage,
@@ -354,15 +374,22 @@ pub async fn compact_history(
 fn build_checkpoint(
     raw_snapshot: &str,
     digests: &str,
-    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    pins: &HistoryPins<'_>,
     exact_tail: &[ChatMessage],
     before_tokens: usize,
 ) -> Result<(Vec<ChatMessage>, usize)> {
     let snapshot = normalize_state_snapshot(raw_snapshot)?;
-    let mut checkpoint_messages = vec![ChatMessage::user(format!(
+    let mut checkpoint_messages = Vec::new();
+    // The active user request is replayed verbatim ahead of the snapshot so
+    // an exact contract in it (an output schema, for example) survives a
+    // compaction that happens in the middle of the turn serving it.
+    if let Some(active_user_message) = pins.active_user_message {
+        checkpoint_messages.push(active_user_message.clone());
+    }
+    checkpoint_messages.push(ChatMessage::user(format!(
         "{CHECKPOINT_PREAMBLE}\n\n{snapshot}{digests}"
-    ))];
-    if let Some(plan) = current_plan {
+    )));
+    if let Some(plan) = pins.current_plan {
         checkpoint_messages.push(ChatMessage::user(format!(
             "<current_plan>\n{}\n</current_plan>",
             serde_json::to_string_pretty(plan)?
@@ -1887,13 +1914,14 @@ mod tests {
     async fn compact_history_emits_snapshot_then_exact_tail() {
         use crate::llm_client::{FunctionCall, ToolCall};
 
-        let (backend, _, _) = ScriptedBackend::new(
+        let (backend, _, seen) = ScriptedBackend::new(
             "<state_snapshot><pending_tasks>finish parser</pending_tasks></state_snapshot>",
             "- extracted history",
             "- combined history",
         );
         let history = vec![
             ChatMessage::user("older evidence ".repeat(6_000)),
+            ChatMessage::user("Return only {\"files\": []}"),
             ChatMessage::assistant_tool_calls(vec![ToolCall {
                 id: "c1".into(),
                 r#type: "function".into(),
@@ -1910,24 +1938,38 @@ mod tests {
             &history,
             0,
             None,
+            HistoryPins {
+                current_plan: None,
+                active_user_message: Some(&history[1]),
+            },
             None,
-            None,
-            Some(100_000),
+            Some(8_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
         .expect("compaction succeeds");
 
-        let first_message = compacted.checkpoint_messages[0].text_content().unwrap();
-        assert!(first_message.starts_with(CHECKPOINT_PREAMBLE));
-        assert!(first_message.contains("<state_snapshot>"));
-        assert!(first_message.contains("<files_already_read>"));
-        assert_eq!(compacted.checkpoint_messages[1].role, "assistant");
-        assert_eq!(compacted.checkpoint_messages[2].role, "tool");
         assert_eq!(
-            compacted.checkpoint_messages[2].text_content(),
+            compacted.checkpoint_messages[0].text_content(),
+            Some("Return only {\"files\": []}")
+        );
+        let checkpoint = compacted.checkpoint_messages[1].text_content().unwrap();
+        assert!(checkpoint.starts_with(CHECKPOINT_PREAMBLE));
+        assert!(checkpoint.contains("<state_snapshot>"));
+        assert!(checkpoint.contains("<files_already_read>"));
+        assert_eq!(compacted.checkpoint_messages[2].role, "assistant");
+        assert_eq!(compacted.checkpoint_messages[3].role, "tool");
+        assert_eq!(
+            compacted.checkpoint_messages[3].text_content(),
             Some("exact recent result")
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|prompt| !prompt.contains("{\"files\": []}")),
+            "the pinned user contract must not enter the generated snapshot"
         );
         assert!(compacted.after_tokens < compacted.before_tokens);
     }
@@ -2067,7 +2109,7 @@ mod tests {
             &all_messages,
             1,
             Some(&tools),
-            None,
+            HistoryPins::default(),
             None,
             Some(200_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
@@ -2135,7 +2177,7 @@ mod tests {
             &all_messages,
             1,
             None,
-            None,
+            HistoryPins::default(),
             None,
             Some(200_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),
@@ -2189,7 +2231,7 @@ mod tests {
             &all_messages,
             1,
             None,
-            None,
+            HistoryPins::default(),
             None,
             Some(1_000),
             IdleTimeouts::uniform(Duration::from_secs(60)),

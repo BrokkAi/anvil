@@ -361,6 +361,7 @@ mod tests {
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },

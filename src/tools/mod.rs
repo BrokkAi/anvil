@@ -858,21 +858,97 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 ///
 /// `semantic_search` results are transparently reranked by the harness (see
 /// `crate::semantic_rerank`), so the model receives a single relevance-ordered
-/// list of hits with source/summaries -- not bifrost's raw ranked lists.
+/// query-local lists of signature locators -- not bifrost's raw ranked lists.
 ///
 /// The description says "semantic", not "semantic + lexical": bifrost deleted
 /// its BM25 arm in c353c862, so promising the model a lexical leg would
 /// misdescribe the tool and invite keyword-shaped queries that dense retrieval
 /// handles worst.
-fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
-    const SEMANTIC_SEARCH: &str = "Semantic code search. Given a natural-language \
-        query, returns a single relevance-ordered list of the most relevant symbols and files, \
-        each with its source or a summary. Results are reranked for relevance to your query and \
-        the current task, so prefer the order given and start from the top.";
+fn mcp_tool_description<'a>(name: &str, original: &'a str, cim_semantic_search: bool) -> &'a str {
+    const SEMANTIC_SEARCH: &str = "Semantic code search. Accepts one to three \
+        natural-language queries and independently returns a relevance-ordered list of compact \
+        symbol/file locators with exact declaration signatures for each query. k is the maximum \
+        number of final relevance-reranked results per query. Each query has its own rerank and \
+        may return fewer than k by design when fewer candidates are relevant.";
+    const CIM_SEMANTIC_SEARCH: &str = "Semantic code search. Prefer this for locating \
+        source code by behavior, intent, concept, or symptom, especially in an unfamiliar area or \
+        when the task provides no exact path or symbol hook. Given one to three distinct \
+        natural-language queries, it independently returns a relevance-ordered list of compact \
+        symbol/file locators with exact signatures for each query. Use exact symbol or regex \
+        tools when the task already supplies a direct hook. k is the maximum number of final \
+        relevance-reranked results per query; each reranker may return fewer than k by design.";
+    const CIM_SEARCH_SYMBOLS: &str = "Find indexed declarations by exact or partial symbol name. \
+        Prefer this when the task already supplies a class, function, method, field, module, or \
+        other identifier; use semantic_search instead when you need to locate an implementation \
+        from behavior, intent, concept, or symptom.";
+    const CIM_GET_SUMMARIES: &str = "Summarize known files, classes, modules, packages, or \
+        directories and navigate their immediate structure. Prefer this after you have a concrete \
+        target or when you need a structural overview; use semantic_search to locate an unknown \
+        implementation by behavior or concept.";
+    if cim_semantic_search {
+        return match name {
+            "semantic_search" => CIM_SEMANTIC_SEARCH,
+            "search_symbols" => CIM_SEARCH_SYMBOLS,
+            "get_summaries" => CIM_GET_SUMMARIES,
+            _ => original,
+        };
+    }
     match name {
         "semantic_search" => SEMANTIC_SEARCH,
         _ => original,
     }
+}
+
+fn mcp_tool_input_schema(name: &str, original: serde_json::Value) -> serde_json::Value {
+    if name != "semantic_search" {
+        return original;
+    }
+    let mut properties = serde_json::Map::from_iter([
+        (
+            "queries".to_string(),
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": { "type": "string" },
+                "description": "One to three distinct, non-redundant natural-language code-search queries. Each query is retrieved and reranked independently."
+            }),
+        ),
+        (
+            "k".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 20,
+                "description": "Maximum number of final relevance-reranked results per query. A reranker may return fewer than k by design when fewer candidates are relevant."
+            }),
+        ),
+    ]);
+    let mut required = vec![json!("queries")];
+    if let Some(workspace) = original
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|properties| properties.get("workspace"))
+    {
+        // Bifrost requires this field when Anvil starts a named-workspace
+        // router. Preserve its enum and required contract in the harness
+        // schema instead of silently dropping it during the reranker override.
+        properties.insert("workspace".to_string(), workspace.clone());
+        if original
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|fields| fields.iter().any(|field| field == "workspace"))
+        {
+            required.insert(0, json!("workspace"));
+        }
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
 }
 
 /// Unified tool registry: filesystem tools + shell + configured
@@ -884,6 +960,7 @@ fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
 pub struct ToolRegistry {
     cwd: PathBuf,
     additional_roots: Vec<PathBuf>,
+    analysis_workspaces: Option<Vec<crate::session::AnalysisWorkspace>>,
     mcp_clients: Vec<Arc<McpClient>>,
     mcp_tool_servers: HashMap<String, Arc<McpClient>>,
     advertised_builtin_tools: RwLock<HashSet<String>>,
@@ -924,6 +1001,9 @@ fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String>
 /// under clippy's argument-count limit while each knob remains explicit at
 /// call sites.
 pub(crate) struct ToolRegistryOptions {
+    /// Named repositories the Bifrost router should analyze. `None` keeps the
+    /// single-root `--root <cwd>` form.
+    pub analysis_workspaces: Option<Vec<crate::session::AnalysisWorkspace>>,
     pub lsp_settings: crate::lsp::LspSettings,
     pub shell_minimizer_enabled: bool,
 }
@@ -936,6 +1016,10 @@ impl ToolRegistry {
 
     pub(crate) fn additional_roots(&self) -> &[PathBuf] {
         &self.additional_roots
+    }
+
+    pub(crate) fn analysis_workspaces(&self) -> Option<&[crate::session::AnalysisWorkspace]> {
+        self.analysis_workspaces.as_deref()
     }
 
     /// Replace the cached SkillRegistry. Called by `update_cwd` so the
@@ -997,6 +1081,11 @@ impl ToolRegistry {
         plugin_hooks: Vec<crate::plugins::HookCommand>,
         options: ToolRegistryOptions,
     ) -> Self {
+        let ToolRegistryOptions {
+            analysis_workspaces,
+            lsp_settings,
+            shell_minimizer_enabled,
+        } = options;
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
         // profile from a concurrent in-flight shell call.
@@ -1006,7 +1095,9 @@ impl ToolRegistry {
         let mut mcp_clients = Vec::new();
         let mut mcp_tool_servers = HashMap::new();
         for config in mcp_servers.iter().filter(|server| server.enabled) {
-            match McpClient::spawn(config, &cwd).await {
+            match McpClient::spawn_with_workspaces(config, &cwd, analysis_workspaces.as_deref())
+                .await
+            {
                 Ok(client) => {
                     let client = Arc::new(client);
                     for tool in client.tools() {
@@ -1050,22 +1141,16 @@ impl ToolRegistry {
                 }
             }
         }
-        let lsp = if options
-            .lsp_settings
-            .servers
-            .iter()
-            .any(|server| server.enabled)
-        {
-            Some(crate::lsp::LspManager::start(cwd.clone(), options.lsp_settings).await)
+        let lsp = if lsp_settings.servers.iter().any(|server| server.enabled) {
+            Some(crate::lsp::LspManager::start(cwd.clone(), lsp_settings).await)
         } else {
             None
         };
-        let shell_minimizer = options
-            .shell_minimizer_enabled
-            .then(|| shell::ShellMinimizer::new(&cwd));
+        let shell_minimizer = shell_minimizer_enabled.then(|| shell::ShellMinimizer::new(&cwd));
         Self {
             cwd,
             additional_roots,
+            analysis_workspaces,
             mcp_clients,
             mcp_tool_servers,
             advertised_builtin_tools: RwLock::new(
@@ -1106,12 +1191,20 @@ impl ToolRegistry {
     /// sandbox-looking failure.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
+        let cim_semantic_search = crate::cim::enabled() && self.is_bifrost_tool("semantic_search");
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
-            let read_description = format!(
-                "Reads and returns the content of a specified text file, up to {} bytes. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
-                filesystem::READ_MAX_BYTES
-            );
+            let read_description = if cim_semantic_search {
+                format!(
+                    "Reads and returns the content of a specified text file, up to {} bytes. Use after selecting an exact file/range; prefer semantic_search for locating unknown code by behavior, get_symbol_sources for known definitions, and get_summaries for known-container orientation.",
+                    filesystem::READ_MAX_BYTES
+                )
+            } else {
+                format!(
+                    "Reads and returns the content of a specified text file, up to {} bytes. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
+                    filesystem::READ_MAX_BYTES
+                )
+            };
             defs.push(tool_def(
                 "read_file",
                 &read_description,
@@ -1257,7 +1350,11 @@ impl ToolRegistry {
         if builtin_tools.contains("grep_search") {
             defs.push(tool_def(
                 "grep_search",
-                "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages_by_reference.",
+                if cim_semantic_search {
+                    "Searches file contents with a regex. Prefer this for exact literals, identifiers, configuration, or documentation; use semantic_search for conceptual or behavior-based code discovery, search_symbols for declarations, and scan_usages_by_reference for references/callers."
+                } else {
+                    "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages_by_reference."
+                },
                 json!({
                     "type": "object",
                     "properties": {
@@ -1385,8 +1482,8 @@ impl ToolRegistry {
                 }
                 defs.push(tool_def(
                     &tool.name,
-                    mcp_tool_description(&tool.name, &tool.description),
-                    tool.input_schema.clone(),
+                    mcp_tool_description(&tool.name, &tool.description, cim_semantic_search),
+                    mcp_tool_input_schema(&tool.name, tool.input_schema.clone()),
                 ));
             }
         }
@@ -1519,19 +1616,21 @@ impl ToolRegistry {
     /// dispatch path. This is for harness-internal orchestration (e.g. the
     /// `semantic_search` reranker) that needs to read the structured payload
     /// (`vector_ranked`, `sources`, `summaries`, ...) rather than a
-    /// pretty-printed blob. The tool runs without any permission gate, so only
-    /// call it for read-only bifrost tools on harness initiative.
+    /// pretty-printed blob. Bifrost can accept internal tools that it omits
+    /// from `tools/list`, so select the server itself instead of the advertised
+    /// tool map. The tool runs without any permission gate, so only call it for
+    /// read-only bifrost tools on harness initiative.
     pub(crate) async fn call_bifrost_tool_raw(
         &self,
         name: &str,
         args: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let client = self
-            .mcp_tool_servers
-            .get(name)
-            .filter(|client| client.name() == "bifrost")
+            .mcp_clients
+            .iter()
+            .find(|client| client.name() == "bifrost")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("bifrost tool '{name}' is not available"))?;
+            .ok_or_else(|| anyhow::anyhow!("bifrost MCP server is not available"))?;
         let args = match client.tools().iter().find(|tool| tool.name == name) {
             Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
             None => args,
@@ -1573,6 +1672,16 @@ impl ToolRegistry {
         policy: SandboxPolicy,
         outside_sandbox_once: bool,
     ) -> ToolResult {
+        if name == "run_shell_command"
+            && outside_sandbox_once
+            && std::env::var_os("ANVIL_OFFLINE_SHELL").is_some()
+        {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: "Outside-sandbox shell execution is disabled for this offline evaluation session."
+                    .to_string(),
+            };
+        }
         self.execute_with_sandbox_mode(name, args, policy, outside_sandbox_once, None)
             .await
     }
@@ -2452,6 +2561,7 @@ mod tests {
         ToolRegistry {
             cwd,
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -2478,6 +2588,7 @@ mod tests {
         ToolRegistry {
             cwd,
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -2648,8 +2759,11 @@ mod tests {
 
     #[test]
     fn semantic_search_description_is_overridden() {
-        let overridden = mcp_tool_description("semantic_search", "bifrost's raw description");
+        let overridden =
+            mcp_tool_description("semantic_search", "bifrost's raw description", false);
         assert!(overridden.contains("relevance-ordered"));
+        assert!(overridden.contains("maximum number of final relevance-reranked results"));
+        assert!(overridden.contains("may return fewer than k by design"));
         assert_ne!(overridden, "bifrost's raw description");
         // Bifrost has no lexical arm since c353c862. Do not tell the model it
         // does.
@@ -2659,9 +2773,155 @@ mod tests {
         );
         // Other tools keep bifrost's description unchanged.
         assert_eq!(
-            mcp_tool_description("search_symbols", "bifrost's raw description"),
+            mcp_tool_description("search_symbols", "bifrost's raw description", false),
             "bifrost's raw description"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_bifrost_calls_can_use_unadvertised_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script = temp.path().join("fake-bifrost.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{}}}"
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"semantic_search\",\"description\":\"Fake\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      ;;
+    *'"method":"tools/call"'* )
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"structuredContent\":{\"hidden_call_succeeded\":true}}}"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write fake Bifrost");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("stat fake Bifrost")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make fake Bifrost executable");
+
+        let config = McpServerConfig {
+            name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
+            command: script.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        };
+        let registry = ToolRegistry::new(
+            temp.path().to_path_buf(),
+            Vec::new(),
+            vec![config],
+            Arc::new(SkillRegistry::default()),
+            Arc::new(AgentRegistry::default()),
+            Vec::new(),
+            ToolRegistryOptions {
+                analysis_workspaces: None,
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
+        )
+        .await;
+
+        assert!(registry.is_bifrost_tool("semantic_search"));
+        assert!(!registry.is_bifrost_tool("get_symbol_sources"));
+        let result = registry
+            .call_bifrost_tool_raw(
+                "get_symbol_sources",
+                json!({ "symbols": ["example.Type.method"] }),
+            )
+            .await
+            .expect("hidden Bifrost tool call succeeds");
+        assert_eq!(result, json!({ "hidden_call_succeeded": true }));
+    }
+
+    #[test]
+    fn cim_semantic_descriptions_prefer_concept_search_without_mandating_it() {
+        let semantic = mcp_tool_description("semantic_search", "raw", true);
+        assert!(semantic.contains("Prefer this"));
+        assert!(semantic.contains("exact path or symbol hook"));
+        assert!(!semantic.to_ascii_lowercase().contains("always"));
+        assert!(!semantic.to_ascii_lowercase().contains("must"));
+
+        let symbols = mcp_tool_description("search_symbols", "raw", true);
+        assert!(symbols.contains("exact or partial symbol name"));
+        assert!(symbols.contains("use semantic_search instead"));
+        let summaries = mcp_tool_description("get_summaries", "raw", true);
+        assert!(summaries.contains("concrete target"));
+        assert!(summaries.contains("use semantic_search"));
+    }
+
+    #[test]
+    fn semantic_search_batch_and_k_schema_are_overridden() {
+        let schema = mcp_tool_input_schema(
+            "semantic_search",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["query"]
+            }),
+        );
+        let k = &schema["properties"]["k"];
+        assert_eq!(k["type"], "integer");
+        assert_eq!(k["minimum"], 1);
+        assert_eq!(k["maximum"], 20);
+        assert_eq!(k["default"], 20);
+        assert!(
+            k["description"]
+                .as_str()
+                .unwrap()
+                .contains("may return fewer than k by design")
+        );
+        let queries = &schema["properties"]["queries"];
+        assert_eq!(queries["type"], "array");
+        assert_eq!(queries["minItems"], 1);
+        assert_eq!(queries["maxItems"], 3);
+        assert_eq!(queries["items"]["type"], "string");
+        assert!(schema["properties"].get("query").is_none());
+        assert_eq!(schema["required"], json!(["queries"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn semantic_search_preserves_named_workspace_schema() {
+        let schema = mcp_tool_input_schema(
+            "semantic_search",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["api", "ui"]
+                    },
+                    "query": { "type": "string" },
+                    "k": { "type": "integer" }
+                },
+                "required": ["workspace", "query"]
+            }),
+        );
+        assert_eq!(
+            schema["properties"]["workspace"]["enum"],
+            json!(["api", "ui"])
+        );
+        assert_eq!(schema["required"], json!(["workspace", "queries"]));
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
@@ -2684,6 +2944,7 @@ mod tests {
         let registry = ToolRegistry {
             cwd: std::env::temp_dir(),
             additional_roots: Vec::new(),
+            analysis_workspaces: None,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(

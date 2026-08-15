@@ -99,10 +99,11 @@ use crate::llm_client::{
 };
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
-    PromptStartError, REASONING_EFFORT_OFF_VALUE, RewindOutcome, Session, SessionManifest,
-    SessionMode, SessionSnapshot, SessionStore, ToolExchangeDiff, ToolExchangeStatus,
-    TurnReplayEvent, UnsupportedMcpTransport, acp_mcp_servers_to_configs, sanitize_replay_events,
+    AnalysisWorkspace, CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen,
+    PermissionMode, PromptStartError, REASONING_EFFORT_OFF_VALUE, RewindOutcome, Session,
+    SessionManifest, SessionMode, SessionSnapshot, SessionStore, ToolExchangeDiff,
+    ToolExchangeStatus, TurnReplayEvent, UnsupportedMcpTransport, acp_mcp_servers_to_configs,
+    sanitize_replay_events,
 };
 use crate::slash::{is_slash_command, parse_slash_command, slash_command_args};
 use crate::structured_output::{
@@ -232,6 +233,102 @@ fn validate_additional_directories(
     crate::session::validate_additional_directories(directories).map_err(|err| {
         invalid_additional_directories_error(method, err.index, &err.path, err.requirement)
     })
+}
+
+const ANALYSIS_WORKSPACES_META_KEY: &str = "io.brokk/workspaces";
+
+fn validate_analysis_workspaces(
+    method: &str,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+) -> Result<Option<Vec<AnalysisWorkspace>>, agent_client_protocol::Error> {
+    let Some(value) = meta.and_then(|meta| meta.get(ANALYSIS_WORKSPACES_META_KEY)) else {
+        return Ok(None);
+    };
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    let items = value.get("items").and_then(serde_json::Value::as_array);
+    if version != Some(1) || items.is_none() {
+        return Err(
+            agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!(
+                    "{method} {ANALYSIS_WORKSPACES_META_KEY} must have version 1 and an items array"
+                )
+            })),
+        );
+    }
+
+    let mut authority = Vec::with_capacity(additional_directories.len() + 1);
+    for path in std::iter::once(cwd).chain(additional_directories.iter().map(PathBuf::as_path)) {
+        authority.push(path.canonicalize().map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!("{method} cannot resolve workspace authority {}: {error}", path.display())
+            }))
+        })?);
+    }
+
+    let mut names = std::collections::HashSet::new();
+    let mut paths = std::collections::HashSet::new();
+    let mut workspaces = Vec::new();
+    for (index, item) in items.expect("items checked above").iter().enumerate() {
+        let name = item.get("name").and_then(serde_json::Value::as_str);
+        let path = item.get("path").and_then(serde_json::Value::as_str);
+        let valid_name = name.is_some_and(|name| {
+            name.as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        });
+        if !valid_name || path.is_none() {
+            return Err(agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!(
+                    "{method} {ANALYSIS_WORKSPACES_META_KEY}.items[{index}] needs a valid name and absolute path"
+                )
+            })));
+        }
+        let name = name.expect("name checked above");
+        let raw_path = PathBuf::from(path.expect("path checked above"));
+        if !raw_path.is_absolute() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                    "reason": format!("{method} analysis workspace `{name}` path must be absolute")
+                })),
+            );
+        }
+        let path = raw_path.canonicalize().map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!("{method} cannot resolve analysis workspace `{name}`: {error}")
+            }))
+        })?;
+        if !path.is_dir() || !authority.iter().any(|root| path.starts_with(root)) {
+            return Err(agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!(
+                    "{method} analysis workspace `{name}` must be a directory inside the current workspace scope"
+                )
+            })));
+        }
+        if !names.insert(name.to_string()) || !paths.insert(path.clone()) {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                    "reason": format!("{method} analysis workspace names and paths must be unique")
+                })),
+            );
+        }
+        workspaces.push(AnalysisWorkspace {
+            name: name.to_string(),
+            path,
+        });
+    }
+    if workspaces.is_empty() {
+        return Err(
+            agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                "reason": format!("{method} analysis workspace items must not be empty")
+            })),
+        );
+    }
+    Ok(Some(workspaces))
 }
 
 fn prompt_response_meta(
@@ -1707,6 +1804,15 @@ pub fn agent_component(
                     Ok(directories) => directories,
                     Err(err) => return responder.respond_with_error(err),
                 };
+                let analysis_workspaces = match validate_analysis_workspaces(
+                    "session/new",
+                    req.meta.as_ref(),
+                    &cwd,
+                    &additional_directories,
+                ) {
+                    Ok(workspaces) => workspaces,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 let session_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
                     Ok(servers) => servers,
                     Err(err) => {
@@ -1725,6 +1831,9 @@ pub fn agent_component(
                         Some(session_mcp_servers),
                         additional_directories,
                     )
+                    .await;
+                sessions_new
+                    .set_analysis_workspaces(&session.id, analysis_workspaces)
                     .await;
 
                 // Use the cached catalog populated at init; fall back to a
@@ -1837,6 +1946,15 @@ pub fn agent_component(
                     Ok(directories) => directories,
                     Err(err) => return responder.respond_with_error(err),
                 };
+                let analysis_workspaces = match validate_analysis_workspaces(
+                    "session/load",
+                    req.meta.as_ref(),
+                    &cwd,
+                    &additional_directories,
+                ) {
+                    Ok(workspaces) => workspaces,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 // Convert (and validate) the requested MCP servers before any
                 // session work, so an unsupported transport is rejected early
                 // (#159). The converted set is applied after the session loads
@@ -1889,6 +2007,9 @@ pub fn agent_component(
                         })),
                     );
                 }
+                sessions_load
+                    .set_analysis_workspaces(&session_id, analysis_workspaces)
+                    .await;
                 // Apply the client-supplied MCP servers for this load, dropping
                 // any cached registry so the next prompt rebuilds with them (#145).
                 sessions_load
@@ -1964,6 +2085,15 @@ pub fn agent_component(
                     Ok(directories) => directories,
                     Err(err) => return responder.respond_with_error(err),
                 };
+                let analysis_workspaces = match validate_analysis_workspaces(
+                    "session/resume",
+                    req.meta.as_ref(),
+                    &cwd,
+                    &additional_directories,
+                ) {
+                    Ok(workspaces) => workspaces,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 // Reject unsupported MCP transports before any session work (#159);
                 // apply the converted set after the session loads (#146).
                 let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
@@ -2013,6 +2143,9 @@ pub fn agent_component(
                         })),
                     );
                 }
+                sessions_resume
+                    .set_analysis_workspaces(&session_id, analysis_workspaces)
+                    .await;
                 // Apply the client-supplied MCP servers for this resume,
                 // dropping any cached registry so the next prompt rebuilds with
                 // them (#146).
@@ -2077,6 +2210,15 @@ pub fn agent_component(
                     Ok(directories) => directories,
                     Err(err) => return responder.respond_with_error(err),
                 };
+                let analysis_workspaces = match validate_analysis_workspaces(
+                    "session/fork",
+                    req.meta.as_ref(),
+                    &cwd,
+                    &additional_directories,
+                ) {
+                    Ok(workspaces) => workspaces,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
                     Ok(servers) => servers,
                     Err(err) => {
@@ -2123,6 +2265,9 @@ pub fn agent_component(
                         })),
                     );
                 }
+                sessions_fork
+                    .set_analysis_workspaces(&new_id, analysis_workspaces)
+                    .await;
                 // Apply the request's MCP servers (replace) when supplied; an
                 // empty set inherits the source's copied MCP config (#145/#146
                 // semantics, but fork defaults to the source's config).
@@ -4301,7 +4446,7 @@ pub(crate) async fn build_prompt_messages_with_compression(
     reasoning_effort: Option<String>,
     tools: Option<&[ToolDefinition]>,
 ) -> PreparedPrompt {
-    use crate::context_manager::{compact_history, context_budget};
+    use crate::context_manager::{HistoryPins, compact_history, context_budget};
 
     let budget = context_budget(context_length);
     let prefix_len = prompt_prefix_messages(snap, snap.mode).len();
@@ -4334,7 +4479,10 @@ pub(crate) async fn build_prompt_messages_with_compression(
         &all_messages,
         dynamic_start,
         tools,
-        current_plan.as_ref(),
+        HistoryPins {
+            current_plan: current_plan.as_ref(),
+            active_user_message: None,
+        },
         reasoning_effort,
         context_length,
         idle_timeout,
@@ -4424,6 +4572,7 @@ fn prompt_prefix_messages(snap: &SessionSnapshot, mode: SessionMode) -> Vec<Chat
         &mode,
         &snap.cwd,
         &snap.additional_directories,
+        snap.analysis_workspaces.as_deref(),
     )));
     append_prompt_context_messages(&mut messages, snap);
     messages
@@ -4650,7 +4799,7 @@ async fn run_model_turn_in_spawn(
         sessions,
         session_id,
         fallback_cwd,
-        None,
+        Some(&outcome.usage_by_model),
         outcome.turn_failure(),
     )
     .await;
@@ -4765,6 +4914,7 @@ fn build_system_prompt(
     mode: &SessionMode,
     cwd: &Path,
     additional_directories: &[PathBuf],
+    analysis_workspaces: Option<&[AnalysisWorkspace]>,
 ) -> String {
     let mut cwd_context = format!(
         "The user's working directory is: {}\n\
@@ -4779,6 +4929,21 @@ fn build_system_prompt(
             cwd_context.push_str(&directory.display().to_string());
             cwd_context.push('\n');
         }
+    }
+    if let Some(workspaces) =
+        crate::mcp::effective_analysis_workspaces(cwd, additional_directories, analysis_workspaces)
+    {
+        cwd_context.push_str("Bifrost code tools use these workspace names:\n");
+        for workspace in workspaces {
+            cwd_context.push_str(&format!(
+                "- {}: {}\n",
+                workspace.name,
+                workspace.path.display()
+            ));
+        }
+        cwd_context.push_str(
+            "Select the workspace that contains the target code for each Bifrost call.\n",
+        );
     }
     cwd_context.push('\n');
 
@@ -4941,10 +5106,11 @@ closest advertised tool instead of guessing at names.
 - Prefer a dedicated tool over its shell equivalent whenever one is advertised: file-read \
 tools over cat/head/sed, edit/write tools over sed or heredocs, content search over \
 grep/rg, directory listing over ls.
-- When code-intelligence tools are advertised, prefer them for code questions: \
-search_symbols to locate declarations, get_summaries for API shape and orientation, \
-get_symbol_sources for full definitions, scan_usages_by_reference for callers. Use text search for \
-plain text, configuration, and docs.
+- When code-intelligence tools are advertised, choose by question type: prefer semantic_search \
+to locate unfamiliar code from behavior, intent, concept, or symptom; search_symbols for known \
+declarations; get_summaries for known-container orientation; get_symbol_sources for full \
+definitions; and scan_usages_by_reference for callers. Use text search for exact literals, \
+configuration, and docs.
 - Use the shell where CLI semantics matter: builds, tests, git, package managers, pipelines.
 - If a tool call is denied, do not attempt the same action by another route; ask or move on.
 
@@ -9693,7 +9859,10 @@ async fn handle_compress(
         &all_messages,
         dynamic_start,
         tools.as_deref(),
-        current_plan,
+        crate::context_manager::HistoryPins {
+            current_plan,
+            active_user_message: None,
+        },
         snap.reasoning_effort.clone(),
         context_length,
         idle_timeout,
@@ -9815,6 +9984,66 @@ fn render_context_report(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn analysis_workspace_metadata_accepts_nested_repositories() {
+        let root = tempfile::tempdir().expect("root");
+        let api = root.path().join("api");
+        let ui = root.path().join("ui");
+        std::fs::create_dir_all(&api).expect("api");
+        std::fs::create_dir_all(&ui).expect("ui");
+        let meta = serde_json::json!({
+            ANALYSIS_WORKSPACES_META_KEY: {
+                "version": 1,
+                "items": [
+                    {"name": "api", "path": api},
+                    {"name": "ui", "path": ui},
+                ]
+            }
+        });
+        let workspaces =
+            validate_analysis_workspaces("session/new", meta.as_object(), root.path(), &[])
+                .expect("valid metadata")
+                .expect("metadata is present");
+
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].name, "api");
+        assert_eq!(workspaces[1].name, "ui");
+    }
+
+    #[test]
+    fn analysis_workspace_metadata_rejects_paths_outside_authority() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let meta = serde_json::json!({
+            ANALYSIS_WORKSPACES_META_KEY: {
+                "version": 1,
+                "items": [{"name": "outside", "path": outside.path()}]
+            }
+        });
+
+        assert!(
+            validate_analysis_workspaces("session/new", meta.as_object(), root.path(), &[],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn system_prompt_names_each_bifrost_workspace() {
+        let workspaces = vec![AnalysisWorkspace {
+            name: "backend".into(),
+            path: PathBuf::from("/work/backend"),
+        }];
+        let prompt = build_system_prompt(
+            &SessionMode::Lutz,
+            Path::new("/work"),
+            &[],
+            Some(&workspaces),
+        );
+
+        assert!(prompt.contains("- backend: /work/backend"));
+        assert!(prompt.contains("Select the workspace"));
+    }
 
     #[test]
     fn mcp_instructions_extend_only_the_system_prompt() {
@@ -10750,7 +10979,7 @@ mod tests {
             (SessionMode::Lutz, "Work the task to completion"),
             (SessionMode::Plan, "focus on planning"),
         ] {
-            let prompt = build_system_prompt(&mode, cwd, &[]);
+            let prompt = build_system_prompt(&mode, cwd, &[], None);
             assert!(
                 prompt.contains("/tmp/some-cwd") || prompt.contains("\\tmp\\some-cwd"),
                 "system prompt for {mode:?} must embed the cwd, got: {prompt}"
@@ -10776,6 +11005,14 @@ mod tests {
             assert!(
                 prompt.contains("Call only tools that are currently advertised"),
                 "system prompt for {mode:?} must carry the shared core guidance, got: {prompt}"
+            );
+            assert!(
+                prompt.contains(
+                    "prefer semantic_search to locate unfamiliar code from behavior, intent, \
+                     concept, or symptom"
+                ),
+                "system prompt for {mode:?} must route behavioral discovery to semantic search, \
+                 got: {prompt}"
             );
             assert!(
                 prompt.contains("Keep the user oriented during tool-heavy work"),
@@ -10808,7 +11045,7 @@ mod tests {
         // prompt tells it to go read one.
         let cwd = std::path::Path::new("/tmp/some-cwd");
         for mode in [SessionMode::Lutz, SessionMode::Plan] {
-            let prompt = build_system_prompt(&mode, cwd, &[]);
+            let prompt = build_system_prompt(&mode, cwd, &[], None);
             assert!(
                 prompt.contains("governs the whole tree under its directory"),
                 "system prompt for {mode:?} must state the AGENTS.md scoping rule, got: {prompt}"
@@ -10835,7 +11072,7 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         let additional = vec![PathBuf::from("/tmp/other-root")];
 
-        let prompt = build_system_prompt(&SessionMode::Lutz, cwd, &additional);
+        let prompt = build_system_prompt(&SessionMode::Lutz, cwd, &additional, None);
 
         assert!(
             prompt.contains("/tmp/other-root") || prompt.contains("\\tmp\\other-root"),
@@ -10858,6 +11095,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
@@ -10906,6 +11144,7 @@ mod tests {
         let snapshot = |agent_response: String| SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -10938,6 +11177,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: String::new(),
             history: vec![],
@@ -10964,6 +11204,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
@@ -11004,6 +11245,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Plan,
             model: "codex::gpt-5-codex".into(),
             history: vec![],
@@ -11039,6 +11281,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Plan,
             model: "openrouter::openai/gpt-4o".into(),
             history: vec![],
@@ -11170,6 +11413,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11205,6 +11449,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11307,6 +11552,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11379,6 +11625,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11438,6 +11685,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11491,6 +11739,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -11513,6 +11762,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -11555,6 +11805,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -11638,6 +11889,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -11671,6 +11923,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -11711,6 +11964,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -12968,6 +13222,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![
@@ -13023,6 +13278,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {

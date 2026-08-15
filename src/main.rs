@@ -11,6 +11,7 @@ mod agents_md;
 mod bedrock_auth;
 mod bedrock_client;
 mod bedrock_credits;
+mod cim;
 mod codex_auth;
 mod codex_client;
 mod codex_credits;
@@ -58,6 +59,7 @@ mod trace_logging;
 mod train_bifrost;
 mod turn_runner;
 mod usage_report;
+mod utility_model;
 mod workspace_delta;
 
 use crate::llm_client::LlmBackend;
@@ -139,6 +141,13 @@ struct Args {
     #[arg(long)]
     reasoning_effort: Option<String>,
 
+    /// Provider-qualified model for internal semantic-search reranking and
+    /// automatic permission classification. When unset, these calls use the
+    /// active session model at low reasoning effort. An explicitly configured
+    /// utility model uses its provider-default reasoning behavior.
+    #[arg(long, env = "ANVIL_UTILITY_MODEL")]
+    utility_model: Option<String>,
+
     /// Optional cap on tool-calling turns per prompt. Defaults to `0` =
     /// unbounded: the loop runs until the model answers without a tool call
     /// (normal completion), with stalls caught earlier by the LLM stream
@@ -149,7 +158,7 @@ struct Args {
     /// cost/time, in which case hitting N forces a final text response. The
     /// conversation context is preserved on that stop, so sending another
     /// message (e.g. "continue") resumes the task from where it stopped.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "ANVIL_MAX_TURNS", default_value_t = 0)]
     max_turns: usize,
 
     /// Maximum number of sessions to keep resident in memory before the
@@ -280,6 +289,7 @@ impl std::fmt::Debug for Args {
             .field("resume", &self.resume)
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("utility_model", &self.utility_model)
             .field("max_turns", &self.max_turns)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
@@ -963,6 +973,11 @@ async fn anvil_main() -> Result<()> {
     }
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
+    let utility_model = utility_model::UtilityModelConfig::new(args.utility_model);
+    if let Some(model) = utility_model.configured_model() {
+        llm.validate_explicit_model_route(model)?;
+    }
+    utility_model::configure(utility_model);
     acp::run_agent(
         llm,
         sessions,

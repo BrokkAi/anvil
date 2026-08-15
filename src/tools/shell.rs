@@ -562,6 +562,21 @@ fn parse_timeout_cap(raw: Option<&str>) -> u64 {
         .unwrap_or(MAX_TIMEOUT_SECONDS)
 }
 
+/// Re-exec the wrapped command inside a fresh, empty network namespace so an
+/// offline evaluation cannot reach the network. Linux only; the caller
+/// rejects `ANVIL_OFFLINE_SHELL` on other platforms.
+#[cfg(target_os = "linux")]
+fn offline_shell_argv(argv: &[String]) -> Vec<String> {
+    let mut isolated = Vec::with_capacity(argv.len() + 3);
+    isolated.extend([
+        "/usr/bin/unshare".to_string(),
+        "--net".to_string(),
+        "--".to_string(),
+    ]);
+    isolated.extend_from_slice(argv);
+    isolated
+}
+
 /// A resolved wall-clock budget for one shell call, plus the user-visible
 /// notice to emit when the request had to be clamped.
 ///
@@ -754,8 +769,25 @@ pub async fn run_shell_command_with_timeout(
     #[cfg(not(unix))]
     let sandbox_path = std::env::var_os("PATH").unwrap_or_default();
 
-    let mut cmd = Command::new(&wrapped.argv[0]);
-    cmd.args(&wrapped.argv[1..])
+    let offline_shell = std::env::var_os("ANVIL_OFFLINE_SHELL").is_some();
+    #[cfg(not(target_os = "linux"))]
+    if offline_shell {
+        return ToolResult {
+            status: ToolStatus::InternalError,
+            output: "ANVIL_OFFLINE_SHELL is supported only on Linux".to_string(),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    let process_argv = if offline_shell {
+        offline_shell_argv(&wrapped.argv)
+    } else {
+        wrapped.argv.clone()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let process_argv = wrapped.argv.clone();
+
+    let mut cmd = Command::new(&process_argv[0]);
+    cmd.args(&process_argv[1..])
         .current_dir(cwd)
         .env_clear()
         .env("PATH", &sandbox_path)
@@ -1023,6 +1055,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tokio::sync::Mutex;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_shell_uses_a_fresh_network_namespace() {
+        let argv = offline_shell_argv(&["sh".to_string(), "-c".to_string(), "true".to_string()]);
+        assert_eq!(
+            argv,
+            ["/usr/bin/unshare", "--net", "--", "sh", "-c", "true"]
+        );
+    }
 
     /// Serializes tests that mutate process-wide env vars. `cargo test`
     /// runs `#[test]`/`#[tokio::test]` cases on parallel threads inside a

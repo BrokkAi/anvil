@@ -1,6 +1,6 @@
 pub(crate) mod announce;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,13 +119,16 @@ struct TaskArgs {
     permission_mode: TaskPermissionMode,
 }
 
-fn invalid_task_args(message: impl Into<String>) -> (ToolExecution, TokenUsage) {
+fn invalid_task_args(
+    message: impl Into<String>,
+) -> (ToolExecution, TokenUsage, BTreeMap<String, TokenUsage>) {
     (
         ToolExecution {
             output: message.into(),
             failed: true,
         },
         TokenUsage::default(),
+        BTreeMap::new(),
     )
 }
 
@@ -548,6 +551,7 @@ pub(crate) struct LoopOutcome {
     pub tool_exchanges: Vec<ToolExchange>,
     pub replay_events: Vec<TurnReplayEvent>,
     pub usage: TokenUsage,
+    pub usage_by_model: BTreeMap<String, TokenUsage>,
     pub stop: LoopStop,
     /// Most recently published task plan. This is model state rather than a
     /// completion gate; callers retain it across turns and compaction.
@@ -572,10 +576,47 @@ impl LoopOutcome {
             tool_exchanges: Vec::new(),
             replay_events: Vec::new(),
             usage: TokenUsage::default(),
+            usage_by_model: BTreeMap::new(),
             current_plan: None,
             compaction_checkpoint: None,
         }
     }
+}
+
+fn usage_by_model(
+    session_model: &str,
+    total: TokenUsage,
+    utility: BTreeMap<String, TokenUsage>,
+) -> BTreeMap<String, TokenUsage> {
+    let mut session_usage = total;
+    let mut result = BTreeMap::new();
+    for (model, usage) in utility {
+        if model != session_model {
+            session_usage.input_tokens = session_usage
+                .input_tokens
+                .saturating_sub(usage.input_tokens);
+            session_usage.output_tokens = session_usage
+                .output_tokens
+                .saturating_sub(usage.output_tokens);
+            session_usage.thought_tokens = session_usage
+                .thought_tokens
+                .saturating_sub(usage.thought_tokens);
+            session_usage.cached_read_tokens = session_usage
+                .cached_read_tokens
+                .saturating_sub(usage.cached_read_tokens);
+            session_usage.cached_write_tokens = session_usage
+                .cached_write_tokens
+                .saturating_sub(usage.cached_write_tokens);
+            result.insert(model, usage);
+        }
+    }
+    if !session_usage.is_zero() {
+        result
+            .entry(session_model.to_string())
+            .or_default()
+            .add(session_usage);
+    }
+    result
 }
 
 /// Result of approving a permission request.
@@ -937,6 +978,7 @@ struct PureGateDecisionWithRationale {
 struct GateOutcome {
     decision: GateDecision,
     usage: TokenUsage,
+    usage_model: Option<String>,
 }
 
 impl GateOutcome {
@@ -944,6 +986,7 @@ impl GateOutcome {
         Self {
             decision,
             usage: TokenUsage::default(),
+            usage_model: None,
         }
     }
 }
@@ -974,6 +1017,7 @@ enum PermissionScopeClassifierOutcome {
     Classified {
         classification: PermissionScopeClassification,
         usage: TokenUsage,
+        model: String,
     },
     Unavailable(String),
 }
@@ -1883,6 +1927,10 @@ pub(crate) async fn run(
     let train_bifrost = train_bifrost_enabled();
     let mut current_plan = initial_plan;
     let mut history_compacted = false;
+    let active_user_message = messages[context_prefix_len.min(messages.len())..]
+        .iter()
+        .rfind(|message| message.role == "user")
+        .cloned();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
         Err(error) => {
@@ -1896,6 +1944,16 @@ pub(crate) async fn run(
             return LoopOutcome::setup_failure(format!(
                 "BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"
             ));
+        }
+    };
+    let cim_config = match crate::cim::load_config_from_env(p2t_config.is_some(), train_bifrost) {
+        Ok(config) => config,
+        Err(error) => {
+            append_trace_record(serde_json::json!({
+                "type": "cim_config_error",
+                "error": format!("{error:#}"),
+            }));
+            return LoopOutcome::setup_failure(format!("BRK_CIM_EVAL is misconfigured: {error:#}"));
         }
     };
     let training_packet = if train_bifrost {
@@ -1973,6 +2031,7 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
+    let mut utility_usage_by_model = BTreeMap::<String, TokenUsage>::new();
     // Set only when a turn ends because the LLM call itself failed (after the
     // inner stream-retry budget is exhausted) or the loop panicked. Left
     // `None` for a normal completion, so an autonomous driver can tell a real
@@ -2023,6 +2082,125 @@ pub(crate) async fn run(
         {
             snapshot_p2t_workspace_best_effort(config, registry.cwd(), snapshot_dir, 0);
         }
+    }
+    let session_is_fresh = sessions
+        .snapshot(&session_id, registry.cwd())
+        .await
+        .is_some_and(|snapshot| snapshot.history.is_empty());
+    let cim_step_claimed = if cim_config.is_some() && session_is_fresh {
+        match crate::cim::claim_synthetic_step() {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                append_trace_record(serde_json::json!({
+                    "type": "cim_step_claim_error",
+                    "error": format!("{error:#}"),
+                }));
+                return LoopOutcome::setup_failure(format!(
+                    "BRK_CIM_EVAL could not claim synthetic step zero: {error:#}"
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    if cim_config.is_some() && session_is_fresh && !cim_step_claimed {
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_skipped",
+            "reason": "already_claimed",
+        }));
+    }
+    if let Some(config) = cim_config.as_ref().filter(|_| cim_step_claimed) {
+        let step = crate::cim::synthetic_step(config);
+        let calls = p2t::forced_step_to_tool_calls(&step);
+        let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_start",
+            "query_manifest_sha256": config.query_manifest_sha256,
+            "query_count": config.queries.len(),
+            "k": config.k,
+            "mcp_tool_timeout_seconds": crate::cim::mcp_tool_call_timeout()
+                .expect("CIM mode is enabled")
+                .as_secs(),
+            "reranker_failure_policy": "fail_closed",
+            "call_ids": call_ids,
+        }));
+        if !calls.is_empty() {
+            let advertised_this_request = advertised_tool_names(Some(&tools));
+            if !advertised_this_request.contains("semantic_search") {
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL has synthetic queries but semantic_search is unavailable"
+                        .to_string(),
+                );
+            }
+            let forced_message = p2t::forced_step_to_message(&step);
+            messages.push(forced_message);
+            replay_events.push(TurnReplayEvent::AssistantToolCalls {
+                text: String::new(),
+                calls: calls.iter().map(tool_call_to_replay).collect(),
+            });
+            let exchange_start = tool_exchanges.len();
+            let outcome = execute_step_tool_calls(
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                service_tier,
+                structured_output,
+                &original_user_request,
+                &calls,
+                &advertised_this_request,
+                &mut messages,
+                &mut tool_exchanges,
+                &mut replay_events,
+                &mut turn_usage,
+                &mut utility_usage_by_model,
+                &mut current_plan,
+                max_turns,
+                idle_timeout,
+                cancel.clone(),
+                event_sink,
+                permission_broker,
+                &session_id,
+                &sessions,
+                notifications,
+                depth,
+                permission_override,
+            )
+            .await;
+            if outcome.cancelled {
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL synthetic step was cancelled".to_string(),
+                );
+            }
+            let exchanges = &tool_exchanges[exchange_start..];
+            if exchanges.len() != calls.len()
+                || exchanges
+                    .iter()
+                    .any(|exchange| exchange.status == ToolExchangeStatus::Failed)
+            {
+                append_trace_record(serde_json::json!({
+                    "type": "cim_synthetic_step_end",
+                    "query_manifest_sha256": config.query_manifest_sha256,
+                    "query_count": config.queries.len(),
+                    "status": "failed",
+                    "failures": exchanges.iter()
+                        .filter(|exchange| exchange.status == ToolExchangeStatus::Failed)
+                        .map(|exchange| serde_json::json!({
+                        "call_id": exchange.call_id,
+                        "error": exchange.result,
+                    })).collect::<Vec<_>>(),
+                }));
+                return LoopOutcome::setup_failure(
+                    "BRK_CIM_EVAL synthetic semantic-search step failed".to_string(),
+                );
+            }
+        }
+        append_trace_record(serde_json::json!({
+            "type": "cim_synthetic_step_end",
+            "query_manifest_sha256": config.query_manifest_sha256,
+            "query_count": config.queries.len(),
+            "status": "completed",
+        }));
     }
     let mut p2t_steps_executed = 0usize;
     let mut p2t_stop_reason: Option<P2tStopReason> = None;
@@ -2125,6 +2303,7 @@ pub(crate) async fn run(
                 &mut tool_exchanges,
                 &mut replay_events,
                 &mut turn_usage,
+                &mut utility_usage_by_model,
                 &mut current_plan,
                 max_turns,
                 idle_timeout,
@@ -2189,7 +2368,10 @@ pub(crate) async fn run(
                 &messages,
                 context_prefix_len,
                 Some(&tools),
-                current_plan.as_ref(),
+                crate::context_manager::HistoryPins {
+                    current_plan: current_plan.as_ref(),
+                    active_user_message: active_user_message.as_ref(),
+                },
                 reasoning_effort.map(str::to_string),
                 context_length,
                 idle_timeout,
@@ -2557,6 +2739,7 @@ pub(crate) async fn run(
                     &mut tool_exchanges,
                     &mut replay_events,
                     &mut turn_usage,
+                    &mut utility_usage_by_model,
                     &mut current_plan,
                     max_turns,
                     idle_timeout,
@@ -2849,6 +3032,7 @@ pub(crate) async fn run(
         tool_exchanges,
         replay_events,
         usage: turn_usage,
+        usage_by_model: usage_by_model(model, turn_usage, utility_usage_by_model),
         stop,
         current_plan,
         compaction_checkpoint,
@@ -2961,6 +3145,7 @@ async fn execute_step_tool_calls(
     tool_exchanges: &mut Vec<ToolExchange>,
     replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
+    utility_usage_by_model: &mut BTreeMap<String, TokenUsage>,
     current_plan: &mut Option<crate::plan::UpdatePlanArgs>,
     max_turns: usize,
     idle_timeout: IdleTimeouts,
@@ -3004,6 +3189,7 @@ async fn execute_step_tool_calls(
                 tool_exchanges,
                 replay_events,
                 turn_usage,
+                utility_usage_by_model,
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
@@ -3274,7 +3460,6 @@ async fn execute_step_tool_calls(
             GateCheck {
                 llm,
                 model,
-                reasoning_effort,
                 original_user_request,
                 idle_timeout,
                 session_id,
@@ -3289,6 +3474,12 @@ async fn execute_step_tool_calls(
         )
         .await;
         turn_usage.add(decision.usage);
+        if let Some(usage_model) = decision.usage_model {
+            utility_usage_by_model
+                .entry(usage_model)
+                .or_default()
+                .add(decision.usage);
+        }
         let decision = decision.decision;
 
         let (mut output, status, replay_diff, permission_notice) = match decision {
@@ -3398,7 +3589,7 @@ async fn execute_step_tool_calls(
                     exec
                 } else {
                     let mut exec = if tool_name == "task" {
-                        let (exec, nested_usage) = execute_subagent(
+                        let (exec, nested_usage, nested_usage_by_model) = execute_subagent(
                             llm,
                             registry,
                             model,
@@ -3418,6 +3609,12 @@ async fn execute_step_tool_calls(
                         )
                         .await;
                         turn_usage.add(nested_usage);
+                        for (usage_model, usage) in nested_usage_by_model {
+                            utility_usage_by_model
+                                .entry(usage_model)
+                                .or_default()
+                                .add(usage);
+                        }
                         exec
                     } else if tool_name == "update_plan" {
                         execute_update_plan(
@@ -3447,6 +3644,12 @@ async fn execute_step_tool_calls(
                         )
                         .await;
                         turn_usage.add(outcome.usage);
+                        if let Some(usage_model) = outcome.usage_model {
+                            utility_usage_by_model
+                                .entry(usage_model)
+                                .or_default()
+                                .add(outcome.usage);
+                        }
                         ToolExecution {
                             output: outcome.output,
                             failed: outcome.failed,
@@ -3568,6 +3771,7 @@ async fn execute_parallel_safe_calls(
     tool_exchanges: &mut Vec<ToolExchange>,
     replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
+    utility_usage_by_model: &mut BTreeMap<String, TokenUsage>,
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
@@ -3780,7 +3984,6 @@ async fn execute_parallel_safe_calls(
             GateCheck {
                 llm,
                 model,
-                reasoning_effort,
                 original_user_request,
                 idle_timeout,
                 session_id,
@@ -3795,6 +3998,12 @@ async fn execute_parallel_safe_calls(
         )
         .await;
         turn_usage.add(decision.usage);
+        if let Some(usage_model) = decision.usage_model {
+            utility_usage_by_model
+                .entry(usage_model)
+                .or_default()
+                .add(decision.usage);
+        }
 
         match decision.decision {
             GateDecision::Reject {
@@ -3871,13 +4080,14 @@ async fn execute_parallel_safe_calls(
         let prior_messages = prior_messages.clone();
         let prior_tool_exchanges = prior_tool_exchanges.clone();
         async move {
-            let (exec, nested_usage) = if let Some(blocked) =
+            let (exec, nested_usage, usage_model, nested_usage_by_model) = if let Some(blocked) =
                 run_pre_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input).await
             {
-                (blocked, TokenUsage::default())
+                (blocked, TokenUsage::default(), None, BTreeMap::new())
             } else {
-                let (mut exec, nested_usage) = if ready.tool_name == "task" {
-                    execute_subagent(
+                let (mut exec, nested_usage, usage_model, nested_usage_by_model) =
+                    if ready.tool_name == "task" {
+                    let (exec, usage, usage_by_model) = execute_subagent(
                         llm,
                         registry,
                         model,
@@ -3895,7 +4105,8 @@ async fn execute_parallel_safe_calls(
                         depth + 1,
                         permission_override,
                     )
-                    .await
+                    .await;
+                    (exec, usage, None, usage_by_model)
                 } else if ready.tool_name == "semantic_search"
                     && registry.is_bifrost_tool("semantic_search")
                 {
@@ -3909,12 +4120,15 @@ async fn execute_parallel_safe_calls(
                         &cancel,
                     )
                     .await;
+                    let usage_model = outcome.usage_model;
                     (
                         ToolExecution {
                             output: outcome.output,
                             failed: outcome.failed,
                         },
                         outcome.usage,
+                        usage_model,
+                        BTreeMap::new(),
                     )
                 } else {
                     let permission_mode =
@@ -3951,21 +4165,40 @@ async fn execute_parallel_safe_calls(
                         },
                     )
                     .await;
-                    (exec, TokenUsage::default())
+                    (exec, TokenUsage::default(), None, BTreeMap::new())
                 };
                 run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
                     .await;
-                (exec, nested_usage)
+                (exec, nested_usage, usage_model, nested_usage_by_model)
             };
-            (slot_index, ready, exec, nested_usage)
+            (
+                slot_index,
+                ready,
+                exec,
+                nested_usage,
+                usage_model,
+                nested_usage_by_model,
+            )
         }
     }))
     .buffered(MAX_PARALLEL_SAFE_TOOL_CALLS)
     .collect::<Vec<_>>()
     .await;
 
-    for (slot_index, ready, exec, nested_usage) in completed {
+    for (slot_index, ready, exec, nested_usage, usage_model, nested_usage_by_model) in completed {
         turn_usage.add(nested_usage);
+        if let Some(usage_model) = usage_model {
+            utility_usage_by_model
+                .entry(usage_model)
+                .or_default()
+                .add(nested_usage);
+        }
+        for (usage_model, usage) in nested_usage_by_model {
+            utility_usage_by_model
+                .entry(usage_model)
+                .or_default()
+                .add(usage);
+        }
         let (phase, status) = if exec.failed {
             let clean = strip_sandbox_escalation_hint(&exec.output);
             (
@@ -4262,6 +4495,7 @@ async fn classify_gate_or_reject(
         PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
+            model,
         } => {
             if !classification.allow {
                 tracing::info!(
@@ -4291,6 +4525,7 @@ async fn classify_gate_or_reject(
                         permission_notice: Some(notice),
                     },
                     usage,
+                    usage_model: Some(model),
                 };
             }
 
@@ -4323,6 +4558,7 @@ async fn classify_gate_or_reject(
                                 )),
                             },
                             usage,
+                            usage_model: Some(model),
                         };
                     }
                     None
@@ -4350,6 +4586,7 @@ async fn classify_gate_or_reject(
                                 )),
                             },
                             usage,
+                            usage_model: Some(model),
                         };
                     }
                     evaluation.shell_sandboxed.then_some(SandboxPolicy::None)
@@ -4390,6 +4627,7 @@ async fn classify_gate_or_reject(
                     permission_notice,
                 },
                 usage,
+                usage_model: Some(model),
             }
         }
         PermissionScopeClassifierOutcome::Unavailable(rationale) => {
@@ -4628,6 +4866,8 @@ async fn classify_permission_scope_with_model(
     shell_sandboxed: bool,
     cancel: &CancellationToken,
 ) -> PermissionScopeClassifierResult {
+    let utility = crate::utility_model::select(request.model);
+    let started = std::time::Instant::now();
     if request.original_user_request.trim().is_empty() {
         return PermissionScopeClassifierResult {
             outcome: PermissionScopeClassifierOutcome::Unavailable(
@@ -4677,15 +4917,15 @@ async fn classify_permission_scope_with_model(
         ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
         ChatMessage::user(prompt),
     ];
-    let (result, attempts, trace_usage) = stream_permission_classifier_with_retry(
+    let (result, attempts, retry_usage) = stream_permission_classifier_with_retry(
         request.llm.as_ref(),
         "classifying permission scope",
         cancel,
         || StreamChatRequest {
-            model: request.model.to_string(),
+            model: utility.model.clone(),
             messages: messages.clone(),
             tools: None,
-            reasoning_effort: request.reasoning_effort.map(str::to_string),
+            reasoning_effort: utility.reasoning_effort.clone(),
             service_tier: None,
             temperature: None,
             structured_output: Some(permission_classifier_schema().clone()),
@@ -4702,6 +4942,16 @@ async fn classify_permission_scope_with_model(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
+            append_trace_record(serde_json::json!({
+                "type": "permission_classifier",
+                "status": "error",
+                "tool_name": request.tool_name,
+                "utility_model": utility.model,
+                "utility_reasoning_effort": utility.reasoning_effort,
+                "utility_model_source": utility.source,
+                "elapsed_millis": started.elapsed().as_millis(),
+                "error": format!("{error:#}"),
+            }));
             // Surface the underlying cause in the user-facing notice, not just
             // the logs: a bare "request failed" can't be acted on, and the
             // downstream rationale is sanitized + length-bounded
@@ -4718,7 +4968,7 @@ async fn classify_permission_scope_with_model(
                     "the auto-classifier request failed: {detail}"
                 )),
                 attempts,
-                usage: trace_usage,
+                usage: retry_usage,
             };
         }
     };
@@ -4726,6 +4976,16 @@ async fn classify_permission_scope_with_model(
     let text = match response {
         LlmResponse::Text { text, .. } => text,
         LlmResponse::ToolCalls { .. } => {
+            append_trace_record(serde_json::json!({
+                "type": "permission_classifier",
+                "status": "invalid_tool_calls",
+                "tool_name": request.tool_name,
+                "utility_model": utility.model,
+                "utility_reasoning_effort": utility.reasoning_effort,
+                "utility_model_source": utility.source,
+                "elapsed_millis": started.elapsed().as_millis(),
+                "usage": trace_usage(usage),
+            }));
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
@@ -4737,21 +4997,46 @@ async fn classify_permission_scope_with_model(
                         .to_string(),
                 ),
                 attempts,
-                usage: trace_usage,
+                usage: retry_usage,
             };
         }
     };
     match parse_permission_scope_classification(&text) {
-        Some(classification) => PermissionScopeClassifierResult {
-            outcome: PermissionScopeClassifierOutcome::Classified {
-                classification,
-                usage,
-            },
-            attempts,
-            usage: trace_usage,
-        },
+        Some(classification) => {
+            append_trace_record(serde_json::json!({
+                "type": "permission_classifier",
+                "status": "completed",
+                "tool_name": request.tool_name,
+                "utility_model": utility.model,
+                "utility_reasoning_effort": utility.reasoning_effort,
+                "utility_model_source": utility.source,
+                "attempts": attempts,
+                "elapsed_millis": started.elapsed().as_millis(),
+                "usage": trace_usage(usage),
+            }));
+            PermissionScopeClassifierResult {
+                outcome: PermissionScopeClassifierOutcome::Classified {
+                    classification,
+                    usage,
+                    model: utility.model.clone(),
+                },
+                attempts,
+                usage: retry_usage,
+            }
+        }
         None => {
             let output = truncate_for_permission_classifier(&text);
+            append_trace_record(serde_json::json!({
+                "type": "permission_classifier",
+                "status": "invalid_output",
+                "tool_name": request.tool_name,
+                "utility_model": utility.model,
+                "utility_reasoning_effort": utility.reasoning_effort,
+                "utility_model_source": utility.source,
+                "elapsed_millis": started.elapsed().as_millis(),
+                "usage": trace_usage(usage),
+                "output": output,
+            }));
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
@@ -4763,7 +5048,7 @@ async fn classify_permission_scope_with_model(
                     "the auto-classifier returned invalid JSON: {output}"
                 )),
                 attempts,
-                usage: trace_usage,
+                usage: retry_usage,
             }
         }
     }
@@ -4966,7 +5251,6 @@ fn truncate_for_permission_classifier(text: &str) -> String {
 struct GateCheck<'a> {
     llm: &'a Arc<dyn LlmBackend>,
     model: &'a str,
-    reasoning_effort: Option<&'a str>,
     original_user_request: &'a str,
     idle_timeout: IdleTimeouts,
     session_id: &'a str,
@@ -5765,9 +6049,9 @@ async fn execute_subagent(
     sessions: &SessionStore,
     depth: usize,
     parent_permission_override: Option<PermissionMode>,
-) -> (ToolExecution, TokenUsage) {
+) -> (ToolExecution, TokenUsage, BTreeMap<String, TokenUsage>) {
     let started = Instant::now();
-    let (exec, usage) = run_subagent(
+    let (exec, usage, usage_by_model) = run_subagent(
         llm,
         registry,
         model,
@@ -5792,7 +6076,7 @@ async fn execute_subagent(
         started.elapsed(),
         !exec.failed,
     ));
-    (exec, usage)
+    (exec, usage, usage_by_model)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5813,7 +6097,7 @@ async fn run_subagent(
     sessions: &SessionStore,
     depth: usize,
     parent_permission_override: Option<PermissionMode>,
-) -> (ToolExecution, TokenUsage) {
+) -> (ToolExecution, TokenUsage, BTreeMap<String, TokenUsage>) {
     let args: TaskArgs = match parse_task_args(args.clone()) {
         Ok(args) => args,
         Err(err) => return invalid_task_args(err),
@@ -5840,6 +6124,7 @@ async fn run_subagent(
                         failed: true,
                     },
                     TokenUsage::default(),
+                    BTreeMap::new(),
                 );
             }
         };
@@ -5865,6 +6150,7 @@ async fn run_subagent(
                         failed: true,
                     },
                     TokenUsage::default(),
+                    BTreeMap::new(),
                 );
             }
         }
@@ -5879,6 +6165,7 @@ async fn run_subagent(
                     failed: true,
                 },
                 TokenUsage::default(),
+                BTreeMap::new(),
             );
         }
     };
@@ -5945,6 +6232,7 @@ async fn run_subagent(
     let LoopOutcome {
         response: text,
         usage: nested_usage,
+        usage_by_model: nested_usage_by_model,
         stop,
         ..
     } = nested;
@@ -5958,7 +6246,7 @@ async fn run_subagent(
             failed: false,
         },
     };
-    (exec, nested_usage)
+    (exec, nested_usage, nested_usage_by_model)
 }
 
 /// A subagent inherits the parent's turn budget (unbounded by default,
@@ -6263,6 +6551,36 @@ fn parallel_batch_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_attribution_separates_utility_model_without_double_counting_fallback() {
+        let total = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..TokenUsage::default()
+        };
+        let external = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 5,
+            ..TokenUsage::default()
+        };
+        let map = usage_by_model(
+            "bedrock::luna",
+            total,
+            BTreeMap::from([("deepseek::flash".to_string(), external)]),
+        );
+        assert_eq!(map["deepseek::flash"].input_tokens, 30);
+        assert_eq!(map["bedrock::luna"].input_tokens, 70);
+        assert_eq!(map["bedrock::luna"].output_tokens, 15);
+
+        let fallback = usage_by_model(
+            "bedrock::luna",
+            total,
+            BTreeMap::from([("bedrock::luna".to_string(), external)]),
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback["bedrock::luna"].input_tokens, 100);
+    }
     use crate::llm_client::{
         FunctionCall, FunctionDef, IncompleteStreamError, OutputBudgetExhaustedError,
     };
@@ -6457,6 +6775,7 @@ mod tests {
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },
@@ -7268,7 +7587,6 @@ mod tests {
         let request = GateCheck {
             llm: &llm,
             model: "test-model",
-            reasoning_effort: None,
             original_user_request: "fix the failing tests",
             idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
@@ -7284,6 +7602,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
+            ..
         } = classify_permission_scope_with_model(&request, false, true, &CancellationToken::new())
             .await
             .outcome
@@ -7344,7 +7663,6 @@ mod tests {
         let request = GateCheck {
             llm: &llm,
             model: "test-model",
-            reasoning_effort: None,
             original_user_request: "fix the failing tests",
             idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
@@ -7397,7 +7715,6 @@ mod tests {
         GateCheck {
             llm,
             model: "test-model",
-            reasoning_effort: None,
             original_user_request: "fix the failing tests",
             idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
@@ -8689,6 +9006,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
             }],
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },
@@ -8778,6 +9096,7 @@ mod tests {
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },
@@ -8883,6 +9202,7 @@ mod tests {
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },
@@ -8895,7 +9215,7 @@ mod tests {
         };
         let sessions = SessionStore::new("m".to_string());
 
-        let (exec, _usage) = crate::trace_logging::with_trace_path(
+        let (exec, _usage, _usage_by_model) = crate::trace_logging::with_trace_path(
             &trace,
             execute_subagent(
                 &llm,
@@ -8972,6 +9292,7 @@ mod tests {
             Arc::new(crate::agents::AgentRegistry::default()),
             Vec::new(),
             crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
                 lsp_settings: crate::lsp::LspSettings::default(),
                 shell_minimizer_enabled: false,
             },

@@ -68,6 +68,11 @@ pub(crate) struct PromptTurnOutcome {
     /// adapter reports usage through its own session-cumulative update.
     #[cfg(feature = "http-api")]
     pub turn_usage: TokenUsage,
+    /// This turn's usage split by the model that actually spent it. The
+    /// harness routes its own internal work (permission classification, the
+    /// semantic reranker, subagents) to a utility model, so a single turn can
+    /// bill two models. Empty when the turn spent nothing.
+    pub usage_by_model: std::collections::BTreeMap<String, TokenUsage>,
     pub response: String,
     pub stop: LoopStop,
     pub tool_stats: crate::host_notice::ToolCallStats,
@@ -173,6 +178,7 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
                 tool_exchanges: Vec::new(),
                 replay_events: Vec::new(),
                 usage: TokenUsage::default(),
+                usage_by_model: std::collections::BTreeMap::new(),
                 stop: LoopStop::Failed(TurnFailure {
                     retryable: false,
                     message: "agent loop panicked".to_string(),
@@ -183,11 +189,21 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
         }
     };
     outcome.usage.add(initial_usage);
+    // Preparing the turn (history compaction) runs on the session model, so
+    // its tokens belong to that model's line in the breakdown.
+    if !outcome.usage_by_model.is_empty() && !initial_usage.is_zero() {
+        outcome
+            .usage_by_model
+            .entry(model.to_string())
+            .or_default()
+            .add(initial_usage);
+    }
     let LoopOutcome {
         response: response_text,
         tool_exchanges,
         replay_events,
         usage: turn_usage,
+        usage_by_model,
         stop,
         current_plan,
         compaction_checkpoint,
@@ -195,7 +211,14 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
 
     let model_metadata = sessions.available_model_metadata().await;
     let model_meta = model_metadata.iter().find(|meta| meta.id == model);
-    let cost_delta_usd = model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage));
+    // An empty breakdown means the loop never attributed usage (a panic, or a
+    // turn that spent nothing), so fall back to pricing the whole turn on the
+    // session model.
+    let cost_delta_usd = if usage_by_model.is_empty() {
+        model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage))
+    } else {
+        crate::usage_report::estimate_usage_by_model_cost(&model_metadata, &usage_by_model)
+    };
     let recap_context_length = model_meta.and_then(|meta| meta.context_length);
     let cumulative_usage = sessions
         .record_usage(session_id, turn_usage, cost_delta_usd)
@@ -270,6 +293,7 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
         cumulative_usage,
         #[cfg(feature = "http-api")]
         turn_usage,
+        usage_by_model,
         response: response_text,
         stop,
         tool_stats,

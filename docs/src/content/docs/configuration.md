@@ -39,6 +39,7 @@ anvil [OPTIONS]
 | --- | --- | --- | --- |
 | `--default-model` | — | unset | Default wire id or bare provider model id for new sessions. |
 | `--reasoning-effort` | — | provider default | Seed new sessions with a supported reasoning effort, or `off`. |
+| `--utility-model` | `ANVIL_UTILITY_MODEL` | session model at `low` effort | Provider-qualified model for semantic-search reranking and automatic permission classification. Explicit utility models use provider-default effort and must have a configured provider at startup. |
 | `--max-turns` | — | `0` | Prompt tool-loop ceiling; `0` is unbounded. |
 | `--max-sessions` | — | `50` | Resident-session LRU limit; `0` disables it. |
 | `--max-history-turns` | — | `50` | In-memory history-turn limit; `0` disables it. |

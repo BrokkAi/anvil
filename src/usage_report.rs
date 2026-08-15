@@ -167,6 +167,26 @@ pub(crate) fn is_deepseek_model(model_wire_id: &str) -> bool {
     )
 }
 
+/// Cost of a turn whose tokens are split across models, which happens when
+/// the harness routes its own internal work (permission classification, the
+/// semantic reranker, subagents) to a cheaper utility model. Returns `None`
+/// when any model that actually spent tokens has no price, so a partial
+/// figure is never reported as the whole turn's cost.
+pub(crate) fn estimate_usage_by_model_cost(
+    metadata: &[crate::llm_client::ModelMetadata],
+    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
+) -> Option<f64> {
+    usage_by_model
+        .iter()
+        .try_fold(0.0, |total, (model, usage)| {
+            if usage.is_zero() {
+                return Some(total);
+            }
+            let model = metadata.iter().find(|metadata| metadata.id == *model)?;
+            Some(total + model.estimate_cost_usd(*usage)?)
+        })
+}
+
 /// `render_usage_report` can render a distinct line for "no credential
 /// found" vs. "credential found but the upstream call failed" without
 /// the call site re-shaping a nested type.
@@ -469,6 +489,7 @@ mod tests {
         crate::session::SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
+            analysis_workspaces: None,
             mode: SessionMode::Lutz,
             model: model.into(),
             history: vec![],
