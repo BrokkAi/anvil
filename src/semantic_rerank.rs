@@ -23,12 +23,15 @@
 //! Bifrost's raw payload is never exposed to the model.
 //!
 //! Bifrost used to return a third list, `bm25_ranked`, from a lexical arm fused
-//! alongside the dense one. That arm was deleted outright in bifrost c353c862
-//! after the hybrid A/B lost on tokens and money with no measurable task
-//! benefit, so a current server never sends the key. This module still reads it
-//! where it appears: replaying an archived response, or pointing the harness at
-//! an older bifrost build, are ordinary inputs, and the leg's absence is normal
-//! rather than an error. Nothing branches on which shape arrived.
+//! alongside the dense one, and a `retrieval_profile` naming the leg budget the
+//! `BIFROST_SEMANTIC_SEARCH_PROFILE` sweep had selected. Both were deleted in
+//! bifrost c353c862 after the hybrid A/B lost on tokens and money with no
+//! measurable task benefit; the winning budget (dense `2*k`, co-edit `k`) is now
+//! the server's only behavior, so a current server never sends either key. This
+//! module still reads both where they appear: replaying an archived response, or
+//! pointing the harness at an older bifrost build, are ordinary inputs, and the
+//! absence is normal rather than an error. Nothing branches on which shape
+//! arrived.
 
 use anyhow::Context;
 use futures::future::join_all;
@@ -169,6 +172,14 @@ struct RankedCandidate<'a> {
 /// (every query in the batch: search, candidate context fetch, and the
 /// disposable rerank turn), which is what `execute_tool` records for every
 /// other tool: the time the model waited.
+///
+/// Note that this counts calls the `semantic_search_batch` records cannot: the
+/// batch-start record is written only after `parse_final_k` and `parse_queries`
+/// accept the arguments, so a rejected call never opens a batch. In the r26
+/// CodeScaleBench arm the traces hold 55 batch starts against 64
+/// `semantic_search` calls the model issued; argument rejection is one
+/// mechanism for that gap, and it is not yet established that it is the only
+/// one. Do not read batch-start counts as a call census.
 pub(crate) async fn rerank_semantic_search(
     llm: &Arc<dyn LlmBackend>,
     model: &str,
@@ -1275,13 +1286,14 @@ fn trace_phase(
 }
 
 fn trace_rerank(trace: RerankTrace<'_>) {
-    let realized = |key: &str| {
-        trace
-            .raw
-            .get(key)
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-    };
+    // A leg the response does not carry is reported as null, not as zero. Zero
+    // is a real measurement -- r26 ran the `semantic-coedit-2-1` budget, whose
+    // bm25 leg was present with a zero depth -- and a dense-only server that
+    // has no lexical leg at all must not be averaged in as though it had asked
+    // and got nothing. cimeval's `mean_realized_*` skips nulls and keeps its
+    // r26 numbers.
+    let realized =
+        |key: &str| -> Option<usize> { trace.raw.get(key).and_then(Value::as_array).map(Vec::len) };
     append_trace_record(json!({
         "type": "semantic_search_rerank",
         "query": trace.query,
@@ -1289,6 +1301,9 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "query_count": trace.query_count,
         "requested_final_k": trace.final_k,
         "forwarded_base_k": trace.base_k,
+        // Null against a current bifrost: c353c862 removed the profile knob
+        // and fixed the budget at the arm the sweep chose. The field stays so a
+        // reader can tell a dense-only run from an r26 one that named its arm.
         "retrieval_profile": diagnostic(trace.raw, "retrieval_profile"),
         "requested_leg_counts": diagnostic(trace.raw, "requested_leg_counts"),
         "retrieval_timings": diagnostic(trace.raw, "timings"),
@@ -1629,6 +1644,95 @@ mod tests {
             !prompt.contains("bm25"),
             "no lexical leg exists to advertise to the model: {prompt}"
         );
+        // The full rerank path over these candidates: prompt, selection,
+        // ordering. A dense-only response reranks like any other.
+        let ordered = order_candidates(
+            &candidates,
+            &[selection("f1"), selection("s2")],
+            DEFAULT_FINAL_K,
+        )
+        .expect("a dense-only response reranks");
+        let ordered_names: Vec<&str> = ordered
+            .iter()
+            .map(|selected| selected.candidate.name.as_str())
+            .collect();
+        assert_eq!(ordered_names, vec!["src/x.rs", "a.B.d"]);
+
+        // The diagnostics the trace record reads are absent, not zero: a
+        // campaign that averages `realized_bm25` must not count a leg that no
+        // longer exists as a leg that returned nothing.
+        assert!(diagnostic(&raw, "retrieval_profile").is_none());
+        assert!(diagnostic(&raw, "requested_leg_counts").is_some());
+        assert!(diagnostic(&raw, "timings").is_some());
+        assert!(raw.get("bm25_ranked").is_none());
+    }
+
+    async fn traced(raw: &Value) -> Value {
+        let utility = crate::utility_model::UtilityModelSelection {
+            model: "test-model".to_string(),
+            reasoning_effort: Some("low".to_string()),
+            source: "test",
+        };
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let path = cwd.path().join("anvil-trace.jsonl");
+        crate::trace_logging::with_trace_path(&path, async {
+            trace_rerank(RerankTrace {
+                query: "q",
+                query_index: 0,
+                query_count: 1,
+                raw,
+                final_k: 20,
+                base_k: 40,
+                deduplicated_count: 0,
+                context_bytes: 0,
+                selected_count: 0,
+                final_count: 0,
+                signature_candidate_count: 0,
+                signature_locator_count: 0,
+                final_with_signature_count: 0,
+                declaration_fallback_count: 0,
+                failure_reason: None,
+                usage: TokenUsage::default(),
+                utility: &utility,
+            })
+        })
+        .await;
+        let lines = std::fs::read_to_string(&path).expect("trace written");
+        serde_json::from_str(lines.lines().next().expect("one record")).expect("valid json")
+    }
+
+    /// A campaign that averages `realized_bm25` skips nulls. A leg the response
+    /// never carried must therefore be null, not zero: zero is a real
+    /// measurement (r26 ran the `semantic-coedit-2-1` budget, whose bm25 leg
+    /// was present at depth zero) and conflating the two would silently fold
+    /// dense-only runs into the r26 mean.
+    #[tokio::test]
+    async fn a_removed_leg_traces_as_absent_and_an_empty_one_as_zero() {
+        let dense_only = traced(&json!({
+            "vector_ranked": [{ "fqfn": "a.B.c", "score": 0.9 }],
+            "coedit_ranked": [],
+            "requested_leg_counts": { "vector": 40, "coedit": 20 },
+        }))
+        .await;
+        assert_eq!(dense_only["realized_vector"], 1);
+        assert_eq!(dense_only["realized_coedit"], 0);
+        assert!(
+            dense_only["realized_bm25"].is_null(),
+            "a leg bifrost no longer has must not be reported as an empty one: {dense_only}"
+        );
+        assert!(dense_only["retrieval_profile"].is_null());
+        assert_eq!(dense_only["requested_leg_counts"]["vector"], 40);
+
+        let r26_shape = traced(&json!({
+            "vector_ranked": [{ "fqfn": "a.B.c", "score": 0.9 }],
+            "bm25_ranked": [],
+            "coedit_ranked": [],
+            "retrieval_profile": "semantic-coedit-2-1",
+            "requested_leg_counts": { "vector": 40, "bm25": 0, "coedit": 20 },
+        }))
+        .await;
+        assert_eq!(r26_shape["realized_bm25"], 0);
+        assert_eq!(r26_shape["retrieval_profile"], "semantic-coedit-2-1");
     }
 
     /// An archived response, or one from a bifrost older than c353c862, still
@@ -2165,6 +2269,97 @@ mod tests {
         assert!(
             timing.get("timestamp").and_then(Value::as_str).is_some(),
             "timing record needs the timestamp the trace writer stamps: {timing:?}"
+        );
+    }
+
+    /// The call the `semantic_search_batch` records cannot see. Rejected
+    /// arguments never open a batch, so without the wrapper's own record this
+    /// call would be invisible to a trace consumer counting calls per tool.
+    /// It is also the cheapest path through the wrapper: no MCP server, no LLM.
+    #[tokio::test]
+    async fn a_rejected_semantic_search_still_records_its_tool_timing() {
+        struct UnusedBackend;
+        impl LlmBackend for UnusedBackend {
+            fn list_models(&self) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("rejected arguments never reach the rerank turn")
+            }
+
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                unimplemented!("rejected arguments never reach the rerank turn")
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
+        )
+        .await;
+        let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
+
+        let outcome = crate::trace_logging::with_trace_path(
+            &trace,
+            rerank_semantic_search(
+                &llm,
+                "test-model",
+                &registry,
+                &[],
+                &json!({"queries": []}),
+                IdleTimeouts {
+                    first_progress: std::time::Duration::from_secs(1),
+                    inter_chunk: std::time::Duration::from_secs(1),
+                },
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.failed,
+            "an empty query list is rejected: {}",
+            outcome.output
+        );
+
+        let lines = std::fs::read_to_string(&trace).unwrap_or_default();
+        let records: Vec<Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        let timings: Vec<&Value> = records
+            .iter()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("tool_timing"))
+            .collect();
+        assert_eq!(
+            timings.len(),
+            1,
+            "expected exactly one tool_timing record, got {records:?}"
+        );
+        assert_eq!(
+            timings[0].get("tool").and_then(Value::as_str),
+            Some("semantic_search")
+        );
+        assert_eq!(
+            timings[0].get("success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("type").and_then(Value::as_str)
+                    != Some("semantic_search_batch")),
+            "a rejected call must not have opened a batch: {records:?}"
         );
     }
 

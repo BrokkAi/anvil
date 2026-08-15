@@ -860,10 +860,11 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
 /// `crate::semantic_rerank`), so the model receives a single relevance-ordered
 /// query-local lists of signature locators -- not bifrost's raw ranked lists.
 ///
-/// The description says "semantic", not "semantic + lexical": bifrost deleted
+/// The descriptions say "semantic", not "semantic + lexical": bifrost deleted
 /// its BM25 arm in c353c862, so promising the model a lexical leg would
 /// misdescribe the tool and invite keyword-shaped queries that dense retrieval
-/// handles worst.
+/// handles worst. This matters most for `CIM_SEMANTIC_SEARCH`, whose whole job
+/// is steering the model between behavior-shaped and identifier-shaped lookups.
 fn mcp_tool_description<'a>(name: &str, original: &'a str, cim_semantic_search: bool) -> &'a str {
     const SEMANTIC_SEARCH: &str = "Semantic code search. Accepts one to three \
         natural-language queries and independently returns a relevance-ordered list of compact \
@@ -2765,12 +2766,17 @@ mod tests {
         assert!(overridden.contains("maximum number of final relevance-reranked results"));
         assert!(overridden.contains("may return fewer than k by design"));
         assert_ne!(overridden, "bifrost's raw description");
-        // Bifrost has no lexical arm since c353c862. Do not tell the model it
-        // does.
-        assert!(
-            !overridden.to_lowercase().contains("lexical"),
-            "the description must not advertise a retrieval leg bifrost removed: {overridden}"
-        );
+        // Bifrost has no lexical arm since c353c862. Neither description may
+        // tell the model it does.
+        for description in [
+            mcp_tool_description("semantic_search", "raw", false),
+            mcp_tool_description("semantic_search", "raw", true),
+        ] {
+            assert!(
+                !description.to_ascii_lowercase().contains("lexical"),
+                "the description must not advertise a retrieval leg bifrost removed: {description}"
+            );
+        }
         // Other tools keep bifrost's description unchanged.
         assert_eq!(
             mcp_tool_description("search_symbols", "bifrost's raw description", false),
