@@ -50,7 +50,7 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
@@ -91,6 +91,22 @@ const MAX_BODY_FETCH_IDS: usize = 10;
 /// reproduced pool 97.9 percent of gold candidates were decidable from name,
 /// path, signals, and signatures alone, so this is an exception budget.
 const MAX_BODY_FETCH_TOTAL_BYTES: usize = 40_000;
+
+/// First-progress idle timeout for this reranker's utility requests, and for
+/// nothing else.
+///
+/// The measured failure mode is the provider stalling before its first token.
+/// At the session's 120-second first-progress timeout, with up to four attempts
+/// from `stream_chat_no_visible_output_with_retry`, one stalled rerank call can
+/// spend more than eight minutes producing nothing. In the 2026-08-14
+/// remeasure, 49 such stalls at 120 seconds each accounted for approximately
+/// the entire rerank phase, and a body-fetch round multiplies the exposure by
+/// putting more requests behind the same stall.
+///
+/// Only the first-progress bound moves. Once the utility model has started
+/// streaming it is making progress, so the inter-chunk bound stays whatever the
+/// session set. A session configured tighter than this keeps its own value.
+const UTILITY_FIRST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MAX_LINE_CHARS: usize = 2048;
 
@@ -344,6 +360,15 @@ async fn rerank_one_semantic_search(
     cancel: &CancellationToken,
 ) -> RerankOutcome {
     let utility = crate::utility_model::select(model);
+    // Every request this function makes is a utility request, so the shorter
+    // first-progress bound is applied once, here. See
+    // `UTILITY_FIRST_PROGRESS_TIMEOUT`.
+    let idle_timeout = IdleTimeouts {
+        first_progress: idle_timeout
+            .first_progress
+            .min(UTILITY_FIRST_PROGRESS_TIMEOUT),
+        inter_chunk: idle_timeout.inter_chunk,
+    };
     let started = Instant::now();
     let phases = PhaseTrace {
         query,
@@ -2855,6 +2880,7 @@ for line in sys.stdin:
         messages: Vec<ChatMessage>,
         tool_names: Vec<String>,
         structured: bool,
+        idle_timeouts: IdleTimeouts,
     }
 
     /// A utility model scripted by request index. Hand-written rather than
@@ -2888,6 +2914,7 @@ for line in sys.stdin:
                         .map(|tool| tool.function.name.clone())
                         .collect(),
                     structured: request.structured_output.is_some(),
+                    idle_timeouts: request.idle_timeouts,
                 });
                 requests.len() - 1
             };
@@ -2981,7 +3008,11 @@ for line in sys.stdin:
                 &registry,
                 &[ChatMessage::user("where does run() come from?")],
                 &json!({ "queries": ["where does run come from"] }),
-                IdleTimeouts::uniform(std::time::Duration::from_secs(5)),
+                // The session's shape, so the utility override is visible.
+                IdleTimeouts {
+                    first_progress: Duration::from_secs(120),
+                    inter_chunk: Duration::from_secs(60),
+                },
                 &CancellationToken::new(),
             ),
         )
@@ -3032,6 +3063,15 @@ for line in sys.stdin:
         assert!(prompt.contains(BODY_FETCH_TOOL), "{prompt}");
         assert_eq!(requests[0].tool_names, vec![BODY_FETCH_TOOL.to_string()]);
         assert!(requests[0].structured);
+        // A stalled utility request is abandoned well before the session's own
+        // first-progress budget; a streaming one keeps it.
+        assert_eq!(
+            requests[0].idle_timeouts,
+            IdleTimeouts {
+                first_progress: UTILITY_FIRST_PROGRESS_TIMEOUT,
+                inter_chunk: Duration::from_secs(60),
+            }
+        );
 
         let record = rerank_record(&records);
         assert_eq!(record["body_fetch_rounds"], 0);
