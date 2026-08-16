@@ -6,10 +6,19 @@
 //! leaves fusion to the caller. Rather than dump the raw lists into the
 //! model's context, the harness runs one *disposable*
 //! LLM turn on top of the live conversation: it shows the selected utility model each
-//! candidate together with its (truncated) source or file summary and asks it
-//! to return just the relevant ones, best-first. The model then sees a single
-//! clean, relevance-ordered hit list; the bulky candidate context lives only
-//! in the disposable turn and never pollutes the main conversation.
+//! candidate together with its structured declaration signatures (and, for a
+//! file candidate, its summary) and asks it to return just the relevant ones,
+//! best-first. The model then sees a single clean, relevance-ordered hit list;
+//! the bulky candidate context lives only in the disposable turn and never
+//! pollutes the main conversation.
+//!
+//! The prompt is signatures-first: no candidate arrives with its source. In a
+//! reproduced pool 97.9 percent of gold candidates were decidable from name,
+//! path, signals, and signatures alone, and pre-fetching every body cost up to
+//! 120KB per query to serve the other 2.1 percent. Those are reachable through
+//! the one tool the disposable turn offers, `fetch_candidate_sources`, in a
+//! bounded exchange of at most `MAX_BODY_FETCH_ROUNDS` rounds before the
+//! selection must come back.
 //!
 //! The disposable turn takes the *task* half of the conversation as its prefix:
 //! the system, user, and assistant text up to the trailing assistant message
@@ -19,7 +28,8 @@
 //! it has already read.
 //!
 //! Provider failures return a tool error. Invalid structured output gets one
-//! corrective retry, then returns a tool error. A failed reranker must not
+//! corrective retry, then returns a tool error. A bifrost failure inside a
+//! body-fetch round returns a tool error too. A failed reranker must not
 //! silently change the result into a different retrieval treatment.
 //! Bifrost's raw payload is never exposed to the model.
 //!
@@ -44,8 +54,9 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
-    TokenUsage, stream_chat_no_visible_output_with_retry,
+    ChatContentPart, ChatMessage, FunctionDef, IdleTimeouts, LlmBackend, LlmResponse,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    stream_chat_no_visible_output_with_retry,
 };
 use crate::structured_output::StructuredOutputRequest;
 use crate::tools::ToolRegistry;
@@ -60,6 +71,26 @@ const CONTEXT_FETCH_BATCH: usize = 8;
 const MAX_SELECTED_DECLARATIONS: usize = 5;
 const MAX_UTILITY_OUTPUT_ATTEMPTS: usize = 2;
 const RRF_RANK_CONSTANT: f64 = 60.0;
+
+/// Declarations rendered per candidate in the rerank prompt. Bifrost returns
+/// every declaration it has for a target, and a reproduced pool held a
+/// gtest-macro candidate with 290 of them that alone was 27 percent of the
+/// prompt. Relevance is decided by the first few signatures; the tail is
+/// repetition.
+const MAX_PROMPT_DECLARATIONS: usize = 8;
+
+/// The one tool the rerank turn offers the utility model.
+const BODY_FETCH_TOOL: &str = "fetch_candidate_sources";
+/// Tool rounds allowed before the turn must answer. Two rounds cover "fetch,
+/// then fetch what the first fetch pointed at"; more is a budget, not a
+/// decision procedure.
+const MAX_BODY_FETCH_ROUNDS: usize = 2;
+/// Candidate ids one `fetch_candidate_sources` call may ask for.
+const MAX_BODY_FETCH_IDS: usize = 10;
+/// Source bytes the whole rerank may hand back through the tool. In a
+/// reproduced pool 97.9 percent of gold candidates were decidable from name,
+/// path, signals, and signatures alone, so this is an exception budget.
+const MAX_BODY_FETCH_TOTAL_BYTES: usize = 40_000;
 
 const MAX_LINE_CHARS: usize = 2048;
 
@@ -314,44 +345,27 @@ async fn rerank_one_semantic_search(
 ) -> RerankOutcome {
     let utility = crate::utility_model::select(model);
     let started = Instant::now();
-    let (bifrost_args, base_k) = prepare_bifrost_args(query, final_k, workspace);
-
-    // 1. Underlying search. A hard failure here is the model's to see.
-    trace_phase(
-        "retrieval_start",
+    let phases = PhaseTrace {
         query,
         query_index,
         query_count,
-        &utility,
+        utility: &utility,
         started,
-        None,
-    );
+    };
+    let (bifrost_args, base_k) = prepare_bifrost_args(query, final_k, workspace);
+
+    // 1. Underlying search. A hard failure here is the model's to see.
+    phases.record("retrieval_start", None);
     let raw = match registry
         .call_bifrost_tool_raw("semantic_search", bifrost_args)
         .await
     {
         Ok(value) => {
-            trace_phase(
-                "retrieval_complete",
-                query,
-                query_index,
-                query_count,
-                &utility,
-                started,
-                None,
-            );
+            phases.record("retrieval_complete", None);
             value
         }
         Err(err) => {
-            trace_phase(
-                "retrieval_error",
-                query,
-                query_index,
-                query_count,
-                &utility,
-                started,
-                Some(&format!("{err:#}")),
-            );
+            phases.record("retrieval_error", Some(&format!("{err:#}")));
             return RerankOutcome::error(format!("Error: {err}"));
         }
     };
@@ -374,6 +388,8 @@ async fn rerank_one_semantic_search(
             signature_locator_count: 0,
             final_with_signature_count: 0,
             declaration_fallback_count: 0,
+            body_fetch_rounds: 0,
+            bodies_fetched: 0,
             failure_reason: None,
             usage: TokenUsage::default(),
             utility: &utility,
@@ -384,39 +400,15 @@ async fn rerank_one_semantic_search(
         );
     }
 
-    // 3. Fetch source / summaries for the candidates.
-    trace_phase(
-        "context_fetch_start",
-        query,
-        query_index,
-        query_count,
-        &utility,
-        started,
-        None,
-    );
+    // 3. Fetch the structured declaration records for the candidates.
+    phases.record("context_fetch_start", None);
     if let Err(err) = fetch_context(registry, &mut candidates, workspace).await {
-        trace_phase(
-            "context_fetch_error",
-            query,
-            query_index,
-            query_count,
-            &utility,
-            started,
-            Some(&format!("{err:#}")),
-        );
+        phases.record("context_fetch_error", Some(&format!("{err:#}")));
         return RerankOutcome::error(format!(
             "Error: semantic_search context fetch failed: {err:#}"
         ));
     }
-    trace_phase(
-        "context_fetch_complete",
-        query,
-        query_index,
-        query_count,
-        &utility,
-        started,
-        None,
-    );
+    phases.record("context_fetch_complete", None);
     let context_bytes = bound_candidate_context(&mut candidates);
 
     // 4. Disposable relevance turn on top of the live conversation.
@@ -433,69 +425,110 @@ async fn rerank_one_semantic_search(
         prefer_json_object: false,
     };
 
-    trace_phase(
-        "utility_request_start",
-        query,
-        query_index,
-        query_count,
-        &utility,
-        started,
-        None,
-    );
+    phases.record("utility_request_start", None);
+    let body_fetch_tool = vec![body_fetch_tool_definition()];
     let mut usage = TokenUsage::default();
     let mut rejection = String::new();
     let mut attempts_made = 0;
     let mut last_selected_count = 0;
-    for attempt in 1..=MAX_UTILITY_OUTPUT_ATTEMPTS {
+    let mut budget = BodyFetchBudget::default();
+    'attempts: for attempt in 1..=MAX_UTILITY_OUTPUT_ATTEMPTS {
         attempts_made = attempt;
-        let response = stream_chat_no_visible_output_with_retry(
-            llm.as_ref(),
-            "semantic_search rerank",
-            cancel,
-            || StreamChatRequest {
-                model: utility.model.clone(),
-                messages: messages.clone(),
-                tools: None,
-                reasoning_effort: utility.reasoning_effort.clone(),
-                service_tier: None,
-                temperature: None,
-                structured_output: Some(structured.clone()),
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: idle_timeout,
-            },
-        )
-        .await;
+        // Body-fetch rounds run inside the attempt. Tools and the
+        // structured-output schema ride on the same request, so a turn that
+        // needs no body still answers in a single call; once the round budget
+        // is spent the request goes out with the schema and no tools.
+        let text = 'exchange: loop {
+            let tools_open = budget.rounds < MAX_BODY_FETCH_ROUNDS;
+            let response = stream_chat_no_visible_output_with_retry(
+                llm.as_ref(),
+                "semantic_search rerank",
+                cancel,
+                || StreamChatRequest {
+                    model: utility.model.clone(),
+                    messages: messages.clone(),
+                    tools: tools_open.then(|| body_fetch_tool.clone()),
+                    reasoning_effort: utility.reasoning_effort.clone(),
+                    service_tier: None,
+                    temperature: None,
+                    structured_output: Some(structured.clone()),
+                    on_token: Box::new(|_| {}),
+                    on_thought: Box::new(|_| {}),
+                    cancel: cancel.clone(),
+                    idle_timeouts: idle_timeout,
+                },
+            )
+            .await;
 
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                trace_phase(
-                    "utility_request_error",
-                    query,
-                    query_index,
-                    query_count,
-                    &utility,
-                    started,
-                    Some(&format!("{err:#}")),
-                );
-                rejection = format!("provider request failed: {err:#}");
-                break;
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    phases.record("utility_request_error", Some(&format!("{err:#}")));
+                    rejection = format!("provider request failed: {err:#}");
+                    break 'attempts;
+                }
+            };
+            phases.record("utility_request_complete", None);
+            usage.add(response.usage());
+            let (text, reasoning_content, calls) = match response {
+                LlmResponse::Text {
+                    text,
+                    reasoning_content,
+                    ..
+                } => (text, reasoning_content, Vec::new()),
+                LlmResponse::ToolCalls {
+                    text,
+                    reasoning_content,
+                    calls,
+                    ..
+                } => (text, reasoning_content, calls),
+            };
+            if !tools_open || calls.is_empty() {
+                break 'exchange text;
             }
-        };
-        trace_phase(
-            "utility_request_complete",
-            query,
-            query_index,
-            query_count,
-            &utility,
-            started,
-            None,
-        );
-        usage.add(response.usage());
-        let text = match response {
-            LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
+
+            // A round that resolves to nothing useful still spends a round: the
+            // budget bounds the exchange, not the model's hit rate.
+            budget.rounds += 1;
+            let mut results = Vec::with_capacity(calls.len());
+            let mut round_ids = 0;
+            for call in &calls {
+                match run_body_fetch_call(registry, &mut candidates, call, workspace, &mut budget)
+                    .await
+                {
+                    Ok((result, ids)) => {
+                        round_ids += ids;
+                        results.push(result);
+                    }
+                    Err(err) => {
+                        phases.record("utility_tool_error", Some(&format!("{err:#}")));
+                        return RerankOutcome::error(format!(
+                            "Error: semantic_search source fetch failed: {err:#}"
+                        ));
+                    }
+                }
+            }
+            phases.record_tool_round(budget.rounds, round_ids);
+            messages.push(
+                ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                    text,
+                    calls.clone(),
+                    reasoning_content,
+                ),
+            );
+            for (call, result) in calls.iter().zip(results) {
+                messages.push(ChatMessage::tool_result(
+                    &call.id,
+                    &call.function.name,
+                    result,
+                ));
+            }
+            if budget.rounds == MAX_BODY_FETCH_ROUNDS {
+                messages.push(ChatMessage::user(format!(
+                    "Tool access is finished: `{BODY_FETCH_TOOL}` is no longer available. Decide \
+                     from what you already have and return only the selection object."
+                )));
+            }
         };
 
         let selected = parse_selections(&text);
@@ -543,6 +576,8 @@ async fn rerank_one_semantic_search(
                         .iter()
                         .filter(|selected| selected.declaration_fallback)
                         .count(),
+                    body_fetch_rounds: budget.rounds,
+                    bodies_fetched: budget.bodies,
                     failure_reason: None,
                     usage,
                     utility: &utility,
@@ -597,6 +632,8 @@ async fn rerank_one_semantic_search(
             .sum(),
         final_with_signature_count: 0,
         declaration_fallback_count: 0,
+        body_fetch_rounds: budget.rounds,
+        bodies_fetched: budget.bodies,
         failure_reason: Some(&rejection),
         usage,
         utility: &utility,
@@ -791,10 +828,16 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
     candidates
 }
 
-/// Batch-fetch symbol source (`get_symbol_sources`) and file summaries
-/// (`get_summaries`) for the candidates and attach truncated context. A Bifrost
-/// error fails the semantic-search call. Name-only results are a different tool
-/// contract, not a valid fallback for failed context enrichment.
+/// Batch-fetch file summaries (`get_summaries`) for the candidates and attach
+/// the structured declaration records they carry. A Bifrost error fails the
+/// semantic-search call. Name-only results are a different tool contract, not a
+/// valid fallback for failed context enrichment.
+///
+/// This sweep no longer pre-fetches `get_symbol_sources` for every candidate.
+/// Bodies are fetched on demand by the utility model through
+/// `fetch_candidate_sources`; the summaries are the only source of the
+/// signatures and `path:lines` records that both the prompt and the agent-facing
+/// card are built from, so they are still fetched for every candidate.
 async fn fetch_context(
     registry: &ToolRegistry,
     candidates: &mut [Candidate],
@@ -802,43 +845,12 @@ async fn fetch_context(
 ) -> anyhow::Result<()> {
     for start in (0..candidates.len()).step_by(CONTEXT_FETCH_BATCH) {
         let end = (start + CONTEXT_FETCH_BATCH).min(candidates.len());
-        let symbols: Vec<String> = candidates[start..end]
+        let targets: Vec<String> = candidates[start..end]
             .iter()
-            .filter(|candidate| candidate.kind == CandidateKind::Symbol)
             .map(|candidate| candidate.name.clone())
             .collect();
-        let files: Vec<String> = candidates[start..end]
-            .iter()
-            .filter(|candidate| candidate.kind == CandidateKind::File)
-            .map(|candidate| candidate.name.clone())
-            .collect();
-        let summary_targets: Vec<String> = symbols.iter().chain(&files).cloned().collect();
-
-        if available_private_context_bytes(candidates) < MAX_TOTAL_CONTEXT_BYTES {
-            fetch_symbol_context(registry, candidates, &symbols, workspace).await?;
-        }
-        fetch_summary_context(registry, candidates, &summary_targets, workspace).await?;
+        fetch_summary_context(registry, candidates, &targets, workspace).await?;
     }
-    Ok(())
-}
-
-async fn fetch_symbol_context(
-    registry: &ToolRegistry,
-    candidates: &mut [Candidate],
-    symbols: &[String],
-    workspace: Option<&str>,
-) -> anyhow::Result<()> {
-    if symbols.is_empty() {
-        return Ok(());
-    }
-    let value = registry
-        .call_bifrost_tool_raw(
-            "get_symbol_sources",
-            bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
-        )
-        .await
-        .context("get_symbol_sources failed during semantic-search enrichment")?;
-    attach_symbol_sources(candidates, &value);
     Ok(())
 }
 
@@ -872,16 +884,177 @@ async fn fetch_summary_context(
     Ok(())
 }
 
-fn available_private_context_bytes(candidates: &[Candidate]) -> usize {
-    candidates
-        .iter()
-        .filter_map(|candidate| candidate.context.as_ref())
-        .map(String::len)
-        .sum()
+/// What the utility model may do with `fetch_candidate_sources`, spent across
+/// the whole rerank of one query.
+#[derive(Default)]
+struct BodyFetchBudget {
+    /// Tool rounds spent, whether or not they produced anything.
+    rounds: usize,
+    /// Candidates whose source reached the model, counting one whose body was
+    /// reported as identical to an earlier candidate's: the model has that
+    /// candidate's source either way.
+    bodies: usize,
+    /// Source bytes printed, against `MAX_BODY_FETCH_TOTAL_BYTES`.
+    bytes: usize,
 }
 
-/// Enforce the disposable-turn source/summary budget without ever removing a
-/// candidate identity. Earlier RRF candidates consume the shared budget first.
+/// The one tool the rerank turn offers. It exists because 2.1 percent of gold
+/// candidates in a reproduced pool were not decidable from name, path, signals,
+/// and signatures: generic-named methods whose deciding evidence was in the
+/// first lines of the body.
+fn body_fetch_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: BODY_FETCH_TOOL.to_string(),
+            description: format!(
+                "Fetch the source of candidates whose relevance the signatures leave undecidable. \
+                 Pass candidate ids exactly as shown in the prompt, for example \"s3\", at most \
+                 {MAX_BODY_FETCH_IDS} per call. Source is available for symbol candidates only."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": MAX_BODY_FETCH_IDS,
+                        "description": "Candidate ids to fetch source for."
+                    }
+                },
+                "required": ["ids"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+/// Run one `fetch_candidate_sources` call and render the tool result, returning
+/// it with the number of distinct ids the call asked for.
+///
+/// A bifrost failure propagates: the rerank fails closed on it, exactly as it
+/// does for the search and the summary sweep. Everything the model can get
+/// wrong -- another tool's name, unparsable arguments, an id that names no
+/// candidate or names a file -- is reported inside the result text so the
+/// exchange can continue.
+async fn run_body_fetch_call(
+    registry: &ToolRegistry,
+    candidates: &mut [Candidate],
+    call: &ToolCall,
+    workspace: Option<&str>,
+    budget: &mut BodyFetchBudget,
+) -> anyhow::Result<(String, usize)> {
+    if call.function.name != BODY_FETCH_TOOL {
+        return Ok((
+            format!(
+                "Error: unknown tool '{}'. The only tool available here is `{BODY_FETCH_TOOL}`.",
+                call.function.name
+            ),
+            0,
+        ));
+    }
+    let arguments: Value = match serde_json::from_str(&call.function.arguments) {
+        Ok(arguments) => arguments,
+        Err(err) => {
+            return Ok((
+                format!("Error: could not parse the arguments of `{BODY_FETCH_TOOL}`: {err}"),
+                0,
+            ));
+        }
+    };
+    let Some(requested) = arguments.get("ids").and_then(Value::as_array) else {
+        return Ok((
+            format!("Error: `{BODY_FETCH_TOOL}` needs an \"ids\" array of candidate ids."),
+            0,
+        ));
+    };
+    let mut ids: Vec<&str> = Vec::new();
+    for value in requested {
+        let Some(id) = value.as_str() else {
+            return Ok((
+                "Error: every entry of \"ids\" must be a candidate id string.".to_string(),
+                0,
+            ));
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if ids.len() > MAX_BODY_FETCH_IDS {
+        notes.push(format!(
+            "Only the first {MAX_BODY_FETCH_IDS} of {} requested ids were fetched.",
+            ids.len()
+        ));
+        ids.truncate(MAX_BODY_FETCH_IDS);
+    }
+
+    let mut resolved: Vec<(&str, String)> = Vec::new();
+    for id in &ids {
+        match candidates.iter().find(|candidate| candidate.id == *id) {
+            None => notes.push(format!("{id}: no candidate has that id.")),
+            Some(candidate) if candidate.kind == CandidateKind::File => notes.push(format!(
+                "{id}: a file candidate; source is available for symbol candidates only."
+            )),
+            Some(candidate) => resolved.push((id, candidate.name.clone())),
+        }
+    }
+    let id_count = ids.len();
+    if resolved.is_empty() {
+        return Ok((render_body_fetch_result(String::new(), &notes), id_count));
+    }
+
+    let symbols: Vec<&str> = resolved.iter().map(|(_, name)| name.as_str()).collect();
+    let sources = registry
+        .call_bifrost_tool_raw(
+            "get_symbol_sources",
+            bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
+        )
+        .await
+        .context("get_symbol_sources failed during semantic-search body fetch")?;
+    let bodies = take_symbol_sources(candidates, &sources);
+
+    let mut out = String::new();
+    let mut first_by_body: HashMap<&str, &str> = HashMap::new();
+    for (id, name) in &resolved {
+        let Some(body) = bodies.get(name) else {
+            out.push_str(&format!("[{id}] {name}\nno source available\n\n"));
+            continue;
+        };
+        if let Some(first) = first_by_body.get(body.as_str()) {
+            out.push_str(&format!("[{id}] {name}\nidentical source to {first}\n\n"));
+            budget.bodies += 1;
+            continue;
+        }
+        if budget.bytes + body.len() > MAX_BODY_FETCH_TOTAL_BYTES {
+            notes.push(format!(
+                "{id}: source omitted, this search's {MAX_BODY_FETCH_TOTAL_BYTES}-byte source \
+                 budget is spent."
+            ));
+            continue;
+        }
+        budget.bytes += body.len();
+        budget.bodies += 1;
+        first_by_body.insert(body.as_str(), id);
+        out.push_str(&format!("[{id}] {name}\n```\n{body}\n```\n\n"));
+    }
+    Ok((render_body_fetch_result(out, &notes), id_count))
+}
+
+fn render_body_fetch_result(mut out: String, notes: &[String]) -> String {
+    for note in notes {
+        out.push_str(note);
+        out.push('\n');
+    }
+    let out = out.trim_end();
+    if out.is_empty() {
+        return "No sources were returned.".to_string();
+    }
+    out.to_string()
+}
+
+/// Enforce the disposable-turn declaration/summary budget without ever removing
+/// a candidate identity. Earlier RRF candidates consume the shared budget first.
 fn bound_candidate_context(candidates: &mut [Candidate]) -> usize {
     let mut remaining = MAX_TOTAL_CONTEXT_BYTES;
     let mut used = 0;
@@ -889,6 +1062,9 @@ fn bound_candidate_context(candidates: &mut [Candidate]) -> usize {
         let mut candidate_remaining = remaining.min(MAX_CANDIDATE_CONTEXT_BYTES);
         let mut declarations = Vec::new();
         for mut declaration in std::mem::take(&mut candidate.declarations) {
+            if declarations.len() == MAX_PROMPT_DECLARATIONS {
+                break;
+            }
             declaration.id = format!("{}d{}", candidate.id, declarations.len() + 1);
             let bytes = render_declaration_for_prompt(&declaration).len();
             if bytes > candidate_remaining {
@@ -926,11 +1102,19 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// Attach truncated source text to symbol candidates from a
-/// `get_symbol_sources` result (`{ sources: [{label,path,start_line,end_line,text}] }`).
-fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
+/// Read a `get_symbol_sources` result
+/// (`{ sources: [{label,path,start_line,end_line,text}] }`): record each
+/// matching symbol candidate's chunk location, and return the bounded source
+/// text keyed by candidate name.
+///
+/// The location is kept on the candidate because the agent-facing card needs it
+/// (a C++ header/implementation split is the one case where the chunk names a
+/// file no declaration names). The source text is not: bodies live in the tool
+/// result the utility model asked for and nowhere else.
+fn take_symbol_sources(candidates: &mut [Candidate], result: &Value) -> HashMap<String, String> {
+    let mut bodies = HashMap::new();
     let Some(sources) = result.get("sources").and_then(Value::as_array) else {
-        return;
+        return bodies;
     };
     let mut by_label: HashMap<&str, &Value> = HashMap::new();
     for block in sources {
@@ -946,7 +1130,10 @@ fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
             continue;
         };
         if let Some(text) = block.get("text").and_then(Value::as_str) {
-            candidate.context = Some(sample_source(text));
+            bodies.insert(
+                candidate.name.clone(),
+                truncate_utf8(&sample_source(text), MAX_CANDIDATE_CONTEXT_BYTES),
+            );
         }
         let path = block.get("path").and_then(Value::as_str);
         let start = block.get("start_line").and_then(Value::as_u64);
@@ -956,6 +1143,7 @@ fn attach_symbol_sources(candidates: &mut [Candidate], result: &Value) {
             lines: start.zip(end),
         });
     }
+    bodies
 }
 
 /// Attach structured declaration signatures to every matching candidate and
@@ -1163,13 +1351,20 @@ fn build_rerank_prompt(query: &str, candidates: &[Candidate], final_k: usize) ->
     let mut out = String::new();
     out.push_str(
         "A code search just ran for the query below and returned these candidate results. \
-Each candidate has an id, the symbol or file it refers to, structured declaration signatures \
-with ids, and (when available) private source or file-summary context. Decide which candidates \
-are genuinely relevant to the query and the task in this conversation. For every selected \
-candidate that has declaration ids, choose the one through five declarations most useful for \
-locating the relevant implementation. Omit irrelevant candidates. Order all selected candidates \
-from strongest direct evidence to weakest supporting evidence.\n\n",
+Each candidate has an id, the symbol or file it refers to, which retrieval signals surfaced it, \
+and its structured declaration signatures with ids (a file candidate also carries a summary). \
+Decide which candidates are genuinely relevant to the query and the task in this conversation. \
+For every selected candidate that has declaration ids, choose the one through five declarations \
+most useful for locating the relevant implementation. Omit irrelevant candidates. Order all \
+selected candidates from strongest direct evidence to weakest supporting evidence.\n\n",
     );
+    out.push_str(&format!(
+        "Source bodies are not included. Most candidates are decidable from the name, path, \
+signals, and signatures alone, so decide from those. When a candidate's relevance is genuinely \
+undecidable that way -- a generic name whose signature says nothing about what it does -- call \
+the `{BODY_FETCH_TOOL}` tool with the candidate ids you need, up to {MAX_BODY_FETCH_IDS} per \
+call, and it returns their source. Ask only for the candidates you cannot decide.\n\n"
+    ));
     out.push_str(&format!(
         "Respond with ONLY a JSON object of the form {{\"relevant\": \
 [{{\"id\":\"<candidate-id>\",\"declarations\":[\"<declaration-id>\", ...]}}]}} using \
@@ -1209,13 +1404,10 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
             out.push_str(&render_declaration_for_prompt(declaration));
         }
     }
-    match &candidate.context {
-        Some(context) => {
-            out.push_str("```\n");
-            out.push_str(context);
-            out.push_str("\n```\n");
-        }
-        None => out.push_str("(no source available)\n"),
+    if let Some(context) = &candidate.context {
+        out.push_str("```\n");
+        out.push_str(context);
+        out.push_str("\n```\n");
     }
     out
 }
@@ -1308,32 +1500,50 @@ struct RerankTrace<'a> {
     signature_locator_count: usize,
     final_with_signature_count: usize,
     declaration_fallback_count: usize,
+    body_fetch_rounds: usize,
+    bodies_fetched: usize,
     failure_reason: Option<&'a str>,
     usage: TokenUsage,
     utility: &'a crate::utility_model::UtilityModelSelection,
 }
 
-fn trace_phase(
-    phase: &str,
-    query: &str,
+/// The identity every `semantic_search_phase` record carries for one query.
+struct PhaseTrace<'a> {
+    query: &'a str,
     query_index: usize,
     query_count: usize,
-    utility: &crate::utility_model::UtilityModelSelection,
+    utility: &'a crate::utility_model::UtilityModelSelection,
     started: Instant,
-    error: Option<&str>,
-) {
-    append_trace_record(json!({
-        "type": "semantic_search_phase",
-        "phase": phase,
-        "query": query,
-        "query_index": query_index,
-        "query_count": query_count,
-        "elapsed_millis": started.elapsed().as_millis(),
-        "utility_model": utility.model,
-        "utility_reasoning_effort": utility.reasoning_effort,
-        "utility_model_source": utility.source,
-        "error": error,
-    }));
+}
+
+impl PhaseTrace<'_> {
+    fn record(&self, phase: &str, error: Option<&str>) {
+        append_trace_record(self.base(phase, error));
+    }
+
+    /// One body-fetch round. Same record type as every other phase, so a reader
+    /// sees the rounds in sequence with the requests around them.
+    fn record_tool_round(&self, round: usize, id_count: usize) {
+        let mut record = self.base("utility_tool_round", None);
+        record["round"] = json!(round);
+        record["id_count"] = json!(id_count);
+        append_trace_record(record);
+    }
+
+    fn base(&self, phase: &str, error: Option<&str>) -> Value {
+        json!({
+            "type": "semantic_search_phase",
+            "phase": phase,
+            "query": self.query,
+            "query_index": self.query_index,
+            "query_count": self.query_count,
+            "elapsed_millis": self.started.elapsed().as_millis(),
+            "utility_model": self.utility.model,
+            "utility_reasoning_effort": self.utility.reasoning_effort,
+            "utility_model_source": self.utility.source,
+            "error": error,
+        })
+    }
 }
 
 fn trace_rerank(trace: RerankTrace<'_>) {
@@ -1374,6 +1584,11 @@ fn trace_rerank(trace: RerankTrace<'_>) {
         "structured_signature_locator_count": trace.signature_locator_count,
         "selected_with_signature_count": trace.final_with_signature_count,
         "declaration_selection_fallback_count": trace.declaration_fallback_count,
+        // On-demand source: how many rounds the utility model spent on
+        // `fetch_candidate_sources` and how many candidate bodies it received.
+        // Zero on both is the expected shape; the prompt is signatures-first.
+        "body_fetch_rounds": trace.body_fetch_rounds,
+        "bodies_fetched": trace.bodies_fetched,
         // Keep the old fields so trace readers can distinguish this behavior
         // from old runs that silently used reciprocal-rank fusion.
         "fallback": false,
@@ -1620,7 +1835,7 @@ mod tests {
             .await
             .expect_err("missing Bifrost context service must fail enrichment");
         assert!(
-            format!("{error:#}").contains("get_symbol_sources failed"),
+            format!("{error:#}").contains("get_summaries failed"),
             "unexpected error: {error:#}"
         );
     }
@@ -1742,6 +1957,8 @@ mod tests {
                 signature_locator_count: 0,
                 final_with_signature_count: 0,
                 declaration_fallback_count: 0,
+                body_fetch_rounds: 0,
+                bodies_fetched: 0,
                 failure_reason: None,
                 usage: TokenUsage::default(),
                 utility: &utility,
@@ -1976,6 +2193,40 @@ mod tests {
         }
     }
 
+    /// A macro-heavy candidate can carry hundreds of declarations. One with 290
+    /// was 27 percent of a reproduced prompt on its own, so only the first few
+    /// are rendered and only those can be cited back.
+    #[test]
+    fn a_candidate_with_many_declarations_renders_only_the_first_few() {
+        let elements: Vec<Value> = (1..=40)
+            .map(|i| {
+                json!({
+                    "path": "test/suite.cc",
+                    "symbol": format!("Suite_Case{i}_Test"),
+                    "kind": "class",
+                    "start_line": i,
+                    "end_line": i + 1,
+                    "text": format!("class Suite_Case{i}_Test")
+                })
+            })
+            .collect();
+        let mut candidates = parse_candidates(&json!({
+            "coedit_ranked": [{ "path": "test/suite.cc", "score": 1.0 }]
+        }));
+        attach_summaries(
+            &mut candidates,
+            &json!({ "summaries": [{ "label": "test/suite.cc", "path": "test/suite.cc", "elements": elements }] }),
+        );
+        assert_eq!(candidates[0].declarations.len(), 40);
+
+        bound_candidate_context(&mut candidates);
+        assert_eq!(candidates[0].declarations.len(), MAX_PROMPT_DECLARATIONS);
+        let prompt = build_rerank_prompt("gtest cases", &candidates, 20);
+        assert!(prompt.contains("[f1d8]"), "{prompt}");
+        assert!(!prompt.contains("[f1d9]"), "{prompt}");
+        assert!(order_candidates(&candidates, &[selection("f1")], 20).is_ok());
+    }
+
     #[test]
     fn compact_file_outlines_are_valid_reranker_context() {
         let mut candidates = parse_candidates(&json!({
@@ -2001,7 +2252,6 @@ mod tests {
             .as_deref()
             .expect("compact outline is attached");
         assert_eq!(context, "src/config.rs (42 lines)\n- Config\n  - load");
-        assert_eq!(available_private_context_bytes(&candidates), context.len());
     }
 
     #[test]
@@ -2046,12 +2296,14 @@ mod tests {
     /// on all 1,376 declarations, and repeated the chunk's file on 88 percent
     /// of them. The remaining 12 percent are a C++ header/implementation split,
     /// where the chunk is the .cpp body and the declaration the .h, and there
-    /// the chunk location is the only place the .cpp appears.
+    /// the chunk location is the only place the .cpp appears. The chunk
+    /// location now reaches the card only for a candidate the utility model
+    /// fetched the source of, which is what `take_symbol_sources` records.
     #[test]
     fn agent_card_drops_the_repeated_name_but_keeps_a_second_file() {
         let card = |raw: Value, summaries: Value, id: &str| {
             let mut candidates = parse_candidates(&raw);
-            attach_symbol_sources(&mut candidates, &summaries);
+            take_symbol_sources(&mut candidates, &summaries);
             attach_summaries(&mut candidates, &summaries);
             let ordered = order_candidates(&candidates, &[selection(id)], 20).unwrap();
             render_unified("q", &ordered, 1, None)
@@ -2509,5 +2761,416 @@ mod tests {
         let prefix = prefix_for_rerank(&history);
         assert_eq!(prefix.len(), 3);
         assert_eq!(prefix[2].content_text(), "Here it is.");
+    }
+
+    /// A bifrost that serves the three tools this reranker uses. Two of its
+    /// symbols share a body, so a fetch of both exercises deduplication.
+    /// `fail_sources` makes `get_symbol_sources` return a JSON-RPC error while
+    /// search and summaries keep working, which is the fail-closed case.
+    #[cfg(unix)]
+    const FAKE_BIFROST_WITH_SOURCES: &str = r#"
+import json, sys
+
+fail_sources = "fail_sources" in sys.argv
+
+PATHS = {
+    "app.alpha.run": "app/alpha.py",
+    "app.beta.run": "app/beta.py",
+    "app.gamma.helper": "app/gamma.py",
+}
+BODIES = {
+    "app.alpha.run": "def run(self):\n    return self.value",
+    "app.beta.run": "def run(self):\n    return self.value",
+    "app.gamma.helper": "def helper(self):\n    return 42",
+}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "bifrost", "version": "0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": n, "description": "fake",
+             "inputSchema": {"type": "object", "properties": {}}}
+            for n in ["semantic_search", "get_summaries", "get_symbol_sources"]]}})
+    elif method == "tools/call":
+        name = msg["params"]["name"]
+        args = msg["params"].get("arguments", {})
+        if name == "semantic_search":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": {
+                "vector_ranked": [{"fqfn": s, "score": 1.0} for s in
+                                  ["app.alpha.run", "app.beta.run", "app.gamma.helper"]],
+                "coedit_ranked": []}}})
+        elif name == "get_summaries":
+            summaries = []
+            for target in args.get("targets", []):
+                if target not in PATHS:
+                    continue
+                summaries.append({"label": target, "path": PATHS[target], "elements": [
+                    {"path": PATHS[target], "symbol": target, "kind": "function",
+                     "start_line": 1, "end_line": 2,
+                     "text": "def " + target.split(".")[-1] + "(self):"}]})
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"structuredContent": {"summaries": summaries}}})
+        elif name == "get_symbol_sources":
+            if fail_sources:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32000, "message": "symbol source index unavailable"}})
+                continue
+            sources = []
+            for symbol in args.get("symbols", []):
+                if symbol not in BODIES:
+                    continue
+                sources.append({"label": symbol, "path": PATHS[symbol],
+                                "start_line": 1, "end_line": 2, "text": BODIES[symbol]})
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"structuredContent": {"sources": sources}}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid,
+                  "error": {"code": -32601, "message": "unexpected tool " + name}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}})
+"#;
+
+    /// What one rerank request looked like, kept because the shape of the
+    /// request is the behavior under test: which tools it offered and what the
+    /// model had been told by then.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct CapturedRequest {
+        messages: Vec<ChatMessage>,
+        tool_names: Vec<String>,
+        structured: bool,
+    }
+
+    /// A utility model scripted by request index. Hand-written rather than
+    /// mocked: every test below drives the real rerank turn through it.
+    #[cfg(unix)]
+    struct ScriptedUtilityBackend {
+        respond: Box<dyn Fn(usize) -> LlmResponse + Send + Sync>,
+        requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    }
+
+    #[cfg(unix)]
+    impl LlmBackend for ScriptedUtilityBackend {
+        fn list_models(&self) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            use futures::FutureExt;
+            async { Ok(vec!["test-model".to_string()]) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            request: StreamChatRequest,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            use futures::FutureExt;
+            let index = {
+                let mut requests = self.requests.lock().expect("captured requests");
+                requests.push(CapturedRequest {
+                    messages: request.messages.clone(),
+                    tool_names: request
+                        .tools
+                        .iter()
+                        .flatten()
+                        .map(|tool| tool.function.name.clone())
+                        .collect(),
+                    structured: request.structured_output.is_some(),
+                });
+                requests.len() - 1
+            };
+            let response = (self.respond)(index);
+            async move { Ok(response) }.boxed()
+        }
+    }
+
+    #[cfg(unix)]
+    fn body_fetch_response(call_id: &str, ids: &[&str]) -> LlmResponse {
+        LlmResponse::ToolCalls {
+            text: String::new(),
+            reasoning_content: None,
+            calls: vec![crate::llm_client::ToolCall {
+                id: call_id.to_string(),
+                r#type: "function".to_string(),
+                function: crate::llm_client::FunctionCall {
+                    name: BODY_FETCH_TOOL.to_string(),
+                    arguments: json!({ "ids": ids }).to_string(),
+                },
+            }],
+            usage: TokenUsage::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn selection_response(selection: Value) -> LlmResponse {
+        LlmResponse::Text {
+            text: selection.to_string(),
+            reasoning_content: None,
+            usage: TokenUsage::default(),
+        }
+    }
+
+    /// Drive one whole `semantic_search` call against the fake bifrost and a
+    /// scripted utility model, returning the outcome, the requests the utility
+    /// model saw, and the trace records the call wrote.
+    #[cfg(unix)]
+    async fn scripted_rerank(
+        script_args: &[&str],
+        respond: impl Fn(usize) -> LlmResponse + Send + Sync + 'static,
+    ) -> (RerankOutcome, Vec<CapturedRequest>, Vec<Value>) {
+        use crate::mcp::{McpFraming, McpServerConfig};
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let script = cwd.path().join("fake_bifrost_sources.py");
+        std::fs::write(&script, FAKE_BIFROST_WITH_SOURCES).expect("write fake server");
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let mut args = vec![script.to_string_lossy().into_owned()];
+        args.extend(script_args.iter().map(|arg| (*arg).to_string()));
+
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            vec![McpServerConfig {
+                name: "bifrost".to_string(),
+                transport: Default::default(),
+                command: std::env::var("ANVIL_PYTHON").unwrap_or_else(|_| "python3".to_string()),
+                url: None,
+                headers: Vec::new(),
+                args,
+                env: Vec::new(),
+                framing: McpFraming::Line,
+                enabled: true,
+            }],
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            crate::tools::ToolRegistryOptions {
+                analysis_workspaces: None,
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
+        )
+        .await;
+        assert!(
+            registry.is_bifrost_tool("semantic_search"),
+            "the fake bifrost must advertise semantic_search"
+        );
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedUtilityBackend {
+            respond: Box::new(respond),
+            requests: requests.clone(),
+        });
+        let outcome = crate::trace_logging::with_trace_path(
+            &trace,
+            rerank_semantic_search(
+                &llm,
+                "test-model",
+                &registry,
+                &[ChatMessage::user("where does run() come from?")],
+                &json!({ "queries": ["where does run come from"] }),
+                IdleTimeouts::uniform(std::time::Duration::from_secs(5)),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        let records = std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        let requests = std::mem::take(&mut *requests.lock().expect("captured requests"));
+        (outcome, requests, records)
+    }
+
+    #[cfg(unix)]
+    fn rerank_record(records: &[Value]) -> &Value {
+        records
+            .iter()
+            .find(|record| {
+                record.get("type").and_then(Value::as_str) == Some("semantic_search_rerank")
+            })
+            .unwrap_or_else(|| panic!("expected a semantic_search_rerank record in {records:?}"))
+    }
+
+    /// The ordinary case: signatures decide it, no body is fetched, and the
+    /// prompt never carried a source body to begin with.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rerank_that_needs_no_source_selects_in_one_request() {
+        let (outcome, requests, records) = scripted_rerank(&[], |_| {
+            selection_response(json!({ "relevant": [{ "id": "s1", "declarations": ["s1d1"] }] }))
+        })
+        .await;
+
+        assert!(!outcome.failed, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("app.alpha.run"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(requests.len(), 1);
+        let prompt = requests[0].messages.last().expect("prompt").content_text();
+        assert!(prompt.contains("[s1] symbol app.alpha.run"), "{prompt}");
+        assert!(prompt.contains("def run(self):"), "{prompt}");
+        // Signatures only: the body bifrost holds for this symbol is not in the
+        // prompt, and the tool is advertised instead.
+        assert!(!prompt.contains("return self.value"), "{prompt}");
+        assert!(prompt.contains(BODY_FETCH_TOOL), "{prompt}");
+        assert_eq!(requests[0].tool_names, vec![BODY_FETCH_TOOL.to_string()]);
+        assert!(requests[0].structured);
+
+        let record = rerank_record(&records);
+        assert_eq!(record["body_fetch_rounds"], 0);
+        assert_eq!(record["bodies_fetched"], 0);
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["phase"] == "utility_tool_round"),
+            "no round was needed: {records:?}"
+        );
+    }
+
+    /// The exception path: the model asks for two bodies that turn out to be
+    /// identical and one id that does not exist, then selects. The duplicate is
+    /// stated by reference, the unknown id is rejected in the result text
+    /// rather than failing the search, and the selection still round trips.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_body_fetch_round_dedupes_bodies_and_rejects_unknown_ids() {
+        let (outcome, requests, records) = scripted_rerank(&[], |index| match index {
+            0 => body_fetch_response("call-1", &["s1", "s2", "s9"]),
+            _ => selection_response(
+                json!({ "relevant": [{ "id": "s2", "declarations": ["s2d1"] }] }),
+            ),
+        })
+        .await;
+
+        assert!(!outcome.failed, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("app.beta.run"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(requests.len(), 2);
+
+        let tool_results: Vec<String> = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(ChatMessage::content_text)
+            .collect();
+        assert_eq!(tool_results.len(), 1, "{:?}", requests[1].messages);
+        let result = &tool_results[0];
+        assert!(result.contains("[s1] app.alpha.run"), "{result}");
+        assert!(result.contains("return self.value"), "{result}");
+        assert!(result.contains("[s2] app.beta.run"), "{result}");
+        assert!(result.contains("identical source to s1"), "{result}");
+        assert_eq!(result.matches("return self.value").count(), 1, "{result}");
+        assert!(result.contains("s9: no candidate has that id."), "{result}");
+        // The assistant turn that made the call is replayed with it, so the
+        // tool result has something to attach to.
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == "assistant" && message.tool_calls.is_some()),
+            "{:?}",
+            requests[1].messages
+        );
+
+        let round = records
+            .iter()
+            .find(|record| record["phase"] == "utility_tool_round")
+            .unwrap_or_else(|| panic!("expected a utility_tool_round record in {records:?}"));
+        assert_eq!(round["round"], 1);
+        assert_eq!(round["id_count"], 3);
+        let record = rerank_record(&records);
+        assert_eq!(record["body_fetch_rounds"], 1);
+        assert_eq!(record["bodies_fetched"], 2);
+    }
+
+    /// A model that keeps calling the tool runs out of rounds. The final
+    /// request must still go out -- with the schema, without the tool, and with
+    /// the instruction that tool access is over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exhausted_rounds_still_issue_the_final_structured_request() {
+        let (outcome, requests, records) = scripted_rerank(&[], |index| match index {
+            0 => body_fetch_response("call-1", &["s1"]),
+            1 => body_fetch_response("call-2", &["s3"]),
+            _ => selection_response(json!({ "relevant": [] })),
+        })
+        .await;
+
+        assert!(!outcome.failed, "{}", outcome.output);
+        assert_eq!(requests.len(), MAX_BODY_FETCH_ROUNDS + 1);
+        let final_request = requests.last().expect("final request");
+        assert!(
+            final_request.tool_names.is_empty(),
+            "{:?}",
+            final_request.tool_names
+        );
+        assert!(final_request.structured);
+        assert!(
+            final_request
+                .messages
+                .last()
+                .expect("instruction")
+                .content_text()
+                .contains("Tool access is finished"),
+            "{:?}",
+            final_request.messages.last()
+        );
+
+        let record = rerank_record(&records);
+        assert_eq!(record["body_fetch_rounds"], MAX_BODY_FETCH_ROUNDS);
+        assert_eq!(record["bodies_fetched"], 2);
+    }
+
+    /// A bifrost failure inside a round fails the search, exactly as one during
+    /// retrieval or the summary sweep does. Silently reranking without the
+    /// source the model asked for would be a different retrieval treatment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bifrost_failure_during_a_round_fails_closed() {
+        let (outcome, requests, records) =
+            scripted_rerank(&["fail_sources"], |index| match index {
+                0 => body_fetch_response("call-1", &["s1"]),
+                _ => selection_response(json!({ "relevant": [] })),
+            })
+            .await;
+
+        assert!(outcome.failed, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("source fetch failed"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("symbol source index unavailable"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(requests.len(), 1, "the turn stops at the failed round");
+        assert!(
+            records
+                .iter()
+                .any(|record| record["phase"] == "utility_tool_error"),
+            "{records:?}"
+        );
     }
 }
