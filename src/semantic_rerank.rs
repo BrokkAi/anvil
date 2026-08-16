@@ -11,11 +11,12 @@
 //! clean, relevance-ordered hit list; the bulky candidate context lives only
 //! in the disposable turn and never pollutes the main conversation.
 //!
-//! The disposable turn reuses the conversation history as its prefix (minus the
-//! trailing assistant message that carries the in-flight `tool_calls`). When
-//! utility routing resolves to the session provider, that prefix can remain a
-//! provider-cache hit; an explicitly separate utility provider receives the
-//! same relevance context without changing the main conversation.
+//! The disposable turn takes the *task* half of the conversation as its prefix:
+//! the system, user, and assistant text up to the trailing assistant message
+//! that carries the in-flight `tool_calls`. Tool results and `tool_calls` are
+//! left out (see `prefix_for_rerank`), so the utility model sees what the task
+//! is and what the assistant has said about it, and none of the retrieved bulk
+//! it has already read.
 //!
 //! Provider failures return a tool error. Invalid structured output gets one
 //! corrective retry, then returns a tool error. A failed reranker must not
@@ -43,8 +44,8 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
-    stream_chat_no_visible_output_with_retry,
+    ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
+    TokenUsage, stream_chat_no_visible_output_with_retry,
 };
 use crate::structured_output::StructuredOutputRequest;
 use crate::tools::ToolRegistry;
@@ -1096,16 +1097,66 @@ fn render_summary_block(block: &Value) -> String {
     out.trim_end().to_string()
 }
 
-/// Build the conversation prefix for the disposable turn: the live history with
-/// the trailing assistant `tool_calls` message (and any sibling tool results
-/// already appended this step) dropped, so the turn ends cleanly and the prior
-/// history stays an identical, cache-hit prefix.
+/// Build the conversation prefix for the disposable turn: the system, user, and
+/// assistant text of the live history, in order, up to the trailing assistant
+/// `tool_calls` message (and any sibling tool results already appended this
+/// step). Every tool-role message and every `tool_calls` field is dropped; an
+/// assistant message that has nothing left but its `tool_calls` is dropped with
+/// them.
+///
+/// What the reranker needs from the conversation is the task and the
+/// assistant's own account of it. It does not need the retrieved bulk, which it
+/// has no way to judge candidates against and which dominated the prompt:
+/// across a reproduced trace pool the resent conversation ran 101KB at the
+/// median and 345KB at p90, 83 percent of it prior tool results.
+///
+/// Dropping them also ends the provider-cache-hit property the old prefix had
+/// -- this is no longer a copy of the conversation, so it cannot match one --
+/// which is the trade the size makes worth taking.
+///
+/// Adjacent assistant messages are merged. The tool loop pushes exactly one
+/// assistant message per assistant turn, so removing the tool results between
+/// two of them would otherwise hand a backend a run of same-role messages this
+/// harness has never sent (`bedrock_client::convert_messages` and the
+/// OpenAI-compatible client both forward the list as given).
 fn prefix_for_rerank(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let cut = messages
         .iter()
         .rposition(|m| m.role == "assistant" && m.tool_calls.is_some())
         .unwrap_or(messages.len());
-    messages[..cut].to_vec()
+    let mut prefix: Vec<ChatMessage> = Vec::new();
+    for message in &messages[..cut] {
+        match message.role.as_str() {
+            "system" | "user" => prefix.push(message.clone()),
+            "assistant" => {
+                let text = message.content_text();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                match prefix.last_mut() {
+                    Some(previous) if previous.role == "assistant" => {
+                        previous.content = vec![ChatContentPart::text(format!(
+                            "{}\n\n{text}",
+                            previous.content_text()
+                        ))];
+                        if let Some(reasoning) = &message.reasoning_content {
+                            previous.reasoning_content =
+                                Some(match previous.reasoning_content.take() {
+                                    Some(existing) => format!("{existing}\n\n{reasoning}"),
+                                    None => reasoning.clone(),
+                                });
+                        }
+                    }
+                    _ => prefix.push(ChatMessage::assistant_with_reasoning(
+                        text,
+                        message.reasoning_content.clone(),
+                    )),
+                }
+            }
+            _ => {}
+        }
+    }
+    prefix
 }
 
 fn build_rerank_prompt(query: &str, candidates: &[Candidate], final_k: usize) -> String {
@@ -2368,5 +2419,95 @@ mod tests {
             id: id.to_string(),
             declarations: Vec::new(),
         }
+    }
+
+    fn tool_call(id: &str, name: &str) -> crate::llm_client::ToolCall {
+        crate::llm_client::ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: crate::llm_client::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    /// The disposable turn resends the task, not the retrieval. A realistic
+    /// mixed history must come back as system/user/assistant text only, in
+    /// order, with the tool results and every `tool_calls` field gone.
+    #[test]
+    fn the_rerank_prefix_keeps_only_system_user_and_assistant_text() {
+        let history = vec![
+            ChatMessage::system("You are Anvil."),
+            ChatMessage::user("Where is the retry budget applied?"),
+            ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                "Let me search the retry path.",
+                vec![tool_call("call-1", "grep_search")],
+                Some("the budget is probably per tier".to_string()),
+            ),
+            ChatMessage::tool_result("call-1", "grep_search", "PRIOR_TOOL_OUTPUT_SENTINEL"),
+            ChatMessage::assistant_with_reasoning(
+                "Those hits look like the wrong layer.",
+                Some("try the client instead".to_string()),
+            ),
+            // An assistant turn that was nothing but tool calls: dropping the
+            // calls leaves nothing, so the message goes too.
+            ChatMessage::assistant_tool_calls(vec![tool_call("call-2", "read_file")]),
+            ChatMessage::tool_result("call-2", "read_file", "ANOTHER_TOOL_OUTPUT_SENTINEL"),
+            ChatMessage::user("Also check the backoff."),
+            // The in-flight semantic_search call: the cut point, as before.
+            ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                "Searching.",
+                vec![tool_call("call-3", "semantic_search")],
+                None,
+            ),
+        ];
+
+        let prefix = prefix_for_rerank(&history);
+        let roles: Vec<&str> = prefix.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+        assert!(
+            prefix.iter().all(|m| m.tool_calls.is_none()),
+            "no tool_calls may survive: {prefix:?}"
+        );
+        // The two assistant texts around the dropped tool result merge into one
+        // message rather than becoming a same-role run.
+        assert_eq!(
+            prefix[2].content_text(),
+            "Let me search the retry path.\n\nThose hits look like the wrong layer."
+        );
+        assert_eq!(
+            prefix[2].reasoning_content.as_deref(),
+            Some("the budget is probably per tier\n\ntry the client instead")
+        );
+        assert_eq!(prefix[3].content_text(), "Also check the backoff.");
+        let rendered = prefix
+            .iter()
+            .map(ChatMessage::content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("PRIOR_TOOL_OUTPUT_SENTINEL"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("ANOTHER_TOOL_OUTPUT_SENTINEL"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Searching."), "{rendered}");
+    }
+
+    /// With no in-flight tool call there is no cut point, and the same
+    /// projection still applies to the whole history.
+    #[test]
+    fn a_history_without_tool_calls_keeps_its_whole_projection() {
+        let history = vec![
+            ChatMessage::system("You are Anvil."),
+            ChatMessage::user("Find the parser."),
+            ChatMessage::assistant("Here it is."),
+        ];
+        let prefix = prefix_for_rerank(&history);
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix[2].content_text(), "Here it is.");
     }
 }
