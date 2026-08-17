@@ -33,6 +33,14 @@
 //! silently change the result into a different retrieval treatment.
 //! Bifrost's raw payload is never exposed to the model.
 //!
+//! One bifrost answer is not a failure at all: analyzer-pool saturation. Bifrost
+//! bounds admission to its analyzer execution pool and refuses an overflowing
+//! call with an explicitly retryable message, which this module's own fan-out
+//! provokes (see `ANALYZER_SATURATION_MARKER`). Every bifrost call here goes
+//! through `call_bifrost_tool_with_backpressure`, which waits and retries on
+//! that signal within a bounded budget before it gives up and fails as any other
+//! bifrost error does.
+//!
 //! Bifrost used to return a third list, `bm25_ranked`, from a lexical arm fused
 //! alongside the dense one, and a `retrieval_profile` naming the leg budget the
 //! `BIFROST_SEMANTIC_SEARCH_PROFILE` sweep had selected. Both were deleted in
@@ -107,6 +115,41 @@ const MAX_BODY_FETCH_TOTAL_BYTES: usize = 40_000;
 /// streaming it is making progress, so the inter-chunk bound stays whatever the
 /// session set. A session configured tighter than this keeps its own value.
 const UTILITY_FIRST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The stable part of bifrost's analyzer-pool overflow message.
+///
+/// Bifrost bounds admission to its analyzer execution pool -- four executing
+/// calls plus a 32-deep queue -- and refuses anything past that with
+/// `-32603 too many analyzer requests are queued; retry <tool> once earlier
+/// calls complete`. That is backpressure, not a failed request: the server is
+/// telling this client to come back, and the tool name in the message varies
+/// while this phrase does not.
+const ANALYZER_SATURATION_MARKER: &str = "too many analyzer requests are queued";
+
+/// Waits between attempts at a saturated bifrost, and with them the whole retry
+/// budget for one call: four retries spread over 15.25 seconds.
+///
+/// The fan-out that provokes the signal is this module's own. Enrichment issues
+/// one `get_summaries` per candidate in batches of `CONTEXT_FETCH_BATCH`, for
+/// every query in the batch, and CIM step zero multiplies that by the number of
+/// workspaces: four workspaces with three queries put roughly 96 calls in flight
+/// against 36 admission slots at one server. Each of those calls asks for a
+/// single target's summary, so the work queued ahead of a refused call is small
+/// and drains in well under a second -- which is why the first retry is 250 ms
+/// rather than a full second. The quadrupling steps then back off for a server
+/// that is genuinely congested rather than momentarily full.
+///
+/// The 15-second ceiling is what makes this safe to do at every call site: it is
+/// under 1 percent of the 1800-second CIM MCP tool timeout, and the worst case
+/// -- every sequential batch of a large query exhausting the whole budget --
+/// costs tens of seconds against a task that today scores zero. Past the ceiling
+/// the call fails exactly as it did before.
+const SATURATION_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+    Duration::from_secs(10),
+];
 
 const MAX_LINE_CHARS: usize = 2048;
 
@@ -381,8 +424,7 @@ async fn rerank_one_semantic_search(
 
     // 1. Underlying search. A hard failure here is the model's to see.
     phases.record("retrieval_start", None);
-    let raw = match registry
-        .call_bifrost_tool_raw("semantic_search", bifrost_args)
+    let raw = match call_bifrost_tool_with_backpressure(registry, "semantic_search", bifrost_args)
         .await
     {
         Ok(value) => {
@@ -751,6 +793,79 @@ fn prepare_bifrost_args(query: &str, final_k: usize, workspace: Option<&str>) ->
     )
 }
 
+/// Call a bifrost tool on the harness's behalf, waiting out analyzer-pool
+/// saturation.
+///
+/// Saturation is the one bifrost error that says "not now" rather than "no": it
+/// reports that admission to the analyzer pool is full and names retrying as the
+/// remedy (`ANALYZER_SATURATION_MARKER`). Treating it as a failure is what turned
+/// a busy server into a failed retrieval, and a failed step-zero retrieval into a
+/// scored zero. So a saturated call waits and repeats itself on
+/// `SATURATION_RETRY_DELAYS`; every other error, and saturation that outlives the
+/// budget, returns unchanged. Handling it here, at the point the signal arrives,
+/// keeps each caller's own concurrency intact -- the server already bounds how
+/// much work it admits, so a client-side limiter would only duplicate a decision
+/// bifrost has already made.
+async fn call_bifrost_tool_with_backpressure(
+    registry: &ToolRegistry,
+    tool: &str,
+    args: Value,
+) -> anyhow::Result<Value> {
+    let mut retries = 0usize;
+    loop {
+        let error = match registry.call_bifrost_tool_raw(tool, args.clone()).await {
+            Ok(value) => {
+                if retries > 0 {
+                    append_trace_record(json!({
+                        "type": "bifrost_analyzer_saturation",
+                        "phase": "recovered",
+                        "tool": tool,
+                        "retries": retries,
+                    }));
+                }
+                return Ok(value);
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        if !message.contains(ANALYZER_SATURATION_MARKER) {
+            return Err(error);
+        }
+        let Some(delay) = SATURATION_RETRY_DELAYS.get(retries).copied() else {
+            tracing::warn!(
+                tool,
+                retries,
+                %message,
+                "bifrost analyzer pool stayed saturated for the whole retry budget"
+            );
+            append_trace_record(json!({
+                "type": "bifrost_analyzer_saturation",
+                "phase": "exhausted",
+                "tool": tool,
+                "retries": retries,
+                "error": message,
+            }));
+            return Err(error);
+        };
+        retries += 1;
+        tracing::debug!(
+            tool,
+            retry = retries,
+            delay_millis = delay.as_millis(),
+            "bifrost analyzer pool is saturated; retrying"
+        );
+        append_trace_record(json!({
+            "type": "bifrost_analyzer_saturation",
+            "phase": "retry",
+            "tool": tool,
+            "retry": retries,
+            "delay_millis": delay.as_millis(),
+            "error": message,
+        }));
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Name the workspace in a bifrost tool call's arguments, or leave them alone
 /// in the single-root shape that has no router. Shared with `cim`, which builds
 /// step zero's forced `semantic_search` call the same way.
@@ -858,8 +973,10 @@ fn parse_candidates(raw: &Value) -> Vec<Candidate> {
 
 /// Batch-fetch file summaries (`get_summaries`) for the candidates and attach
 /// the structured declaration records they carry. A Bifrost error fails the
-/// semantic-search call. Name-only results are a different tool contract, not a
-/// valid fallback for failed context enrichment.
+/// semantic-search call -- except analyzer-pool saturation, which is waited out
+/// per call (`call_bifrost_tool_with_backpressure`), because this sweep's own
+/// concurrency is what causes it. Name-only results are a different tool
+/// contract, not a valid fallback for failed context enrichment.
 ///
 /// This sweep no longer pre-fetches `get_symbol_sources` for every candidate.
 /// Bodies are fetched on demand by the utility model through
@@ -897,7 +1014,8 @@ async fn fetch_summary_context(
     // Keep every request intrinsically small while retaining parallelism within
     // the already bounded candidate batch.
     let summaries = join_all(targets.iter().map(|target| {
-        registry.call_bifrost_tool_raw(
+        call_bifrost_tool_with_backpressure(
+            registry,
             "get_summaries",
             bifrost_args_with_workspace(json!({ "targets": [target] }), workspace),
         )
@@ -1033,13 +1151,13 @@ async fn run_body_fetch_call(
     }
 
     let symbols: Vec<&str> = resolved.iter().map(|(_, name)| name.as_str()).collect();
-    let sources = registry
-        .call_bifrost_tool_raw(
-            "get_symbol_sources",
-            bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
-        )
-        .await
-        .context("get_symbol_sources failed during semantic-search body fetch")?;
+    let sources = call_bifrost_tool_with_backpressure(
+        registry,
+        "get_symbol_sources",
+        bifrost_args_with_workspace(json!({ "symbols": symbols }), workspace),
+    )
+    .await
+    .context("get_symbol_sources failed during semantic-search body fetch")?;
     let bodies = take_symbol_sources(candidates, &sources);
 
     let mut out = String::new();
@@ -1833,8 +1951,18 @@ fn clamp_line(line: &str) -> String {
 
 /// A fake bifrost that serves the three tools this reranker uses. Two of its
 /// symbols share a body, so a fetch of both exercises deduplication.
-/// `fail_sources` in the argv makes `get_symbol_sources` return a JSON-RPC error
-/// while search and summaries keep working, which is the fail-closed case.
+///
+/// Three argv switches shape how it fails:
+///
+/// - `fail_sources` makes `get_symbol_sources` return a JSON-RPC error while
+///   search and summaries keep working, which is the fail-closed case.
+/// - `saturate_summaries=<count>` makes the first `count` `get_summaries` calls
+///   answer with bifrost's analyzer-pool overflow error, then serve normally.
+///   That is the backpressure signal, so a count of one exercises recovery and a
+///   count past the retry budget exercises the give-up path.
+/// - `fail_workspace=<name>`, repeatable, makes every call that names that
+///   workspace fail. One failing workspace out of several is what a forced CIM
+///   step zero has to survive.
 ///
 /// It takes its workspace shape from its own command line, the way
 /// `McpServerConfig::rendered_args` writes it and the readiness fake
@@ -1858,14 +1986,20 @@ argv = sys.argv[1:]
 fail_sources = "fail_sources" in argv
 
 named = {}
+saturate_summaries = 0
+fail_workspaces = set()
 i = 0
 while i < len(argv):
     if argv[i] == "--workspace" and i + 1 < len(argv):
         name, _, path = argv[i + 1].partition("=")
         named[name] = path
         i += 2
-    else:
-        i += 1
+        continue
+    if argv[i].startswith("saturate_summaries="):
+        saturate_summaries = int(argv[i].split("=", 1)[1])
+    elif argv[i].startswith("fail_workspace="):
+        fail_workspaces.add(argv[i].split("=", 1)[1])
+    i += 1
 
 PATHS = {
     "app.alpha.run": "app/alpha.py",
@@ -1915,6 +2049,11 @@ for line in sys.stdin:
                 "code": -32602,
                 "message": "workspace is not accepted without configured workspaces"}})
             continue
+        if workspace in fail_workspaces:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32603,
+                "message": "workspace " + str(workspace) + " index is unavailable"}})
+            continue
         prefix = (workspace + ".") if named else ""
         if name == "semantic_search":
             send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": {
@@ -1922,6 +2061,13 @@ for line in sys.stdin:
                                   ["app.alpha.run", "app.beta.run", "app.gamma.helper"]],
                 "coedit_ranked": []}}})
         elif name == "get_summaries":
+            if saturate_summaries > 0:
+                saturate_summaries -= 1
+                send({"jsonrpc": "2.0", "id": mid, "error": {
+                    "code": -32603,
+                    "message": "too many analyzer requests are queued; retry "
+                               "get_summaries once earlier calls complete"}})
+                continue
             summaries = []
             for target in args.get("targets", []):
                 symbol = target[len(prefix):] if target.startswith(prefix) else target
@@ -3184,6 +3330,107 @@ mod tests {
         let record = rerank_record(&records);
         assert_eq!(record["body_fetch_rounds"], 1);
         assert_eq!(record["bodies_fetched"], 2);
+    }
+
+    /// Every `bifrost_analyzer_saturation` record the call wrote.
+    #[cfg(unix)]
+    fn saturation_records(records: &[Value]) -> Vec<&Value> {
+        records
+            .iter()
+            .filter(|record| record["type"] == "bifrost_analyzer_saturation")
+            .collect()
+    }
+
+    /// The defect this fixes. Bifrost refuses an enrichment call because its
+    /// analyzer pool is full -- a signal that names retrying as the remedy -- and
+    /// the whole rerank used to fail on it. Now the call waits, repeats itself,
+    /// and the search comes back normal, with the retry on the record rather
+    /// than hidden.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_saturated_summary_call_retries_and_reranks_normally() {
+        let (outcome, requests, records) = scripted_rerank(&["saturate_summaries=1"], |_| {
+            selection_response(json!({ "relevant": [{ "id": "s1", "declarations": ["s1d1"] }] }))
+        })
+        .await;
+
+        assert!(!outcome.failed, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("app.alpha.run"),
+            "{}",
+            outcome.output
+        );
+        assert_eq!(requests.len(), 1);
+        // The retry restored the enrichment rather than reranking without it:
+        // every candidate reaches the prompt with its signatures.
+        let prompt = requests[0].messages.last().expect("prompt").content_text();
+        assert!(
+            !prompt.contains("(no structured signatures available)"),
+            "{prompt}"
+        );
+
+        let saturation = saturation_records(&records);
+        assert_eq!(saturation.len(), 2, "{saturation:?}");
+        assert_eq!(saturation[0]["phase"], "retry");
+        assert_eq!(saturation[0]["tool"], "get_summaries");
+        assert_eq!(saturation[0]["retry"], 1);
+        assert_eq!(
+            saturation[0]["delay_millis"],
+            json!(SATURATION_RETRY_DELAYS[0].as_millis())
+        );
+        assert!(
+            saturation[0]["error"]
+                .as_str()
+                .expect("the refusal text is recorded")
+                .contains(ANALYZER_SATURATION_MARKER),
+            "{saturation:?}"
+        );
+        assert_eq!(saturation[1]["phase"], "recovered");
+        assert_eq!(saturation[1]["retries"], 1);
+    }
+
+    /// Saturation that outlives the budget is a failure again: a rerank that
+    /// quietly proceeded on partial enrichment would be a different retrieval
+    /// treatment. This is the one test that pays the whole retry budget, which
+    /// is the point of having one -- a permanently saturated server bounds the
+    /// query instead of hanging it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saturation_past_the_retry_budget_fails_the_rerank_closed() {
+        let (outcome, requests, records) = scripted_rerank(&["saturate_summaries=99"], |_| {
+            selection_response(json!({ "relevant": [] }))
+        })
+        .await;
+
+        assert!(outcome.failed, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("context fetch failed"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains(ANALYZER_SATURATION_MARKER),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            requests.is_empty(),
+            "the utility model is never asked to rerank an unenriched pool: {requests:?}"
+        );
+
+        // The three candidates of one batch are enriched concurrently, so each
+        // of them spends the whole budget before the batch reports the failure.
+        let saturation = saturation_records(&records);
+        let retries = saturation
+            .iter()
+            .filter(|record| record["phase"] == "retry")
+            .count();
+        let exhausted = saturation
+            .iter()
+            .filter(|record| record["phase"] == "exhausted")
+            .count();
+        assert_eq!(exhausted, 3, "{saturation:?}");
+        assert_eq!(retries, 3 * SATURATION_RETRY_DELAYS.len(), "{saturation:?}");
     }
 
     /// A model that keeps calling the tool runs out of rounds. The final
