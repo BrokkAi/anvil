@@ -127,29 +127,68 @@ const UTILITY_FIRST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const ANALYZER_SATURATION_MARKER: &str = "too many analyzer requests are queued";
 
 /// Waits between attempts at a saturated bifrost, and with them the whole retry
-/// budget for one call: four retries spread over 15.25 seconds.
+/// budget for one call: eight retries spread over 55.25 seconds.
 ///
 /// The fan-out that provokes the signal is this module's own. Enrichment issues
 /// one `get_summaries` per candidate in batches of `CONTEXT_FETCH_BATCH`, for
 /// every query in the batch, and CIM step zero multiplies that by the number of
 /// workspaces: four workspaces with three queries put roughly 96 calls in flight
-/// against 36 admission slots at one server. Each of those calls asks for a
-/// single target's summary, so the work queued ahead of a refused call is small
-/// and drains in well under a second -- which is why the first retry is 250 ms
-/// rather than a full second. The quadrupling steps then back off for a server
-/// that is genuinely congested rather than momentarily full.
+/// against 36 admission slots at one server, with a few hundred summary calls of
+/// work behind them.
 ///
-/// The 15-second ceiling is what makes this safe to do at every call site: it is
-/// under 1 percent of the 1800-second CIM MCP tool timeout, and the worst case
-/// -- every sequential batch of a large query exhausting the whole budget --
-/// costs tens of seconds against a task that today scores zero. Past the ceiling
-/// the call fails exactly as it did before.
-const SATURATION_RETRY_DELAYS: [Duration; 4] = [
+/// The shape is measured, on the `ccx-domain-073` step zero over kubernetes,
+/// client-go, api, and etcd (2026-08-17). Refusals began 7.5 s into the step. Two
+/// calls got in on a 250 ms retry, so the first wait is short: a momentarily full
+/// pool can clear in milliseconds. The pool then stayed full through retries at
+/// 8.5 s, 12.5 s, and 22.5 s, and the enrichment that did get admitted finished
+/// at 27 s -- meaning a budget that stopped at 15.25 s gave up roughly 4 seconds
+/// before the burst it caused had drained, and 36 calls failed for nothing. The
+/// 10-second plateau keeps polling to 55 s, about 2.5 times the observed drain,
+/// which leaves room for a larger workspace set or a colder analyzer cache.
+///
+/// Waiting this long is only ever paid by a call the server has already refused:
+/// an ordinary single `semantic_search` (24 concurrent summary calls at most)
+/// never sees the signal. Against the 1800-second CIM tool timeout and a
+/// 3300-second task budget, a minute spent waiting for a retrieval beats losing
+/// it. Past the ceiling the call fails exactly as it did before.
+const SATURATION_RETRY_DELAYS: [Duration; 8] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
     Duration::from_secs(4),
     Duration::from_secs(10),
+    Duration::from_secs(10),
+    Duration::from_secs(10),
+    Duration::from_secs(10),
+    Duration::from_secs(10),
 ];
+
+// Test-only substitute for `SATURATION_RETRY_DELAYS`, scoped to the running task
+// the way `cim::with_test_eval` and `trace_logging::with_trace_path` are. A test
+// that has to exhaust the budget must not spend a real minute doing it, and the
+// schedule is not something a caller may choose: the server's admission policy
+// decides it, not the call site.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_SATURATION_RETRY_DELAYS: Vec<Duration>;
+}
+
+#[cfg(test)]
+async fn with_test_saturation_delays<F: std::future::Future>(
+    delays: Vec<Duration>,
+    future: F,
+) -> F::Output {
+    TEST_SATURATION_RETRY_DELAYS.scope(delays, future).await
+}
+
+/// The wait before retry number `retries + 1`, or `None` when the budget is
+/// spent.
+fn saturation_retry_delay(retries: usize) -> Option<Duration> {
+    #[cfg(test)]
+    if let Ok(delays) = TEST_SATURATION_RETRY_DELAYS.try_with(Clone::clone) {
+        return delays.get(retries).copied();
+    }
+    SATURATION_RETRY_DELAYS.get(retries).copied()
+}
 
 const MAX_LINE_CHARS: usize = 2048;
 
@@ -831,7 +870,7 @@ async fn call_bifrost_tool_with_backpressure(
         if !message.contains(ANALYZER_SATURATION_MARKER) {
             return Err(error);
         }
-        let Some(delay) = SATURATION_RETRY_DELAYS.get(retries).copied() else {
+        let Some(delay) = saturation_retry_delay(retries) else {
             tracing::warn!(
                 tool,
                 retries,
@@ -3391,15 +3430,19 @@ mod tests {
 
     /// Saturation that outlives the budget is a failure again: a rerank that
     /// quietly proceeded on partial enrichment would be a different retrieval
-    /// treatment. This is the one test that pays the whole retry budget, which
-    /// is the point of having one -- a permanently saturated server bounds the
-    /// query instead of hanging it.
+    /// treatment. The budget is what makes a permanently saturated server bound
+    /// the query instead of hanging it, and the test spends a shortened one
+    /// rather than the real 55 seconds.
     #[cfg(unix)]
     #[tokio::test]
     async fn saturation_past_the_retry_budget_fails_the_rerank_closed() {
-        let (outcome, requests, records) = scripted_rerank(&["saturate_summaries=99"], |_| {
-            selection_response(json!({ "relevant": [] }))
-        })
+        let delays = vec![Duration::from_millis(5); 3];
+        let (outcome, requests, records) = with_test_saturation_delays(
+            delays.clone(),
+            scripted_rerank(&["saturate_summaries=99"], |_| {
+                selection_response(json!({ "relevant": [] }))
+            }),
+        )
         .await;
 
         assert!(outcome.failed, "{}", outcome.output);
@@ -3430,7 +3473,7 @@ mod tests {
             .filter(|record| record["phase"] == "exhausted")
             .count();
         assert_eq!(exhausted, 3, "{saturation:?}");
-        assert_eq!(retries, 3 * SATURATION_RETRY_DELAYS.len(), "{saturation:?}");
+        assert_eq!(retries, 3 * delays.len(), "{saturation:?}");
     }
 
     /// A model that keeps calling the tool runs out of rounds. The final
