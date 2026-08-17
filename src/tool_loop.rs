@@ -2117,6 +2117,10 @@ pub(crate) async fn run(
         let calls = p2t::forced_step_to_tool_calls(&step);
         let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
         let step_started = Instant::now();
+        // The `cim_synthetic_step_end` record, when the step ended in something
+        // other than plain success. `None` keeps the unchanged `completed`
+        // shape, which is also what a step with no queries at all records.
+        let mut step_end: Option<serde_json::Value> = None;
         append_trace_record(serde_json::json!({
             "type": "cim_synthetic_step_start",
             "query_manifest_sha256": config.query_manifest_sha256,
@@ -2141,12 +2145,17 @@ pub(crate) async fn run(
                 );
             }
             let forced_message = p2t::forced_step_to_message(&step);
+            // Where the step begins in each of the three records it appends, so
+            // a step that retrieved nothing can be removed again rather than
+            // leaving a forced `tool_calls` message with nothing under it.
+            let message_start = messages.len();
+            let replay_start = replay_events.len();
+            let exchange_start = tool_exchanges.len();
             messages.push(forced_message);
             replay_events.push(TurnReplayEvent::AssistantToolCalls {
                 text: String::new(),
                 calls: calls.iter().map(tool_call_to_replay).collect(),
             });
-            let exchange_start = tool_exchanges.len();
             let outcome = execute_step_tool_calls(
                 llm,
                 registry,
@@ -2181,37 +2190,67 @@ pub(crate) async fn run(
                 );
             }
             let exchanges = &tool_exchanges[exchange_start..];
-            if exchanges.len() != calls.len()
-                || exchanges
-                    .iter()
-                    .any(|exchange| exchange.status == ToolExchangeStatus::Failed)
+            let mut failures: Vec<serde_json::Value> = Vec::new();
+            for exchange in exchanges
+                .iter()
+                .filter(|exchange| exchange.status == ToolExchangeStatus::Failed)
             {
-                append_trace_record(serde_json::json!({
+                tracing::warn!(
+                    session_id = %session_id,
+                    call_id = %exchange.call_id,
+                    error = %exchange.result,
+                    "CIM step-zero retrieval failed; the session continues without it"
+                );
+                failures.push(serde_json::json!({
+                    "call_id": exchange.call_id,
+                    "error": exchange.result,
+                }));
+            }
+            // Step zero is opportunistic context injection, not session setup.
+            // It used to end the session on any failed call, which turned every
+            // transient bifrost failure into a scored zero before the model had
+            // taken a single turn. What survives is what the first turn reads:
+            // the successful workspaces stay in the conversation, and a step
+            // that retrieved nothing is removed from it so the first turn starts
+            // clean.
+            //
+            // `execute_step_tool_calls` records one exchange per call unless the
+            // turn was cancelled, which returned above, so a short list is a
+            // state that should not occur. Treat it as nothing survived anyway:
+            // a forced `tool_calls` message whose results are incomplete is not
+            // a conversation a provider will accept.
+            let succeeded = exchanges.len() - failures.len();
+            let complete = exchanges.len() == calls.len();
+            if !failures.is_empty() || !complete {
+                let results_in_context = succeeded > 0 && complete;
+                if !results_in_context {
+                    messages.truncate(message_start);
+                    replay_events.truncate(replay_start);
+                    tool_exchanges.truncate(exchange_start);
+                }
+                step_end = Some(serde_json::json!({
                     "type": "cim_synthetic_step_end",
                     "query_manifest_sha256": config.query_manifest_sha256,
                     "query_count": config.queries.len(),
-                    "status": "failed",
+                    "status": if results_in_context { "degraded" } else { "failed_continued" },
                     "call_ids": call_ids,
                     "elapsed_millis": step_started.elapsed().as_millis(),
-                    "failures": exchanges.iter()
-                        .filter(|exchange| exchange.status == ToolExchangeStatus::Failed)
-                        .map(|exchange| serde_json::json!({
-                        "call_id": exchange.call_id,
-                        "error": exchange.result,
-                    })).collect::<Vec<_>>(),
+                    "succeeded_call_count": succeeded,
+                    "failed_call_count": failures.len(),
+                    "results_in_context": results_in_context,
+                    "failures": failures,
                 }));
-                return LoopOutcome::setup_failure(
-                    "BRK_CIM_EVAL synthetic semantic-search step failed".to_string(),
-                );
             }
         }
-        append_trace_record(serde_json::json!({
-            "type": "cim_synthetic_step_end",
-            "query_manifest_sha256": config.query_manifest_sha256,
-            "query_count": config.queries.len(),
-            "status": "completed",
-            "call_ids": call_ids,
-            "elapsed_millis": step_started.elapsed().as_millis(),
+        append_trace_record(step_end.unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "cim_synthetic_step_end",
+                "query_manifest_sha256": config.query_manifest_sha256,
+                "query_count": config.queries.len(),
+                "status": "completed",
+                "call_ids": call_ids,
+                "elapsed_millis": step_started.elapsed().as_millis(),
+            })
         }));
     }
     let mut p2t_steps_executed = 0usize;
@@ -10464,9 +10503,14 @@ mod tests {
     /// (`semantic_rerank::FAKE_BIFROST_WITH_SOURCES`), spawned through the real
     /// workspace-args expansion so the fake sees the command line the real
     /// bifrost would: `--root <cwd>` with no named workspaces, one
-    /// `--workspace <name>=<path>` pair per name with them.
+    /// `--workspace <name>=<path>` pair per name with them. `fake_args` are the
+    /// fake's own failure switches, passed after the expanded workspace pairs.
     #[cfg(unix)]
-    async fn retrieval_bifrost_registry(cwd: &Path, names: &[&str]) -> ToolRegistry {
+    async fn retrieval_bifrost_registry(
+        cwd: &Path,
+        names: &[&str],
+        fake_args: &[&str],
+    ) -> ToolRegistry {
         use crate::mcp::{BIFROST_WORKSPACE_ARGS_PLACEHOLDER, McpFraming, McpServerConfig};
 
         let script = cwd.join("fake_bifrost_sources.py");
@@ -10490,10 +10534,13 @@ mod tests {
                 command: std::env::var("ANVIL_PYTHON").unwrap_or_else(|_| "python3".to_string()),
                 url: None,
                 headers: Vec::new(),
-                args: vec![
+                args: [
                     script.to_string_lossy().into_owned(),
                     BIFROST_WORKSPACE_ARGS_PLACEHOLDER.to_string(),
-                ],
+                ]
+                .into_iter()
+                .chain(fake_args.iter().map(|arg| (*arg).to_string()))
+                .collect(),
                 env: Vec::new(),
                 framing: McpFraming::Line,
                 enabled: true,
@@ -10640,7 +10687,7 @@ mod tests {
     #[tokio::test]
     async fn cim_step_zero_sends_one_named_call_per_workspace() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"]).await;
+        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"], &[]).await;
         let workspaces = registry
             .analysis_workspaces()
             .expect("the registry keeps the configured workspaces")
@@ -10708,7 +10755,7 @@ mod tests {
     #[tokio::test]
     async fn a_workspaceless_cim_step_zero_is_refused_by_a_named_bifrost() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"]).await;
+        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"], &[]).await;
 
         let (_messages, exchanges, _rerank_requests) =
             run_cim_step_zero(&registry, cwd.path(), None).await;
@@ -10732,7 +10779,7 @@ mod tests {
     #[tokio::test]
     async fn cim_step_zero_without_named_workspaces_sends_the_single_legacy_call() {
         let cwd = tempfile::tempdir().expect("temp cwd");
-        let registry = retrieval_bifrost_registry(cwd.path(), &[]).await;
+        let registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
         assert!(registry.analysis_workspaces().is_none());
 
         let (messages, exchanges, rerank_requests) =
@@ -10747,6 +10794,271 @@ mod tests {
             messages[2].content_text().contains("app.alpha.run"),
             "{:?}",
             messages[2]
+        );
+    }
+
+    /// What one whole CIM session did with a step zero that partly or wholly
+    /// failed: the loop outcome, the conversation each model turn was sent, and
+    /// the trace records the run wrote.
+    ///
+    /// This drives `run` rather than the forced-step executor because the
+    /// question is what the session does next, and the answer used to be
+    /// "nothing, the session is over". `fail_workspace` switches on the fake
+    /// bifrost decide which workspace calls fail. CIM mode arrives through
+    /// `cim::with_test_eval` rather than through `BRK_CIM_EVAL`, so the test
+    /// does not mutate the process environment other tests are reading.
+    #[cfg(unix)]
+    async fn run_cim_session(
+        names: &[&str],
+        fake_args: &[&str],
+    ) -> (LoopOutcome, Vec<Vec<ChatMessage>>, Vec<serde_json::Value>) {
+        struct SilentSink;
+        impl EventSink for SilentSink {
+            fn emit(&self, _session_id: &str, _event: RuntimeEvent) {}
+        }
+
+        /// Answers the reranker's structured requests with a fixed selection and
+        /// the model's own turn with final text, keeping every model turn's
+        /// conversation so a test can read what step zero left in it.
+        struct FirstTurnBackend {
+            model_turns: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+        impl LlmBackend for FirstTurnBackend {
+            fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("the loop never lists models")
+            }
+
+            fn stream_chat(
+                &self,
+                request: StreamChatRequest,
+            ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                // The reranker is the only caller that asks for structured
+                // output, so this tells a utility request from a model turn.
+                let rerank = request.structured_output.is_some();
+                if !rerank {
+                    self.model_turns
+                        .lock()
+                        .expect("captured model turns")
+                        .push(request.messages.clone());
+                }
+                async move {
+                    Ok(LlmResponse::Text {
+                        text: if rerank {
+                            serde_json::json!({
+                                "relevant": [{ "id": "s1", "declarations": ["s1d1"] }]
+                            })
+                            .to_string()
+                        } else {
+                            "done".to_string()
+                        },
+                        reasoning_content: None,
+                        usage: TokenUsage::default(),
+                    })
+                }
+                .boxed()
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let cim_config = crate::cim::CimConfig {
+            query_manifest_sha256: "abc".to_string(),
+            k: 20,
+            queries: vec!["where does run come from".to_string()],
+        };
+        let registry = retrieval_bifrost_registry(cwd.path(), names, fake_args).await;
+        let model_turns = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmBackend> = Arc::new(FirstTurnBackend {
+            model_turns: model_turns.clone(),
+        });
+        let sessions = SessionStore::new("test-model".to_string());
+        let session = sessions.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            sessions
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Cancelled,
+            prompt: Arc::new(Mutex::new(None)),
+        };
+        let trace = cwd.path().join("anvil-trace.jsonl");
+
+        let outcome = crate::cim::with_test_eval(
+            cim_config,
+            cwd.path().join("cim-config.json"),
+            crate::trace_logging::with_trace_path(
+                &trace,
+                run(
+                    &llm,
+                    &registry,
+                    "test-model",
+                    None,
+                    None,
+                    None,
+                    vec![ChatMessage::user("where does run come from?")],
+                    2,
+                    IdleTimeouts::uniform(Duration::from_secs(30)),
+                    CancellationToken::new(),
+                    text_sink_for_test(Arc::new(Mutex::new(String::new()))),
+                    text_sink_for_test(Arc::new(Mutex::new(String::new()))),
+                    &SilentSink,
+                    &broker,
+                    session.id.clone(),
+                    sessions.clone(),
+                    "where does run come from?".to_string(),
+                    NotificationMode::Silent,
+                    0,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            broker.prompt.lock().expect("prompt lock").is_none(),
+            "a read-only semantic search must not prompt"
+        );
+        let records = std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect();
+        let model_turns = std::mem::take(&mut *model_turns.lock().expect("captured model turns"));
+        (outcome, model_turns, records)
+    }
+
+    #[cfg(unix)]
+    fn cim_step_end(records: &[serde_json::Value]) -> &serde_json::Value {
+        records
+            .iter()
+            .find(|record| record["type"] == "cim_synthetic_step_end")
+            .unwrap_or_else(|| panic!("expected a cim_synthetic_step_end record in {records:?}"))
+    }
+
+    /// The defect this fixes. One of two workspaces fails its step-zero
+    /// retrieval, and the session used to end there as a setup failure -- before
+    /// the model had taken a single turn, which scored the task zero. Now the
+    /// step degrades: the workspace that answered stays in the conversation, the
+    /// one that failed is on the record, and the model's first turn happens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_partly_failed_cim_step_zero_continues_into_the_first_turn() {
+        let (outcome, model_turns, records) =
+            run_cim_session(&["backend", "frontend"], &["fail_workspace=frontend"]).await;
+
+        assert!(
+            matches!(outcome.stop, LoopStop::Completed { had_text: true }),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(outcome.response, "done");
+        assert_eq!(model_turns.len(), 1, "the model took its first turn once");
+
+        // Both exchanges are in the turn, and the surviving retrieval is in the
+        // conversation the model read.
+        let statuses: Vec<(&str, ToolExchangeStatus)> = outcome
+            .tool_exchanges
+            .iter()
+            .map(|exchange| (exchange.call_id.as_str(), exchange.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (
+                    "cim-step-0-semantic-search-backend",
+                    ToolExchangeStatus::Completed
+                ),
+                (
+                    "cim-step-0-semantic-search-frontend",
+                    ToolExchangeStatus::Failed
+                ),
+            ],
+            "{:?}",
+            outcome.tool_exchanges
+        );
+        let first_turn = &model_turns[0];
+        assert!(
+            first_turn
+                .iter()
+                .any(|message| message.role == "assistant" && message.tool_calls.is_some()),
+            "the forced step stays in the conversation: {first_turn:?}"
+        );
+        let results: Vec<String> = first_turn
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(ChatMessage::content_text)
+            .collect();
+        assert_eq!(results.len(), 2, "{first_turn:?}");
+        assert!(results[0].contains("backend.app.alpha.run"), "{results:?}");
+        assert!(results[1].contains("index is unavailable"), "{results:?}");
+
+        let step_end = cim_step_end(&records);
+        assert_eq!(step_end["status"], "degraded");
+        assert_eq!(step_end["succeeded_call_count"], 1);
+        assert_eq!(step_end["failed_call_count"], 1);
+        assert_eq!(step_end["results_in_context"], true);
+        assert_eq!(
+            step_end["failures"][0]["call_id"],
+            "cim-step-0-semantic-search-frontend"
+        );
+        assert!(
+            step_end["failures"][0]["error"]
+                .as_str()
+                .expect("the failure text is recorded")
+                .contains("index is unavailable"),
+            "{step_end:?}"
+        );
+    }
+
+    /// Every workspace fails, so step zero retrieved nothing. The session still
+    /// continues, and the first turn starts from a clean conversation rather
+    /// than from a forced assistant step whose every result is an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wholly_failed_cim_step_zero_continues_with_no_results() {
+        let (outcome, model_turns, records) = run_cim_session(
+            &["backend", "frontend"],
+            &["fail_workspace=backend", "fail_workspace=frontend"],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, LoopStop::Completed { had_text: true }),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(model_turns.len(), 1, "the model took its first turn once");
+        assert!(
+            outcome.tool_exchanges.is_empty(),
+            "{:?}",
+            outcome.tool_exchanges
+        );
+        let first_turn = &model_turns[0];
+        assert!(
+            first_turn
+                .iter()
+                .all(|message| message.role == "user" || message.role == "system"),
+            "nothing of the failed step is left in the conversation: {first_turn:?}"
+        );
+
+        let step_end = cim_step_end(&records);
+        assert_eq!(step_end["status"], "failed_continued");
+        assert_eq!(step_end["succeeded_call_count"], 0);
+        assert_eq!(step_end["failed_call_count"], 2);
+        assert_eq!(step_end["results_in_context"], false);
+        assert_eq!(
+            step_end["failures"]
+                .as_array()
+                .expect("both failures are recorded")
+                .len(),
+            2
         );
     }
 }

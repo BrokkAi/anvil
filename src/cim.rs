@@ -36,8 +36,46 @@ struct CimConfigFile {
     queries: Vec<String>,
 }
 
+// Test-only stand-in for the two environment variables that configure step
+// zero: the parsed queries, and the config path the once-per-eval claim file is
+// derived from (the file itself is never read).
+//
+// It is a task-local, scoped like `trace_logging::with_trace_path`, because
+// `std::env::set_var` is not a safe way to configure a test in this crate. The
+// unit tests share one binary and run in parallel, so one test's env write races
+// every other test's env read: setting `BRK_CIM_EVAL` and `BRK_CIM_CONFIG`
+// around a session test made two unrelated tests fail and made the CIM tests
+// read each other's config path. A task-local is visible to the task under test
+// and to nothing else.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_EVAL: (CimConfig, PathBuf);
+}
+
+/// Run `future` as though `BRK_CIM_EVAL=1` and `BRK_CIM_CONFIG=config_path` were
+/// set, with `config_path` already parsed into `config`. Give each test its own
+/// `config_path` so it claims step zero for itself.
+#[cfg(test)]
+pub(crate) async fn with_test_eval<F: std::future::Future>(
+    config: CimConfig,
+    config_path: PathBuf,
+    future: F,
+) -> F::Output {
+    TEST_EVAL.scope((config, config_path), future).await
+}
+
+#[cfg(test)]
+fn test_eval() -> Option<(CimConfig, PathBuf)> {
+    TEST_EVAL.try_with(Clone::clone).ok()
+}
+
+#[cfg(not(test))]
+fn test_eval() -> Option<(CimConfig, PathBuf)> {
+    None
+}
+
 pub(crate) fn enabled() -> bool {
-    crate::p2t::env_var_truthy(CIM_EVAL_ENV)
+    test_eval().is_some() || crate::p2t::env_var_truthy(CIM_EVAL_ENV)
 }
 
 pub(crate) fn load_config_from_env(
@@ -49,6 +87,9 @@ pub(crate) fn load_config_from_env(
     }
     if p2t_enabled || train_bifrost_enabled {
         bail!("{CIM_EVAL_ENV} cannot be combined with BRK_PATCHES_TO_TRACES or BRK_TRAIN_BIFROST");
+    }
+    if let Some((config, _)) = test_eval() {
+        return Ok(Some(config));
     }
     let path = config_path_from_env()?;
     load_config(&path).map(Some)
@@ -66,7 +107,10 @@ fn config_path_from_env() -> Result<PathBuf> {
 }
 
 pub(crate) fn claim_synthetic_step() -> Result<bool> {
-    claim_synthetic_step_at(&config_path_from_env()?)
+    match test_eval() {
+        Some((_, config_path)) => claim_synthetic_step_at(&config_path),
+        None => claim_synthetic_step_at(&config_path_from_env()?),
+    }
 }
 
 fn claim_synthetic_step_at(config_path: &Path) -> Result<bool> {
