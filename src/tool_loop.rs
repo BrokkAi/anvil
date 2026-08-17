@@ -5865,7 +5865,9 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
     // assembles a replacement session and closes the previous indexer, so the
     // new workspace hydrates from scratch and the session's opening wait does
     // not cover it. Wait again here, after the timing record, so the hydration
-    // stays out of tool time instead of landing inside the next search.
+    // stays out of tool time instead of landing inside the next search. The
+    // name routes through `semantic_readiness::probe_targets`, so a session
+    // with named workspaces probes the activated one by name.
     if success && let Some(workspace) = activated_workspace {
         crate::semantic_readiness::wait_for_semantic_index(
             registry,

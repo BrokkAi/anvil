@@ -214,7 +214,12 @@ fn default_enabled() -> bool {
 }
 
 const DEFAULT_BIFROST_TOOLSET: &str = "core";
-const BIFROST_WORKSPACE_ARGS_PLACEHOLDER: &str = "{bifrost_workspace_args}";
+/// Stands in for the workspace flags in a bifrost server's configured args.
+/// `rendered_args` expands it to `--root <cwd>` or to one `--workspace
+/// <name>=<path>` pair per analysis workspace, which is what puts bifrost in
+/// its named-workspace shape. Crate-visible so tests can spawn a fake bifrost
+/// through the same expansion.
+pub(crate) const BIFROST_WORKSPACE_ARGS_PLACEHOLDER: &str = "{bifrost_workspace_args}";
 
 fn bifrost_args(flag: &str, toolset: &str) -> Vec<String> {
     vec![
