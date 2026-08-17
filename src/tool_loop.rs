@@ -2110,9 +2110,13 @@ pub(crate) async fn run(
         }));
     }
     if let Some(config) = cim_config.as_ref().filter(|_| cim_step_claimed) {
-        let step = crate::cim::synthetic_step(config);
+        // The configured workspaces are what bifrost's command line was built
+        // from, so they are also the names its router accepts: step zero asks
+        // each of them the same queries. See `cim::synthetic_step`.
+        let step = crate::cim::synthetic_step(config, registry.analysis_workspaces());
         let calls = p2t::forced_step_to_tool_calls(&step);
         let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+        let step_started = Instant::now();
         append_trace_record(serde_json::json!({
             "type": "cim_synthetic_step_start",
             "query_manifest_sha256": config.query_manifest_sha256,
@@ -2122,6 +2126,10 @@ pub(crate) async fn run(
                 .expect("CIM mode is enabled")
                 .as_secs(),
             "reranker_failure_policy": "fail_closed",
+            "workspaces": registry.analysis_workspaces().map(|workspaces| workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>()),
             "call_ids": call_ids,
         }));
         if !calls.is_empty() {
@@ -2183,6 +2191,8 @@ pub(crate) async fn run(
                     "query_manifest_sha256": config.query_manifest_sha256,
                     "query_count": config.queries.len(),
                     "status": "failed",
+                    "call_ids": call_ids,
+                    "elapsed_millis": step_started.elapsed().as_millis(),
                     "failures": exchanges.iter()
                         .filter(|exchange| exchange.status == ToolExchangeStatus::Failed)
                         .map(|exchange| serde_json::json!({
@@ -2200,6 +2210,8 @@ pub(crate) async fn run(
             "query_manifest_sha256": config.query_manifest_sha256,
             "query_count": config.queries.len(),
             "status": "completed",
+            "call_ids": call_ids,
+            "elapsed_millis": step_started.elapsed().as_millis(),
         }));
     }
     let mut p2t_steps_executed = 0usize;
@@ -10446,5 +10458,295 @@ mod tests {
                 mode
             );
         }
+    }
+
+    /// A registry whose only MCP server is the retrieval fake
+    /// (`semantic_rerank::FAKE_BIFROST_WITH_SOURCES`), spawned through the real
+    /// workspace-args expansion so the fake sees the command line the real
+    /// bifrost would: `--root <cwd>` with no named workspaces, one
+    /// `--workspace <name>=<path>` pair per name with them.
+    #[cfg(unix)]
+    async fn retrieval_bifrost_registry(cwd: &Path, names: &[&str]) -> ToolRegistry {
+        use crate::mcp::{BIFROST_WORKSPACE_ARGS_PLACEHOLDER, McpFraming, McpServerConfig};
+
+        let script = cwd.join("fake_bifrost_sources.py");
+        std::fs::write(&script, crate::semantic_rerank::FAKE_BIFROST_WITH_SOURCES)
+            .expect("write fake server");
+        let analysis_workspaces = (!names.is_empty()).then(|| {
+            names
+                .iter()
+                .map(|name| crate::session::AnalysisWorkspace {
+                    name: (*name).to_string(),
+                    path: cwd.join(name),
+                })
+                .collect()
+        });
+        ToolRegistry::new(
+            cwd.to_path_buf(),
+            Vec::new(),
+            vec![McpServerConfig {
+                name: "bifrost".to_string(),
+                transport: Default::default(),
+                command: std::env::var("ANVIL_PYTHON").unwrap_or_else(|_| "python3".to_string()),
+                url: None,
+                headers: Vec::new(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    BIFROST_WORKSPACE_ARGS_PLACEHOLDER.to_string(),
+                ],
+                env: Vec::new(),
+                framing: McpFraming::Line,
+                enabled: true,
+            }],
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+            crate::tools::ToolRegistryOptions {
+                analysis_workspaces,
+                lsp_settings: crate::lsp::LspSettings::default(),
+                shell_minimizer_enabled: false,
+            },
+        )
+        .await
+    }
+
+    /// Drive a CIM step zero all the way through the forced-step executor and
+    /// return the conversation it produced, the exchanges it recorded, and how
+    /// many utility (reranker) requests it made. `step_workspaces` is what
+    /// `cim::synthetic_step` is told about the session's workspaces, so a test
+    /// can send the fix's per-workspace calls or the old workspace-less one at
+    /// the same named bifrost.
+    #[cfg(unix)]
+    async fn run_cim_step_zero(
+        registry: &ToolRegistry,
+        cwd: &Path,
+        step_workspaces: Option<&[crate::session::AnalysisWorkspace]>,
+    ) -> (Vec<ChatMessage>, Vec<ToolExchange>, usize) {
+        struct SilentSink;
+        impl EventSink for SilentSink {
+            fn emit(&self, _session_id: &str, _event: RuntimeEvent) {}
+        }
+
+        /// A reranker that keeps the first candidate every time. The selection
+        /// is the same for every workspace, so which workspace answered shows
+        /// up in the rendered card rather than in the choice.
+        struct SelectingUtilityBackend {
+            requests: Arc<AtomicUsize>,
+        }
+        impl LlmBackend for SelectingUtilityBackend {
+            fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("the reranker never lists models")
+            }
+
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(LlmResponse::Text {
+                        text: serde_json::json!({
+                            "relevant": [{ "id": "s1", "declarations": ["s1d1"] }]
+                        })
+                        .to_string(),
+                        reasoning_content: None,
+                        usage: TokenUsage::default(),
+                    })
+                }
+                .boxed()
+            }
+        }
+
+        let config = crate::cim::CimConfig {
+            query_manifest_sha256: "abc".to_string(),
+            k: 20,
+            queries: vec!["where does run come from".to_string()],
+        };
+        let step = crate::cim::synthetic_step(&config, step_workspaces);
+        let calls = p2t::forced_step_to_tool_calls(&step);
+        let mut messages = vec![
+            ChatMessage::user("where does run come from?"),
+            p2t::forced_step_to_message(&step),
+        ];
+        let mut tool_exchanges = Vec::new();
+        let mut replay_events = Vec::new();
+        let mut turn_usage = TokenUsage::default();
+        let mut utility_usage_by_model = BTreeMap::new();
+        let mut current_plan = None;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(SelectingUtilityBackend {
+            requests: requests.clone(),
+        });
+        let sessions = SessionStore::new("test-model".to_string());
+        let session = sessions.create_session(cwd.to_path_buf()).await;
+        assert!(
+            sessions
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+        // A read-only search never prompts, so a broker that would cancel the
+        // call proves step zero ran without one.
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Cancelled,
+            prompt: Arc::new(Mutex::new(None)),
+        };
+
+        let outcome = execute_step_tool_calls(
+            &llm,
+            registry,
+            "test-model",
+            None,
+            None,
+            None,
+            "where does run come from?",
+            &calls,
+            &HashSet::from(["semantic_search".to_string()]),
+            &mut messages,
+            &mut tool_exchanges,
+            &mut replay_events,
+            &mut turn_usage,
+            &mut utility_usage_by_model,
+            &mut current_plan,
+            4,
+            IdleTimeouts {
+                first_progress: Duration::from_secs(30),
+                inter_chunk: Duration::from_secs(30),
+            },
+            CancellationToken::new(),
+            &SilentSink,
+            &broker,
+            &session.id,
+            &sessions,
+            NotificationMode::Silent,
+            0,
+            None,
+        )
+        .await;
+
+        assert!(!outcome.cancelled, "step zero must not be cancelled");
+        assert!(
+            broker.prompt.lock().expect("prompt lock").is_none(),
+            "a read-only semantic search must not prompt"
+        );
+        (messages, tool_exchanges, requests.load(Ordering::SeqCst))
+    }
+
+    /// The bug this fix removes. Every CodeScale eval starts bifrost with
+    /// `--workspace NAME=PATH`, and its router rejects a call that names no
+    /// configured workspace, so the whole step-zero exchange has to carry one
+    /// named call per workspace. Each of them must come back as a tool result in
+    /// the conversation the model's first real turn reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cim_step_zero_sends_one_named_call_per_workspace() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"]).await;
+        let workspaces = registry
+            .analysis_workspaces()
+            .expect("the registry keeps the configured workspaces")
+            .to_vec();
+
+        let (messages, exchanges, rerank_requests) =
+            run_cim_step_zero(&registry, cwd.path(), Some(&workspaces)).await;
+
+        let call_ids: Vec<&str> = exchanges
+            .iter()
+            .map(|exchange| exchange.call_id.as_str())
+            .collect();
+        assert_eq!(
+            call_ids,
+            vec![
+                "cim-step-0-semantic-search-backend",
+                "cim-step-0-semantic-search-frontend"
+            ],
+            "{exchanges:?}"
+        );
+        assert!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.status == ToolExchangeStatus::Completed),
+            "every named call must be accepted: {exchanges:?}"
+        );
+        assert_eq!(
+            rerank_requests, 2,
+            "one rerank per workspace call, each with the same single query"
+        );
+
+        // The forced assistant turn plus one tool result per call, in call
+        // order, is what the model's first real turn reads.
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        let results = &messages[2..];
+        assert_eq!(
+            results
+                .iter()
+                .map(|message| message.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("cim-step-0-semantic-search-backend"),
+                Some("cim-step-0-semantic-search-frontend")
+            ]
+        );
+        // Each workspace answered from its own index: the fake prefixes its
+        // symbols with the workspace that served them.
+        assert!(
+            results[0].content_text().contains("backend.app.alpha.run"),
+            "{:?}",
+            results[0]
+        );
+        assert!(
+            results[1].content_text().contains("frontend.app.alpha.run"),
+            "{:?}",
+            results[1]
+        );
+    }
+
+    /// The failure the fix replaces, kept as the contrast case: the same named
+    /// bifrost, one workspace-less call. The router refuses it, the reranker
+    /// fails closed, and the step-zero exchange fails -- which in `run` ends the
+    /// session before the model's first turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_workspaceless_cim_step_zero_is_refused_by_a_named_bifrost() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"]).await;
+
+        let (_messages, exchanges, _rerank_requests) =
+            run_cim_step_zero(&registry, cwd.path(), None).await;
+
+        assert_eq!(exchanges.len(), 1, "{exchanges:?}");
+        assert_eq!(exchanges[0].call_id, "cim-step-0-semantic-search");
+        assert_eq!(exchanges[0].status, ToolExchangeStatus::Failed);
+        assert!(
+            exchanges[0]
+                .result
+                .contains("workspace must be one configured name"),
+            "{:?}",
+            exchanges[0]
+        );
+    }
+
+    /// Without named workspaces nothing changes: bifrost runs as
+    /// `--root <cwd>`, step zero sends the one workspace-less call it always
+    /// sent, and it round-trips.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cim_step_zero_without_named_workspaces_sends_the_single_legacy_call() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = retrieval_bifrost_registry(cwd.path(), &[]).await;
+        assert!(registry.analysis_workspaces().is_none());
+
+        let (messages, exchanges, rerank_requests) =
+            run_cim_step_zero(&registry, cwd.path(), registry.analysis_workspaces()).await;
+
+        assert_eq!(exchanges.len(), 1, "{exchanges:?}");
+        assert_eq!(exchanges[0].call_id, "cim-step-0-semantic-search");
+        assert_eq!(exchanges[0].status, ToolExchangeStatus::Completed);
+        assert_eq!(rerank_requests, 1);
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(
+            messages[2].content_text().contains("app.alpha.run"),
+            "{:?}",
+            messages[2]
+        );
     }
 }

@@ -751,7 +751,10 @@ fn prepare_bifrost_args(query: &str, final_k: usize, workspace: Option<&str>) ->
     )
 }
 
-fn bifrost_args_with_workspace(mut args: Value, workspace: Option<&str>) -> Value {
+/// Name the workspace in a bifrost tool call's arguments, or leave them alone
+/// in the single-root shape that has no router. Shared with `cim`, which builds
+/// step zero's forced `semantic_search` call the same way.
+pub(crate) fn bifrost_args_with_workspace(mut args: Value, workspace: Option<&str>) -> Value {
     if let Some(workspace) = workspace {
         args.as_object_mut()
             .expect("Bifrost arguments must be an object")
@@ -1828,6 +1831,129 @@ fn clamp_line(line: &str) -> String {
     format!("{}… [line truncated]", &line[..cut])
 }
 
+/// A fake bifrost that serves the three tools this reranker uses. Two of its
+/// symbols share a body, so a fetch of both exercises deduplication.
+/// `fail_sources` in the argv makes `get_symbol_sources` return a JSON-RPC error
+/// while search and summaries keep working, which is the fail-closed case.
+///
+/// It takes its workspace shape from its own command line, the way
+/// `McpServerConfig::rendered_args` writes it and the readiness fake
+/// (`semantic_readiness::FAKE_BIFROST`) reads it:
+///
+/// - No `--workspace` argument: single-root mode, and a `workspace` argument is
+///   rejected because there is no router to route it.
+/// - One or more `--workspace <name>=<path>`: named mode, where every call must
+///   name a configured workspace or be refused with bifrost's own
+///   `invalid_params` message. Each workspace answers under its own symbol
+///   prefix, so a caller can tell which workspace served a result.
+///
+/// Module scope rather than inside `mod tests` so another module's tests can
+/// drive a whole `semantic_search` call against it; `cim`'s step zero does.
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) const FAKE_BIFROST_WITH_SOURCES: &str = r#"
+import json, sys
+
+argv = sys.argv[1:]
+fail_sources = "fail_sources" in argv
+
+named = {}
+i = 0
+while i < len(argv):
+    if argv[i] == "--workspace" and i + 1 < len(argv):
+        name, _, path = argv[i + 1].partition("=")
+        named[name] = path
+        i += 2
+    else:
+        i += 1
+
+PATHS = {
+    "app.alpha.run": "app/alpha.py",
+    "app.beta.run": "app/beta.py",
+    "app.gamma.helper": "app/gamma.py",
+}
+BODIES = {
+    "app.alpha.run": "def run(self):\n    return self.value",
+    "app.beta.run": "def run(self):\n    return self.value",
+    "app.gamma.helper": "def helper(self):\n    return 42",
+}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "bifrost", "version": "0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": n, "description": "fake",
+             "inputSchema": {"type": "object", "properties": {}}}
+            for n in ["semantic_search", "get_summaries", "get_symbol_sources"]]}})
+    elif method == "tools/call":
+        name = msg["params"]["name"]
+        args = msg["params"].get("arguments", {})
+        workspace = args.get("workspace")
+        if named:
+            if not isinstance(workspace, str) or workspace not in named:
+                send({"jsonrpc": "2.0", "id": mid, "error": {
+                    "code": -32602, "message": "workspace must be one configured name"}})
+                continue
+        elif workspace is not None:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32602,
+                "message": "workspace is not accepted without configured workspaces"}})
+            continue
+        prefix = (workspace + ".") if named else ""
+        if name == "semantic_search":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": {
+                "vector_ranked": [{"fqfn": prefix + s, "score": 1.0} for s in
+                                  ["app.alpha.run", "app.beta.run", "app.gamma.helper"]],
+                "coedit_ranked": []}}})
+        elif name == "get_summaries":
+            summaries = []
+            for target in args.get("targets", []):
+                symbol = target[len(prefix):] if target.startswith(prefix) else target
+                if symbol not in PATHS:
+                    continue
+                summaries.append({"label": target, "path": PATHS[symbol], "elements": [
+                    {"path": PATHS[symbol], "symbol": target, "kind": "function",
+                     "start_line": 1, "end_line": 2,
+                     "text": "def " + symbol.split(".")[-1] + "(self):"}]})
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"structuredContent": {"summaries": summaries}}})
+        elif name == "get_symbol_sources":
+            if fail_sources:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32000, "message": "symbol source index unavailable"}})
+                continue
+            sources = []
+            for target in args.get("symbols", []):
+                symbol = target[len(prefix):] if target.startswith(prefix) else target
+                if symbol not in BODIES:
+                    continue
+                sources.append({"label": target, "path": PATHS[symbol],
+                                "start_line": 1, "end_line": 2, "text": BODIES[symbol]})
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": {"structuredContent": {"sources": sources}}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid,
+                  "error": {"code": -32601, "message": "unexpected tool " + name}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}})
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2787,89 +2913,6 @@ mod tests {
         assert_eq!(prefix.len(), 3);
         assert_eq!(prefix[2].content_text(), "Here it is.");
     }
-
-    /// A bifrost that serves the three tools this reranker uses. Two of its
-    /// symbols share a body, so a fetch of both exercises deduplication.
-    /// `fail_sources` makes `get_symbol_sources` return a JSON-RPC error while
-    /// search and summaries keep working, which is the fail-closed case.
-    #[cfg(unix)]
-    const FAKE_BIFROST_WITH_SOURCES: &str = r#"
-import json, sys
-
-fail_sources = "fail_sources" in sys.argv
-
-PATHS = {
-    "app.alpha.run": "app/alpha.py",
-    "app.beta.run": "app/beta.py",
-    "app.gamma.helper": "app/gamma.py",
-}
-BODIES = {
-    "app.alpha.run": "def run(self):\n    return self.value",
-    "app.beta.run": "def run(self):\n    return self.value",
-    "app.gamma.helper": "def helper(self):\n    return 42",
-}
-
-def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    msg = json.loads(line)
-    mid = msg.get("id")
-    method = msg.get("method")
-    if mid is None:
-        continue
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "bifrost", "version": "0"}}})
-    elif method == "tools/list":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
-            {"name": n, "description": "fake",
-             "inputSchema": {"type": "object", "properties": {}}}
-            for n in ["semantic_search", "get_summaries", "get_symbol_sources"]]}})
-    elif method == "tools/call":
-        name = msg["params"]["name"]
-        args = msg["params"].get("arguments", {})
-        if name == "semantic_search":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": {
-                "vector_ranked": [{"fqfn": s, "score": 1.0} for s in
-                                  ["app.alpha.run", "app.beta.run", "app.gamma.helper"]],
-                "coedit_ranked": []}}})
-        elif name == "get_summaries":
-            summaries = []
-            for target in args.get("targets", []):
-                if target not in PATHS:
-                    continue
-                summaries.append({"label": target, "path": PATHS[target], "elements": [
-                    {"path": PATHS[target], "symbol": target, "kind": "function",
-                     "start_line": 1, "end_line": 2,
-                     "text": "def " + target.split(".")[-1] + "(self):"}]})
-            send({"jsonrpc": "2.0", "id": mid,
-                  "result": {"structuredContent": {"summaries": summaries}}})
-        elif name == "get_symbol_sources":
-            if fail_sources:
-                send({"jsonrpc": "2.0", "id": mid,
-                      "error": {"code": -32000, "message": "symbol source index unavailable"}})
-                continue
-            sources = []
-            for symbol in args.get("symbols", []):
-                if symbol not in BODIES:
-                    continue
-                sources.append({"label": symbol, "path": PATHS[symbol],
-                                "start_line": 1, "end_line": 2, "text": BODIES[symbol]})
-            send({"jsonrpc": "2.0", "id": mid,
-                  "result": {"structuredContent": {"sources": sources}}})
-        else:
-            send({"jsonrpc": "2.0", "id": mid,
-                  "error": {"code": -32601, "message": "unexpected tool " + name}})
-    else:
-        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}})
-"#;
 
     /// What one rerank request looked like, kept because the shape of the
     /// request is the behavior under test: which tools it offered and what the

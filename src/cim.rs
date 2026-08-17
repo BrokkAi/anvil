@@ -123,20 +123,70 @@ fn load_config(path: &Path) -> Result<CimConfig> {
     })
 }
 
-pub(crate) fn synthetic_step(config: &CimConfig) -> ForcedStep {
+/// Call id of the workspace-less step-zero call, and the prefix every
+/// per-workspace id extends. Stable so a trace consumer can find step zero
+/// without reading the arguments.
+const STEP_ZERO_CALL_ID: &str = "cim-step-0-semantic-search";
+
+/// Step zero: one forced assistant step that retrieves before the model's
+/// first turn.
+///
+/// The step has to name its workspaces whenever the session has named ones.
+/// Anvil starts bifrost either as `--root <cwd>` or as one
+/// `--workspace <name>=<path>` per repository (`McpServerConfig::rendered_args`),
+/// and in the second shape bifrost's router rejects any tool call without a
+/// configured `workspace` argument ("workspace must be one configured name").
+/// Every CodeScale eval runs the named shape, so a workspace-less forced call
+/// came back as an immediate `retrieval_error` and killed the session before the
+/// first real turn -- the same failure the readiness probe hit in
+/// `semantic_readiness`.
+///
+/// So the names come from the same session configuration that built bifrost's
+/// command line, and the step asks every configured workspace the same queries:
+/// one `semantic_search` call per workspace, each with its own stable id, all in
+/// this one step. Cross-repository coverage is the point of the arm, and
+/// retrieving from a single workspace would forfeit the multi-repo tasks. The
+/// CIM config itself stays workspace-agnostic (queries and k only), because the
+/// query manifest is shared across tasks whose repository sets differ.
+pub(crate) fn synthetic_step(
+    config: &CimConfig,
+    analysis_workspaces: Option<&[crate::session::AnalysisWorkspace]>,
+) -> ForcedStep {
+    let named = analysis_workspaces.filter(|workspaces| !workspaces.is_empty());
     ForcedStep {
         assistant_text: String::new(),
         tool_calls: if config.queries.is_empty() {
             Vec::new()
         } else {
-            vec![PrefixToolCall {
-                id: "cim-step-0-semantic-search".to_string(),
-                name: "semantic_search".to_string(),
-                arguments: serde_json::json!({ "queries": config.queries, "k": config.k })
-                    .to_string(),
-            }]
+            match named {
+                Some(workspaces) => workspaces
+                    .iter()
+                    .map(|workspace| semantic_search_call(config, Some(&workspace.name)))
+                    .collect(),
+                None => vec![semantic_search_call(config, None)],
+            }
         },
         message: None,
+    }
+}
+
+/// One step-zero `semantic_search` call. `workspace` is `None` only in the
+/// single-root shape, where bifrost has no router to name a workspace to.
+fn semantic_search_call(config: &CimConfig, workspace: Option<&str>) -> PrefixToolCall {
+    PrefixToolCall {
+        // Workspace names are unique and restricted to `[A-Za-z0-9._-]`
+        // (`acp::validate_analysis_workspaces`, `mcp::workspace_slug`), so the
+        // suffixed ids stay distinct and readable.
+        id: match workspace {
+            Some(name) => format!("{STEP_ZERO_CALL_ID}-{name}"),
+            None => STEP_ZERO_CALL_ID.to_string(),
+        },
+        name: "semantic_search".to_string(),
+        arguments: crate::semantic_rerank::bifrost_args_with_workspace(
+            serde_json::json!({ "queries": config.queries, "k": config.k }),
+            workspace,
+        )
+        .to_string(),
     }
 }
 
@@ -213,36 +263,114 @@ mod tests {
         );
     }
 
-    #[test]
-    fn synthetic_step_uses_stable_ids_and_k_twenty() {
-        let step = synthetic_step(&CimConfig {
+    fn two_query_config() -> CimConfig {
+        CimConfig {
             query_manifest_sha256: "abc".to_string(),
             k: 20,
             queries: vec![
                 "find auth flow".to_string(),
                 "locate token refresh".to_string(),
             ],
-        });
+        }
+    }
+
+    fn workspaces(names: &[&str]) -> Vec<crate::session::AnalysisWorkspace> {
+        names
+            .iter()
+            .map(|name| crate::session::AnalysisWorkspace {
+                name: (*name).to_string(),
+                path: PathBuf::from("/repos").join(name),
+            })
+            .collect()
+    }
+
+    fn arguments(call: &PrefixToolCall) -> serde_json::Value {
+        serde_json::from_str(&call.arguments).expect("arguments are JSON")
+    }
+
+    /// A single-root session has no name to send, so the call carries no
+    /// `workspace` argument and keeps the original id.
+    #[test]
+    fn synthetic_step_without_named_workspaces_keeps_one_workspaceless_call() {
+        let step = synthetic_step(&two_query_config(), None);
         assert_eq!(step.tool_calls.len(), 1);
         assert_eq!(step.tool_calls[0].id, "cim-step-0-semantic-search");
         assert_eq!(step.tool_calls[0].name, "semantic_search");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&step.tool_calls[0].arguments).unwrap(),
+            arguments(&step.tool_calls[0]),
             serde_json::json!({
                 "queries": ["find auth flow", "locate token refresh"],
                 "k": 20
             })
         );
+        // An empty configured list is the single-root shape too: bifrost was
+        // started with `--root`, so there is still no name to send.
+        assert_eq!(
+            synthetic_step(&two_query_config(), Some(&[])).tool_calls,
+            step.tool_calls
+        );
+    }
+
+    /// The bug this step was failing on. Every CodeScale eval starts bifrost
+    /// with `--workspace NAME=PATH`, where the router rejects a call that names
+    /// no workspace, so step zero asks each configured workspace the same
+    /// queries under its own id.
+    #[test]
+    fn synthetic_step_names_every_configured_workspace() {
+        let config = two_query_config();
+        let step = synthetic_step(&config, Some(&workspaces(&["backend", "frontend"])));
+
+        let ids: Vec<&str> = step
+            .tool_calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "cim-step-0-semantic-search-backend",
+                "cim-step-0-semantic-search-frontend"
+            ]
+        );
+        assert_eq!(
+            step.tool_calls
+                .iter()
+                .map(arguments)
+                .collect::<Vec<serde_json::Value>>(),
+            vec![
+                serde_json::json!({
+                    "queries": ["find auth flow", "locate token refresh"],
+                    "k": 20,
+                    "workspace": "backend"
+                }),
+                serde_json::json!({
+                    "queries": ["find auth flow", "locate token refresh"],
+                    "k": 20,
+                    "workspace": "frontend"
+                }),
+            ]
+        );
+        assert!(
+            step.tool_calls
+                .iter()
+                .all(|call| call.name == "semantic_search")
+        );
     }
 
     #[test]
     fn synthetic_step_with_no_queries_has_no_tool_call() {
-        let step = synthetic_step(&CimConfig {
+        let config = CimConfig {
             query_manifest_sha256: "abc".to_string(),
             k: 20,
             queries: Vec::new(),
-        });
-        assert!(step.tool_calls.is_empty());
+        };
+        assert!(synthetic_step(&config, None).tool_calls.is_empty());
+        assert!(
+            synthetic_step(&config, Some(&workspaces(&["backend", "frontend"])))
+                .tool_calls
+                .is_empty(),
+            "no queries means no calls, however many workspaces there are"
+        );
     }
 
     #[test]
