@@ -3169,6 +3169,7 @@ mod tests {
                 },
             }],
             usage: TokenUsage::default(),
+            codex_reasoning: None,
         }
     }
 
@@ -3178,6 +3179,7 @@ mod tests {
             text: selection.to_string(),
             reasoning_content: None,
             usage: TokenUsage::default(),
+            codex_reasoning: None,
         }
     }
 

@@ -36,10 +36,10 @@ use tokio_util::sync::CancellationToken;
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
-    LlmResponse, ModelDiscoveryNotice, ModelMetadata, ModelServiceTier, OpenAiClient,
-    OutputBudgetExhaustedError, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
-    ToolDefinition,
+    ChatContentPart, ChatMessage, CodexReasoningItem, FunctionCall, IdleTimeouts,
+    IncompleteStreamError, LlmBackend, LlmResponse, ModelDiscoveryNotice, ModelMetadata,
+    ModelServiceTier, OpenAiClient, OutputBudgetExhaustedError, ReasoningLevelPreset,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::responses_chain::{
     RESPONSES_CHAIN_CACHE_CAP, ResponsesChainCache, find_responses_continuation,
@@ -145,6 +145,26 @@ impl CodexPromptCacheIdentity {
             thread_id: uuid::Uuid::new_v4().to_string(),
         }
     }
+}
+
+/// What `find_responses_continuation`'s prefix match found for a turn,
+/// bundled because both halves come from the same lookup and are used
+/// together while building the request: the prompt-cache identity to route
+/// on, and how far into `messages` that match reached.
+///
+/// That reach is also exactly how far it's safe to replay a stored
+/// `ChatMessage::codex_reasoning` item: a match at boundary `a` means
+/// `messages[..a]` hashed identical to a message list this client actually
+/// sent on an earlier turn, so every assistant message at or before index
+/// `a` carries the same content (and, if present, the same reasoning item)
+/// it did when the server produced it. An edited or compacted prefix no
+/// longer matches at all (`reasoning_replay_boundary: None`) or only
+/// matches up to an earlier point, and `build_responses_request` drops any
+/// reasoning item past that boundary rather than replaying it against
+/// context the server never produced it from.
+struct ResponsesContinuation {
+    identity: CodexPromptCacheIdentity,
+    reasoning_replay_boundary: Option<usize>,
 }
 
 /// Who a turn is from and which conversation it continues -- the four headers
@@ -341,8 +361,8 @@ impl CodexClient {
         ChatGptCredentials::from_auth(&auth)
     }
 
-    /// Recovers the identity this conversation has been using, or mints a new
-    /// one.
+    /// Recovers the identity this conversation has been using (or mints a new
+    /// one) together with how far the matched prefix reached.
     ///
     /// The lookup is the shared prefix match in `responses_chain`: it finds
     /// the largest earlier turn whose message list is a prefix of this turn's
@@ -350,14 +370,23 @@ impl CodexClient {
     /// history was edited, compacted, or rewound no longer has a matching
     /// prefix, so it mints a fresh identity and starts warming a new cache
     /// rather than pinning the turn to a prefix the server no longer holds.
-    fn prompt_cache_identity_for(&self, messages: &[ChatMessage]) -> CodexPromptCacheIdentity {
+    /// See `ResponsesContinuation` for what the boundary is used for beyond
+    /// the identity.
+    fn continuation_for(&self, messages: &[ChatMessage]) -> ResponsesContinuation {
         let cache = self
             .prompt_cache_identities
             .lock()
             .expect("prompt_cache_identities mutex poisoned");
-        find_responses_continuation(messages, |hash| cache.get(hash))
-            .map(|(_boundary, identity)| identity)
-            .unwrap_or_else(CodexPromptCacheIdentity::mint)
+        match find_responses_continuation(messages, |hash| cache.get(hash)) {
+            Some((boundary, identity)) => ResponsesContinuation {
+                identity,
+                reasoning_replay_boundary: Some(boundary),
+            },
+            None => ResponsesContinuation {
+                identity: CodexPromptCacheIdentity::mint(),
+                reasoning_replay_boundary: None,
+            },
+        }
     }
 
     fn remember_prompt_cache_identity(
@@ -394,7 +423,8 @@ impl CodexClient {
             cancel,
             idle_timeouts,
         } = request;
-        let identity = self.prompt_cache_identity_for(&messages);
+        let continuation = self.continuation_for(&messages);
+        let identity = &continuation.identity;
         let body = build_responses_request(
             &model,
             &messages,
@@ -402,7 +432,7 @@ impl CodexClient {
             reasoning_effort.as_deref(),
             service_tier.as_deref(),
             structured_output.as_ref(),
-            &identity,
+            &continuation,
         );
         // Keep the caller's sinks behind a mutex so a retry can build
         // fresh FnMut wrappers without losing the live callbacks.
@@ -412,7 +442,7 @@ impl CodexClient {
             .send_responses_request(
                 RequestIdentity {
                     creds: &creds,
-                    conversation: &identity,
+                    conversation: identity,
                 },
                 &body,
                 shared_sink_forwarder(shared_on_token.clone()),
@@ -429,7 +459,7 @@ impl CodexClient {
                 self.send_responses_request(
                     RequestIdentity {
                         creds: &creds,
-                        conversation: &identity,
+                        conversation: identity,
                     },
                     &body,
                     shared_sink_forwarder(shared_on_token),
@@ -450,7 +480,7 @@ impl CodexClient {
         // failure could have invalidated, so the warm prefix from earlier
         // turns stays the best thing to retry against.
         if result.is_ok() {
-            self.remember_prompt_cache_identity(&messages, &identity);
+            self.remember_prompt_cache_identity(&messages, identity);
         }
         result
     }
@@ -1145,6 +1175,25 @@ pub(crate) enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+    /// Replays a `CodexReasoningItem` verbatim so the model resumes its own
+    /// reasoning instead of restarting cold. See `reasoning_input_item` and
+    /// `ChatMessage::codex_reasoning`.
+    ///
+    /// `content` and `summary` are never omitted, even when empty: measured
+    /// live against `chatgpt.com/backend-api/codex/responses` on
+    /// 2026-08-18, omitting an empty `summary` (the shape every response
+    /// observed against this backend actually has) is rejected outright
+    /// with `HTTP 400 {"error":{"message":"Missing required parameter:
+    /// 'input[1].summary'.","param":"input[1].summary",
+    /// "code":"missing_required_parameter"}}`. Sending `[]` back (what was
+    /// actually received) is accepted.
+    Reasoning {
+        id: String,
+        content: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        summary: Vec<serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1185,8 +1234,18 @@ pub(crate) struct ResponsesToolDef {
 /// them hit on 0 of 8. `prompt_cache_key` alone, with no identity headers,
 /// also hit 0 of 2 -- so the headers are what steers the routing and the key
 /// rides along because it is the documented hint and Codex CLI sends both.
-/// `identity` supplies all three values and stays fixed for the life of a
-/// conversation.
+/// `continuation.identity` supplies all three values and stays fixed for the
+/// life of a conversation.
+///
+/// A `codex_reasoning` item on an assistant message is replayed at its
+/// original emission position -- immediately ahead of that same message's
+/// own `function_call`/`message` items, exactly where the response that
+/// produced it emitted the `reasoning` item -- but only for a message at or
+/// before `continuation.reasoning_replay_boundary`; see
+/// `ResponsesContinuation` for why that boundary is the right cutoff. This
+/// keeps the emitted `input` array append-only turn over turn (never
+/// reordering anything already sent), which is what lets the prompt-cache
+/// prefix from `continuation.identity` keep matching as history grows.
 fn build_responses_request(
     model: &str,
     messages: &[ChatMessage],
@@ -1194,12 +1253,13 @@ fn build_responses_request(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output: Option<&StructuredOutputRequest>,
-    identity: &CodexPromptCacheIdentity,
+    continuation: &ResponsesContinuation,
 ) -> ResponsesRequest {
+    let identity = &continuation.identity;
     let mut instructions_parts: Vec<String> = Vec::new();
     let mut input: Vec<ResponsesInputItem> = Vec::new();
 
-    for msg in messages {
+    for (idx, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
             "system" => {
                 let text = msg.content_text();
@@ -1237,6 +1297,20 @@ fn build_responses_request(
                 }
             }
             "assistant" => {
+                if let Some(reasoning) = &msg.codex_reasoning {
+                    if continuation
+                        .reasoning_replay_boundary
+                        .is_some_and(|boundary| idx <= boundary)
+                    {
+                        input.push(reasoning_input_item(reasoning));
+                    } else {
+                        tracing::debug!(
+                            "dropping codex reasoning item at message index {idx}: outside the \
+                             matched prefix (edited or compacted history), so the server never \
+                             produced it from the context we're about to send"
+                        );
+                    }
+                }
                 if let Some(calls) = &msg.tool_calls {
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
@@ -1329,6 +1403,20 @@ fn build_responses_request(
         reasoning,
         service_tier: service_tier.map(str::to_string),
         text,
+    }
+}
+
+/// Builds the outbound `reasoning` input item from a stored
+/// `CodexReasoningItem`, field for field -- `id`, `encrypted_content`,
+/// `content`, `summary` are exactly what `OutputItem::Reasoning` captured
+/// from the response that produced it, so this replays the item as
+/// received rather than reconstructing an assumed shape.
+fn reasoning_input_item(item: &CodexReasoningItem) -> ResponsesInputItem {
+    ResponsesInputItem::Reasoning {
+        id: item.id.clone(),
+        content: item.content.clone(),
+        encrypted_content: item.encrypted_content.clone(),
+        summary: item.summary.clone(),
     }
 }
 
@@ -1452,7 +1540,21 @@ enum OutputItem {
         #[serde(default)]
         call_id: Option<String>,
     },
-    /// Fallback for variants we don't model (Reasoning, LocalShellCall,
+    /// Encrypted reasoning state (requested via `include:
+    /// ["reasoning.encrypted_content"]`; see `REASONING_ENCRYPTED_CONTENT_INCLUDE`).
+    /// Captured verbatim enough to replay on a later turn; see
+    /// `CodexReasoningItem`.
+    Reasoning {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        #[serde(default)]
+        content: Vec<serde_json::Value>,
+        #[serde(default)]
+        summary: Vec<serde_json::Value>,
+    },
+    /// Fallback for variants we don't model (LocalShellCall,
     /// ToolSearchCall, ...). Keeps the deserializer permissive so a
     /// future server adding new item types doesn't poison the stream.
     #[serde(other)]
@@ -1497,6 +1599,13 @@ where
     // Captured from `response.completed.usage`. Zeroed when the server
     // doesn't emit a usage block (older Responses-API versions did not).
     let mut usage = TokenUsage::default();
+    // Every response observed against the live backend carries at most one
+    // `reasoning` output item, always ahead of the response's own text or
+    // function calls (see `CodexReasoningItem` and `build_responses_request`
+    // for how it is replayed). Kept as a single slot rather than a `Vec` to
+    // match that; a second one arriving overwrites the first with a warning
+    // instead of silently misordering a replay this code isn't designed for.
+    let mut pending_reasoning: Option<CodexReasoningItem> = None;
     // Track whether any text deltas were actually delivered so the
     // output_item.done backfill below can distinguish "no deltas yet"
     // from "deltas arrived but happened to be empty strings". Using
@@ -1644,6 +1753,26 @@ where
                                         });
                                         made_progress = true;
                                     }
+                                    OutputItem::Reasoning {
+                                        id,
+                                        encrypted_content,
+                                        content,
+                                        summary,
+                                    } => {
+                                        if pending_reasoning.is_some() {
+                                            tracing::warn!(
+                                                "Codex response emitted more than one reasoning \
+                                                 item; keeping only the latest one for replay"
+                                            );
+                                        }
+                                        pending_reasoning = Some(CodexReasoningItem {
+                                            id,
+                                            encrypted_content,
+                                            content,
+                                            summary,
+                                        });
+                                        made_progress = true;
+                                    }
                                     OutputItem::Other => {}
                                 }
                             }
@@ -1759,6 +1888,7 @@ where
             text: full_text,
             reasoning_content: None,
             usage,
+            codex_reasoning: pending_reasoning,
         });
     }
 
@@ -1774,6 +1904,7 @@ where
             text: full_text,
             reasoning_content: None,
             usage,
+            codex_reasoning: pending_reasoning,
         })
     } else {
         Ok(LlmResponse::ToolCalls {
@@ -1781,6 +1912,7 @@ where
             reasoning_content: None,
             calls: tool_calls,
             usage,
+            codex_reasoning: pending_reasoning,
         })
     }
 }
@@ -1823,6 +1955,36 @@ mod tests {
         }
     }
 
+    /// `test_identity()` plus "nothing is safe to replay" -- the right
+    /// default for body-shape tests that don't set up a matched prefix.
+    /// Reasoning-replay tests build their own with an explicit boundary.
+    fn test_continuation() -> ResponsesContinuation {
+        ResponsesContinuation {
+            identity: test_identity(),
+            reasoning_replay_boundary: None,
+        }
+    }
+
+    /// Continuation whose reasoning-replay boundary covers every message in
+    /// `messages` -- as if `find_responses_continuation` matched all the way
+    /// through, which is what a normal (non-diverged) turn produces once at
+    /// least one earlier turn has been sent successfully.
+    fn continuation_replaying_everything(messages: &[ChatMessage]) -> ResponsesContinuation {
+        ResponsesContinuation {
+            identity: test_identity(),
+            reasoning_replay_boundary: Some(messages.len().saturating_sub(1)),
+        }
+    }
+
+    fn reasoning_item(id: &str, encrypted_content: &str) -> CodexReasoningItem {
+        CodexReasoningItem {
+            id: id.to_string(),
+            encrypted_content: Some(encrypted_content.to_string()),
+            content: Vec::new(),
+            summary: Vec::new(),
+        }
+    }
+
     #[test]
     fn build_request_collapses_system_messages_into_instructions() {
         let messages = vec![
@@ -1837,7 +1999,7 @@ mod tests {
             None,
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         assert_eq!(
             req.instructions.as_deref(),
@@ -1888,7 +2050,7 @@ mod tests {
             None,
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         assert_eq!(req.input.len(), 3);
         match &req.input[1] {
@@ -1929,7 +2091,7 @@ mod tests {
             None,
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         let tools = serialized.get("tools").unwrap().as_array().unwrap();
@@ -1964,14 +2126,146 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            codex_reasoning: None,
         }];
-        let req =
-            build_responses_request("gpt-5", &messages, None, None, None, None, &test_identity());
+        let req = build_responses_request(
+            "gpt-5",
+            &messages,
+            None,
+            None,
+            None,
+            None,
+            &test_continuation(),
+        );
         assert_eq!(req.input.len(), 1);
         assert!(matches!(
             req.input[0],
             ResponsesInputItem::FunctionCall { .. }
         ));
+    }
+
+    #[test]
+    fn build_request_replays_codex_reasoning_items_at_their_original_positions() {
+        // Synthesizes the history a real session accumulates over three
+        // turns -- turn 1's reply carried tool calls, turn 2's was a plain
+        // final answer -- and pins that each reasoning item lands
+        // immediately ahead of the items it preceded when the response
+        // that produced it emitted it, not bundled some other way.
+        let mut turn1_reply = ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+            "",
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "search".to_string(),
+                    arguments: r#"{"q":"X"}"#.to_string(),
+                },
+            }],
+            None,
+        );
+        turn1_reply.codex_reasoning = Some(reasoning_item("rs_1", "enc_1"));
+
+        let mut turn2_reply = ChatMessage::assistant_with_reasoning("a2", None);
+        turn2_reply.codex_reasoning = Some(reasoning_item("rs_2", "enc_2"));
+
+        let messages = vec![
+            ChatMessage::user("q1"),
+            turn1_reply,
+            ChatMessage::tool_result("call_1", "search", "no results"),
+            ChatMessage::user("q2"),
+            turn2_reply,
+            ChatMessage::user("q3"),
+        ];
+        let continuation = continuation_replaying_everything(&messages);
+        let req = build_responses_request(
+            "gpt-5.6-sol",
+            &messages,
+            None,
+            None,
+            None,
+            None,
+            &continuation,
+        );
+
+        fn item_type(item: &ResponsesInputItem) -> &'static str {
+            match item {
+                ResponsesInputItem::Message { .. } => "message",
+                ResponsesInputItem::FunctionCall { .. } => "function_call",
+                ResponsesInputItem::FunctionCallOutput { .. } => "function_call_output",
+                ResponsesInputItem::Reasoning { .. } => "reasoning",
+            }
+        }
+        let shape: Vec<&'static str> = req.input.iter().map(item_type).collect();
+        assert_eq!(
+            shape,
+            vec![
+                "message",       // user q1
+                "reasoning",     // rs_1, ahead of the calls it produced
+                "function_call", // search
+                "function_call_output",
+                "message",   // user q2
+                "reasoning", // rs_2, ahead of the message it produced
+                "message",   // a2
+                "message",   // user q3
+            ]
+        );
+        match &req.input[1] {
+            ResponsesInputItem::Reasoning {
+                id,
+                encrypted_content,
+                ..
+            } => {
+                assert_eq!(id, "rs_1");
+                assert_eq!(encrypted_content.as_deref(), Some("enc_1"));
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+        match &req.input[5] {
+            ResponsesInputItem::Reasoning {
+                id,
+                encrypted_content,
+                ..
+            } => {
+                assert_eq!(id, "rs_2");
+                assert_eq!(encrypted_content.as_deref(), Some("enc_2"));
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_request_drops_codex_reasoning_item_past_the_replay_boundary() {
+        // A message's `codex_reasoning` can still be set (the object
+        // survived) while the prefix leading to it no longer matches what
+        // the server actually produced it from (an edit or compaction
+        // earlier in history). `reasoning_replay_boundary` is how
+        // `stream_chat_with_credentials` communicates that cutoff; anything
+        // past it must be dropped rather than replayed against context the
+        // server never saw.
+        let mut reply = ChatMessage::assistant_with_reasoning("a1", None);
+        reply.codex_reasoning = Some(reasoning_item("rs_1", "enc_1"));
+        let messages = vec![ChatMessage::user("q1"), reply];
+
+        let continuation = ResponsesContinuation {
+            identity: test_identity(),
+            reasoning_replay_boundary: None, // nothing matched: fresh or fully diverged
+        };
+        let req = build_responses_request(
+            "gpt-5.6-sol",
+            &messages,
+            None,
+            None,
+            None,
+            None,
+            &continuation,
+        );
+        assert!(
+            !req.input
+                .iter()
+                .any(|item| matches!(item, ResponsesInputItem::Reasoning { .. })),
+            "no reasoning item should be replayed when nothing matched: {:?}",
+            req.input
+        );
     }
 
     #[test]
@@ -1993,7 +2287,7 @@ mod tests {
             None,
             None,
             Some(&request),
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized["text"]["format"]["type"], "json_schema");
@@ -2016,7 +2310,7 @@ mod tests {
             Some("xhigh"),
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -2038,7 +2332,7 @@ mod tests {
             None,
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
@@ -2056,7 +2350,7 @@ mod tests {
             None,
             Some("priority"),
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized.get("service_tier"), Some(&json!("priority")));
@@ -2071,7 +2365,7 @@ mod tests {
             None,
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
@@ -2095,7 +2389,7 @@ mod tests {
             Some("medium"),
             None,
             None,
-            &test_identity(),
+            &test_continuation(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized["store"], json!(false));
@@ -2353,6 +2647,240 @@ mod tests {
         );
     }
 
+    // ---- Encrypted reasoning replay ----
+    //
+    // These also drive `stream_chat_with_credentials` against a local mock,
+    // mirroring how `tool_loop.rs` attaches a response's `codex_reasoning`
+    // to the assistant `ChatMessage` it pushes into history before the next
+    // turn resends it.
+
+    /// SSE body for a response that emits a `reasoning` item (with
+    /// encrypted content) ahead of its text, the shape observed against the
+    /// live backend (see `sse_parser_captures_reasoning_item_for_replay`).
+    fn responses_sse_with_reasoning(reasoning_id: &str, encrypted: &str, text: &str) -> String {
+        format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_x\"}}}}\n\n\
+             data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"reasoning\",\
+             \"id\":\"{reasoning_id}\",\"encrypted_content\":\"{encrypted}\",\"content\":[],\
+             \"summary\":[]}}}}\n\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_x\"}}}}\n\n",
+        )
+    }
+
+    /// Replies with one scripted SSE body per call, in order (clamped to the
+    /// last body once exhausted), so a multi-turn test can give each turn a
+    /// distinct reasoning item.
+    struct SequencedResponses {
+        bodies: Vec<String>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl wiremock::Respond for SequencedResponses {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = self.bodies[attempt.min(self.bodies.len() - 1)].clone();
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body)
+        }
+    }
+
+    /// Mirrors the two-line pattern in `tool_loop.rs`: attach whatever
+    /// `codex_reasoning` the response carried to the assistant message
+    /// before it goes into history.
+    fn assistant_reply_with_codex_reasoning(resp: LlmResponse) -> ChatMessage {
+        match resp {
+            LlmResponse::Text {
+                text,
+                codex_reasoning,
+                ..
+            } => {
+                let mut message = ChatMessage::assistant(text);
+                message.codex_reasoning = codex_reasoning;
+                message
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    fn reasoning_input(request: &wiremock::Request) -> Vec<serde_json::Value> {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        body["input"]
+            .as_array()
+            .expect("input array")
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .cloned()
+            .collect()
+    }
+
+    fn full_input(request: &wiremock::Request) -> Vec<serde_json::Value> {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        body["input"].as_array().expect("input array").clone()
+    }
+
+    #[tokio::test]
+    async fn codex_reasoning_items_replay_at_original_positions_across_growing_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(SequencedResponses {
+                bodies: vec![
+                    responses_sse_with_reasoning("rs_1", "enc_1", "a1"),
+                    responses_sse_with_reasoning("rs_2", "enc_2", "a2"),
+                    responses_sse_with_reasoning("rs_3", "enc_3", "a3"),
+                ],
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .mount(&server)
+            .await;
+        let client = CodexClient::with_responses_url(format!("{}/responses", server.uri()));
+
+        let mut messages = vec![ChatMessage::user("q1")];
+        for turn in 1..=3 {
+            let resp = client
+                .stream_chat_with_credentials(fake_credentials(), chat_request(messages.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("turn {turn} should succeed: {e:#}"));
+            messages.push(assistant_reply_with_codex_reasoning(resp));
+            messages.push(ChatMessage::user(format!("q{}", turn + 1)));
+        }
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+
+        // First turn has no history to replay from.
+        assert_eq!(
+            reasoning_input(&requests[0]),
+            Vec::<serde_json::Value>::new()
+        );
+        // Turn 2 replays turn 1's item, by id.
+        let turn2_ids: Vec<String> = reasoning_input(&requests[1])
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(turn2_ids, vec!["rs_1"]);
+        // Turn 3 replays both, in emission order, each still carrying its
+        // encrypted payload.
+        let turn3_items = reasoning_input(&requests[2]);
+        let turn3_ids: Vec<String> = turn3_items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(turn3_ids, vec!["rs_1", "rs_2"]);
+        assert_eq!(turn3_items[0]["encrypted_content"], "enc_1");
+        assert_eq!(turn3_items[1]["encrypted_content"], "enc_2");
+
+        // Position: turn 3's full input has each reasoning item immediately
+        // ahead of the assistant message item it preceded, not bundled
+        // elsewhere.
+        let types: Vec<String> = full_input(&requests[2])
+            .iter()
+            .map(|item| item["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "message",
+                "reasoning",
+                "message",
+                "message",
+            ]
+        );
+
+        // Append-only: turn N's input is a strict prefix of turn N+1's, so
+        // the prompt-cache prefix from `find_responses_continuation` keeps
+        // matching as history grows.
+        let inputs: Vec<Vec<serde_json::Value>> = requests.iter().map(full_input).collect();
+        for pair in inputs.windows(2) {
+            let (shorter, longer) = (&pair[0], &pair[1]);
+            assert!(
+                shorter.len() < longer.len(),
+                "history only grows turn over turn"
+            );
+            assert_eq!(
+                longer[..shorter.len()],
+                shorter[..],
+                "turn N's input must be a strict prefix of turn N+1's"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_reasoning_item_is_dropped_when_its_preceding_history_diverges() {
+        // A reasoning item's `ChatMessage` can survive an edit untouched
+        // while the *prefix* leading to it no longer matches what the
+        // server actually produced it from -- compaction can also leave a
+        // stale object like this behind. Only the affected span (turn 2
+        // onward, after the edited question) should lose its reasoning
+        // item; turn 1's is still safe because its own prefix (just the
+        // first question) is unchanged.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(SequencedResponses {
+                bodies: vec![
+                    responses_sse_with_reasoning("rs_1", "enc_1", "a1"),
+                    responses_sse_with_reasoning("rs_2", "enc_2", "a2"),
+                    responses_sse("a3-after-edit"),
+                ],
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .mount(&server)
+            .await;
+        let client = CodexClient::with_responses_url(format!("{}/responses", server.uri()));
+
+        let turn1 = vec![ChatMessage::user("q1")];
+        let resp1 = client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn1.clone()))
+            .await
+            .expect("turn 1 should succeed");
+        let assistant1 = assistant_reply_with_codex_reasoning(resp1);
+
+        let mut turn2 = turn1.clone();
+        turn2.push(assistant1.clone());
+        turn2.push(ChatMessage::user("q2"));
+        let resp2 = client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn2.clone()))
+            .await
+            .expect("turn 2 should succeed");
+        let assistant2 = assistant_reply_with_codex_reasoning(resp2);
+
+        // Edited history: turn 1's question and reply are untouched, but
+        // turn 2's question was rewound and rewritten. `assistant2` is the
+        // same object turn 2 produced (as a stale leftover would be), still
+        // carrying `codex_reasoning`, but its true prefix no longer exists.
+        let edited = vec![
+            ChatMessage::user("q1"),
+            assistant1,
+            ChatMessage::user("q2 -- edited"),
+            assistant2,
+            ChatMessage::user("q3"),
+        ];
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(edited))
+            .await
+            .expect("turn 3 (edited) should succeed");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+        let turn3_ids: Vec<String> = reasoning_input(&requests[2])
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            turn3_ids,
+            vec!["rs_1"],
+            "rs_1's prefix (just q1) is unchanged and safe to replay; rs_2's prefix included \
+             the now-edited q2 and must be dropped"
+        );
+    }
+
     #[tokio::test]
     async fn sse_parser_streams_text_deltas_and_tool_calls() {
         let raw = concat!(
@@ -2414,6 +2942,46 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_captures_reasoning_item_for_replay() {
+        // `include: ["reasoning.encrypted_content"]` makes the backend
+        // return a `reasoning` output_item.done event ahead of the
+        // response's own text/function calls; the parser must capture it
+        // onto `LlmResponse::codex_reasoning` so a caller can attach it to
+        // the assistant `ChatMessage` for the next turn.
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc_1\",\"content\":[],\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let cb = sink_collecting(std::sync::Arc::new(std::sync::Mutex::new(String::new())));
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("stream completes");
+        match resp {
+            LlmResponse::Text {
+                text,
+                codex_reasoning,
+                ..
+            } => {
+                assert_eq!(text, "ok");
+                let item = codex_reasoning.expect("reasoning item should be captured");
+                assert_eq!(item.id, "rs_1");
+                assert_eq!(item.encrypted_content.as_deref(), Some("enc_1"));
+                assert!(item.content.is_empty());
+                assert!(item.summary.is_empty());
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[tokio::test]

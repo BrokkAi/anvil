@@ -865,6 +865,7 @@ impl BedrockClient {
                 text,
                 reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
                 usage,
+                codex_reasoning: None,
             });
         }
         if calls.is_empty() && stop_reason.as_deref() == Some("max_tokens") {
@@ -886,6 +887,7 @@ impl BedrockClient {
                 text,
                 reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
                 usage,
+                codex_reasoning: None,
             })
         } else {
             Ok(LlmResponse::ToolCalls {
@@ -893,6 +895,7 @@ impl BedrockClient {
                 reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
                 calls,
                 usage,
+                codex_reasoning: None,
             })
         }
     }
@@ -2903,6 +2906,54 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6"
         );
         assert_eq!(percent_encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    /// `ChatMessage::codex_reasoning` is codex-only bookkeeping (see its
+    /// doc comment): a history carrying it must build the exact same
+    /// Bedrock Responses-API request as one that never had it, because this
+    /// shared `build_responses_request` -- the one Bedrock's GPT-OSS/`openai.*`
+    /// path actually sends -- has no knowledge of that field at all.
+    #[test]
+    fn codex_reasoning_items_are_invisible_to_bedrock_requests() {
+        let mut with_reasoning = crate::llm_client::ChatMessage::assistant("the answer is 4");
+        with_reasoning.codex_reasoning = Some(crate::llm_client::CodexReasoningItem {
+            id: "rs_1".to_string(),
+            encrypted_content: Some("enc_1".to_string()),
+            content: Vec::new(),
+            summary: Vec::new(),
+        });
+        let without_reasoning = crate::llm_client::ChatMessage::assistant("the answer is 4");
+        assert_ne!(
+            with_reasoning, without_reasoning,
+            "the two histories must actually differ, or this test proves nothing"
+        );
+
+        let messages_with = vec![
+            crate::llm_client::ChatMessage::user("what is 2+2"),
+            with_reasoning,
+        ];
+        let messages_without = vec![
+            crate::llm_client::ChatMessage::user("what is 2+2"),
+            without_reasoning,
+        ];
+
+        let build = |messages: &[crate::llm_client::ChatMessage]| {
+            build_responses_request(
+                "openai.gpt-5.5",
+                messages,
+                None,
+                Some("medium"),
+                None,
+                true,
+                None,
+            )
+        };
+        let req_with = serde_json::to_value(build(&messages_with)).unwrap();
+        let req_without = serde_json::to_value(build(&messages_without)).unwrap();
+        assert_eq!(
+            req_with, req_without,
+            "a codex reasoning item on the history must not change the Bedrock request body"
+        );
     }
 
     #[test]

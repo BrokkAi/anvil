@@ -275,6 +275,9 @@ fn assistant_message_with_tool_calls(
         // PrefixStep tool-call has no real reasoning; an empty string satisfies
         // the field-presence contract without fabricating rationale.
         reasoning_content: Some(String::new()),
+        // A forced/injected step never came from the codex backend, so
+        // there is no encrypted reasoning item to carry.
+        codex_reasoning: None,
     }
 }
 

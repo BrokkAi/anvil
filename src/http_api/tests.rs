@@ -491,6 +491,7 @@ impl LlmBackend for MockBackend {
                             cached_read_tokens: 0,
                             cached_write_tokens: 0,
                         },
+                        codex_reasoning: None,
                     })
                 }
                 .boxed()
@@ -520,6 +521,7 @@ impl LlmBackend for MockBackend {
                                 },
                             }],
                             usage: TokenUsage::default(),
+                            codex_reasoning: None,
                         })
                     }
                     .boxed()
@@ -529,6 +531,7 @@ impl LlmBackend for MockBackend {
                             text: "file written".to_string(),
                             reasoning_content: None,
                             usage: TokenUsage::default(),
+                            codex_reasoning: None,
                         })
                     }
                     .boxed()

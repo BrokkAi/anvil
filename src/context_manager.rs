@@ -1838,6 +1838,7 @@ mod tests {
                     text: response,
                     reasoning_content: None,
                     usage: crate::llm_client::TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -1870,6 +1871,7 @@ mod tests {
                         .to_string(),
                     reasoning_content: None,
                     usage: crate::llm_client::TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -2035,6 +2037,7 @@ mod tests {
                         text: response,
                         reasoning_content: None,
                         usage: crate::llm_client::TokenUsage::default(),
+                        codex_reasoning: None,
                     })
                 }
                 .boxed();
@@ -2058,6 +2061,7 @@ mod tests {
                     text: response,
                     reasoning_content: None,
                     usage: crate::llm_client::TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -2614,6 +2618,7 @@ mod tests {
                         text: "- partial".into(),
                         reasoning_content: None,
                         usage: crate::llm_client::TokenUsage::default(),
+                        codex_reasoning: None,
                     })
                 }
                 .boxed()
@@ -2707,6 +2712,7 @@ mod tests {
                         text: response,
                         reasoning_content: None,
                         usage: crate::llm_client::TokenUsage::default(),
+                        codex_reasoning: None,
                     })
                 }
                 .boxed()

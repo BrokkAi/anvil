@@ -2580,13 +2580,21 @@ pub(crate) async fn run(
                 text,
                 reasoning_content,
                 usage,
+                codex_reasoning,
             }) => {
                 // A usable response ends any spiral, so the recovery budget
                 // bounds consecutive failures rather than the whole turn.
                 output_budget_recovery_count = 0;
                 trace_llm_text_response(turn, &text, usage);
-                let assistant_message =
-                    ChatMessage::assistant_with_reasoning(text.clone(), reasoning_content);
+                let assistant_message = {
+                    let mut message =
+                        ChatMessage::assistant_with_reasoning(text.clone(), reasoning_content);
+                    // codex-only: lets the next turn resume this response's
+                    // own reasoning instead of restarting cold. See
+                    // `ChatMessage::codex_reasoning`.
+                    message.codex_reasoning = codex_reasoning;
+                    message
+                };
                 if let Some(config) = p2t_config.as_ref() {
                     p2t::append_debug_trace(
                         &config.step_trace_out,
@@ -2735,6 +2743,7 @@ pub(crate) async fn run(
                 reasoning_content,
                 calls,
                 usage,
+                codex_reasoning,
             }) => {
                 output_budget_recovery_count = 0;
                 let calls = normalize_llm_tool_calls(calls);
@@ -2763,13 +2772,19 @@ pub(crate) async fn run(
                 }
 
                 // Record the exact assistant message with tool_calls. DeepSeek
-                // requires reasoning_content to be replayed with the prefix.
-                let assistant_message =
-                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                // requires reasoning_content to be replayed with the prefix;
+                // codex-only, codex_reasoning is that same replay
+                // requirement for its own encrypted reasoning item (see
+                // `ChatMessage::codex_reasoning`).
+                let assistant_message = {
+                    let mut message = ChatMessage::assistant_tool_calls_with_content_and_reasoning(
                         text.clone(),
                         calls.clone(),
                         reasoning_content,
                     );
+                    message.codex_reasoning = codex_reasoning;
+                    message
+                };
                 messages.push(assistant_message.clone());
                 replay_events.push(TurnReplayEvent::AssistantToolCalls {
                     text: text.clone(),
@@ -7315,6 +7330,7 @@ mod tests {
                     text: "ok".to_string(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -7381,6 +7397,7 @@ mod tests {
                     text: "ok".to_string(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -7435,6 +7452,7 @@ mod tests {
                         text: String::new(),
                         reasoning_content: None,
                         usage: TokenUsage::default(),
+                        codex_reasoning: None,
                     });
                 }
                 (request.on_token)("ok");
@@ -7442,6 +7460,7 @@ mod tests {
                     text: "ok".to_string(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -7505,6 +7524,7 @@ mod tests {
                         cached_read_tokens: 0,
                         cached_write_tokens: 0,
                     },
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -10598,6 +10618,7 @@ mod tests {
                         .to_string(),
                         reasoning_content: None,
                         usage: TokenUsage::default(),
+                        codex_reasoning: None,
                     })
                 }
                 .boxed()
@@ -10853,6 +10874,7 @@ mod tests {
                         },
                         reasoning_content: None,
                         usage: TokenUsage::default(),
+                        codex_reasoning: None,
                     })
                 }
                 .boxed()

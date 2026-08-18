@@ -772,6 +772,7 @@ mod tests {
                     text: r#"{"hint":"Consider searching for account."}"#.to_string(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             }
             .boxed()
@@ -805,6 +806,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                codex_reasoning: None,
             }],
             &[],
             &packet,
@@ -845,6 +847,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                codex_reasoning: None,
             }],
             &[],
             &packet,

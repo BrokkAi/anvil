@@ -517,12 +517,19 @@ pub enum LlmResponse {
         text: String,
         reasoning_content: Option<String>,
         usage: TokenUsage,
+        /// Set only by the codex (ChatGPT-auth Responses API) backend, when
+        /// the server returned an encrypted `reasoning` item alongside this
+        /// response (see `ChatMessage::codex_reasoning` for how it is
+        /// carried forward). Every other backend leaves this `None`.
+        codex_reasoning: Option<CodexReasoningItem>,
     },
     ToolCalls {
         text: String,
         reasoning_content: Option<String>,
         calls: Vec<ToolCall>,
         usage: TokenUsage,
+        /// See `LlmResponse::Text::codex_reasoning`.
+        codex_reasoning: Option<CodexReasoningItem>,
     },
 }
 
@@ -570,6 +577,43 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The codex (ChatGPT-auth Responses API) backend's encrypted
+    /// `reasoning` item for the response that produced this assistant
+    /// message, if the backend returned one. Codex-only: only
+    /// `codex_client.rs` reads or writes this field, and it is deliberately
+    /// absent from `ChatMessage`'s hand-written `Serialize` impl below, so
+    /// it cannot leak into a Bedrock or OpenAI-compatible/DeepSeek request
+    /// body (see `codex_reasoning_items_are_invisible_to_bedrock_requests`
+    /// in `bedrock_client.rs`).
+    ///
+    /// Follows the same backend-required-replay pattern as
+    /// `reasoning_content` above (kept because DeepSeek requires it back on
+    /// the wire): codex needs its own encrypted reasoning item echoed back
+    /// so the model resumes its reasoning instead of restarting cold each
+    /// turn. Living on the exact `ChatMessage` it preceded means an edit,
+    /// rewind, or compaction that reconstructs history through the
+    /// constructors below -- none of which set this field -- naturally
+    /// drops it instead of needing special-case handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_reasoning: Option<CodexReasoningItem>,
+}
+
+/// One `reasoning` output item the codex backend returned, captured well
+/// enough to replay it verbatim as the next turn's Responses API input.
+/// `encrypted_content` is the resumable reasoning state itself;
+/// `content` and `summary` are replayed as received (empty in every
+/// response observed against the live backend, since this client's fixed
+/// `include` list never asks for `reasoning.text` or requests summaries)
+/// rather than assumed empty, so an unrequested addition on the backend's
+/// side is preserved instead of silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CodexReasoningItem {
+    pub id: String,
+    pub encrypted_content: Option<String>,
+    #[serde(default)]
+    pub content: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub summary: Vec<serde_json::Value>,
 }
 
 impl Serialize for ChatMessage {
@@ -625,6 +669,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            codex_reasoning: None,
         }
     }
 
@@ -636,6 +681,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            codex_reasoning: None,
         }
     }
 
@@ -647,6 +693,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            codex_reasoning: None,
         }
     }
 
@@ -658,6 +705,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            codex_reasoning: None,
         }
     }
 
@@ -672,6 +720,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content,
+            codex_reasoning: None,
         }
     }
 
@@ -696,6 +745,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             reasoning_content,
+            codex_reasoning: None,
         }
     }
 
@@ -711,6 +761,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
             reasoning_content: None,
+            codex_reasoning: None,
         }
     }
 
@@ -2230,6 +2281,7 @@ where
                                 text: full_text,
                                 reasoning_content,
                                 usage,
+                                codex_reasoning: None,
                             });
                         }
                         if output_budget_exhausted {
@@ -2245,6 +2297,7 @@ where
                                 "chat completions SSE",
                             )?,
                             usage,
+                            codex_reasoning: None,
                         });
                     }
 
@@ -2317,6 +2370,7 @@ where
             text: full_text,
             reasoning_content: (!full_reasoning.is_empty()).then_some(full_reasoning),
             usage,
+            codex_reasoning: None,
         });
     }
 
@@ -2484,6 +2538,7 @@ mod tests {
                         text: String::new(),
                         reasoning_content: None,
                         usage: TokenUsage::default(),
+                        codex_reasoning: None,
                     });
                 }
                 (request.on_token)("ok");
@@ -2491,6 +2546,7 @@ mod tests {
                     text: "ok".to_string(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),
+                    codex_reasoning: None,
                 })
             })
         }
@@ -3669,6 +3725,49 @@ mod tests {
         let message = &body["messages"][0];
         assert_eq!(message["reasoning_content"], "thinking");
         assert_eq!(message["reasoning"], "thinking");
+    }
+
+    /// `codex_reasoning` is codex-only bookkeeping (see its doc comment on
+    /// `ChatMessage`): every OpenAI-compatible/DeepSeek request goes through
+    /// this same hand-written `Serialize` impl and `ChatCompletionRequest`,
+    /// so proving it never appears here is proving it never leaks into any
+    /// of those backends, not just one of them.
+    #[test]
+    fn codex_reasoning_never_serializes_into_a_chat_completions_request() {
+        let mut m = ChatMessage::assistant("answer");
+        m.codex_reasoning = Some(CodexReasoningItem {
+            id: "rs_1".to_string(),
+            encrypted_content: Some("enc_1".to_string()),
+            content: Vec::new(),
+            summary: Vec::new(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert!(
+            v.get("codex_reasoning").is_none(),
+            "ChatMessage's Serialize impl must not emit codex_reasoning: {v}"
+        );
+
+        let body = ChatCompletionRequest {
+            model: "openai-compatible-model".into(),
+            messages: vec![m],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking: None,
+            reasoning_effort: None,
+            response_format: None,
+        };
+        let body: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert!(
+            body["messages"][0].get("codex_reasoning").is_none(),
+            "a codex reasoning item must not reach an OpenAI-compatible/DeepSeek request body: {body}"
+        );
     }
 
     /// `assistant_tool_calls` omits `content` entirely (not `null`),

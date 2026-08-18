@@ -605,6 +605,7 @@ mod tests {
                 text: format!("hello from {}", self.name),
                 reasoning_content: None,
                 usage: crate::llm_client::TokenUsage::default(),
+                codex_reasoning: None,
             };
             async move { Ok(response) }.boxed()
         }

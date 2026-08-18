@@ -581,6 +581,7 @@ where
                 text: full_text,
                 reasoning_content: None,
                 usage,
+                codex_reasoning: None,
             },
             response_id,
         });
@@ -597,6 +598,7 @@ where
                 text: full_text,
                 reasoning_content: None,
                 usage,
+                codex_reasoning: None,
             },
             response_id,
         })
@@ -607,6 +609,7 @@ where
                 reasoning_content: None,
                 calls: tool_calls,
                 usage,
+                codex_reasoning: None,
             },
             response_id,
         })
