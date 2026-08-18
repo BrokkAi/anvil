@@ -10,6 +10,10 @@ use crate::llm_client::{
     ReasoningLevelPreset, StreamChatRequest, TokenSink, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
+use crate::responses_chain::{
+    RESPONSES_CHAIN_CACHE_CAP, ResponsesChainCache, find_responses_continuation,
+    hash_responses_context, looks_like_expired_previous_response_id,
+};
 use crate::trace_logging::append_trace_record;
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -440,7 +444,7 @@ pub struct BedrockClient {
     /// `invoke_responses_model`. Only touched by the Responses API (OpenAI
     /// Bedrock Mantle) path; irrelevant to the native Anthropic/converse
     /// path.
-    responses_chain: Arc<std::sync::Mutex<ResponsesChainCache>>,
+    responses_chain: Arc<std::sync::Mutex<ResponsesChainCache<String>>>,
     discovery_cache: Arc<BedrockDiscoveryCache>,
 }
 
@@ -495,166 +499,6 @@ impl<T: Clone> LastGoodDiscovery<T> {
 struct LastGoodValue<T> {
     value: T,
     updated_at: std::time::Instant,
-}
-
-/// How many message-context -> response_id entries `responses_chain` keeps
-/// before evicting the oldest. Bounds memory for long-lived processes with
-/// many/large conversations without needing a `lru` crate dependency.
-const RESPONSES_CHAIN_CACHE_CAP: usize = 512;
-
-/// Bounded content-keyed cache backing `BedrockClient::responses_chain`.
-/// Plain `HashMap` + FIFO insertion-order eviction -- no promote-on-read --
-/// which is enough to bound memory; see `RESPONSES_CHAIN_CACHE_CAP`.
-#[derive(Debug, Default)]
-struct ResponsesChainCache {
-    entries: HashMap<u64, String>,
-    order: std::collections::VecDeque<u64>,
-    cap: usize,
-}
-
-impl ResponsesChainCache {
-    fn new(cap: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            cap,
-        }
-    }
-
-    fn get(&self, key: u64) -> Option<String> {
-        self.entries.get(&key).cloned()
-    }
-
-    fn insert(&mut self, key: u64, value: String) {
-        if !self.entries.contains_key(&key) {
-            self.order.push_back(key);
-            while self.order.len() > self.cap {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.entries.remove(&oldest);
-                }
-            }
-        }
-        self.entries.insert(key, value);
-    }
-
-    fn evict(&mut self, key: u64) {
-        self.entries.remove(&key);
-        self.order.retain(|k| *k != key);
-    }
-
-    fn evict_context_prefixes(&mut self, messages: &[ChatMessage]) -> usize {
-        let mut evicted = 0;
-        for a in (0..messages.len()).rev() {
-            if messages[a].role != "assistant" {
-                continue;
-            }
-            let key = hash_responses_context(&messages[..a]);
-            if self.entries.contains_key(&key) {
-                self.evict(key);
-                evicted += 1;
-            }
-        }
-        evicted
-    }
-}
-
-/// Hashes an ordered Responses API message context (role + normalized
-/// content + tool-call/tool-result fields, in order) to a stable 64-bit key
-/// for `ResponsesChainCache`. Order-sensitive and content-sensitive: any
-/// difference in message order, text, or tool-call identity/arguments
-/// produces a different hash.
-fn hash_responses_context(messages: &[ChatMessage]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    messages.len().hash(&mut hasher);
-    for msg in messages {
-        hash_responses_message(msg, &mut hasher);
-    }
-    hasher.finish()
-}
-
-fn hash_responses_message(msg: &ChatMessage, hasher: &mut impl std::hash::Hasher) {
-    use std::hash::Hash;
-    msg.role.hash(hasher);
-    for part in &msg.content {
-        match part {
-            ChatContentPart::Text { text } => {
-                0u8.hash(hasher);
-                text.hash(hasher);
-            }
-            ChatContentPart::Image { image_url } => {
-                1u8.hash(hasher);
-                image_url.hash(hasher);
-            }
-        }
-    }
-    match &msg.tool_calls {
-        Some(calls) => {
-            calls.len().hash(hasher);
-            for call in calls {
-                call.id.hash(hasher);
-                call.r#type.hash(hasher);
-                call.function.name.hash(hasher);
-                call.function.arguments.hash(hasher);
-            }
-        }
-        None => 0usize.hash(hasher),
-    }
-    msg.tool_call_id.hash(hasher);
-    msg.name.hash(hasher);
-}
-
-/// Finds the largest cached prefix of `messages` that matches a previously
-/// stored Responses API context, so the delta sent as the next turn's input
-/// is as small as possible.
-///
-/// Walks assistant-message boundary indices from the *end* of `messages`
-/// toward the start. For each assistant index `a`, looks up
-/// `hash(messages[0..a])`: a hit means messages `0..a` were exactly the
-/// input of a previously stored response, and `messages[a]` is that
-/// response's assistant turn now echoed back into history. The first
-/// (largest-`a`) hit wins. Returns `(a, previous_response_id)`; the caller
-/// sends `previous_response_id` plus `messages[a+1..]` as the new input.
-///
-/// Returns `None` on a fresh conversation, an evicted/never-seen prefix, or
-/// a first turn -- callers should fall back to sending the full `messages`
-/// as today.
-fn find_responses_continuation(
-    messages: &[ChatMessage],
-    lookup: impl Fn(u64) -> Option<String>,
-) -> Option<(usize, String)> {
-    for a in (0..messages.len()).rev() {
-        if messages[a].role != "assistant" {
-            continue;
-        }
-        let hash = hash_responses_context(&messages[..a]);
-        if let Some(id) = lookup(hash) {
-            return Some((a, id));
-        }
-    }
-    None
-}
-
-/// Heuristic match for a Responses API error indicating `previous_response_id`
-/// was unknown, expired, or otherwise invalid, so the caller can evict the
-/// cache entry and retry once with the full input. The exact error-body
-/// shape isn't documented; this defensively matches a client-error status
-/// plus the field name and a rejection-ish word in the body rather than a
-/// single exact message.
-fn looks_like_expired_previous_response_id(status: reqwest::StatusCode, body: &str) -> bool {
-    if !status.is_client_error() {
-        return false;
-    }
-    let lower = body.to_ascii_lowercase();
-    (lower.contains("previous_response_id")
-        && (lower.contains("not found")
-            || lower.contains("not exist")
-            || lower.contains("expired")
-            || lower.contains("invalid")
-            || lower.contains("unknown")
-            || lower.contains("no longer")))
-        || lower.contains("not_found_error")
-        || (lower.contains("response") && lower.contains("not found"))
 }
 
 /// Which Anthropic extended-thinking request shape a Bedrock model accepts.

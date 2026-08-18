@@ -39,6 +39,7 @@ mod p2t;
 mod plan;
 mod plugins;
 mod responses_api;
+mod responses_chain;
 mod runtime;
 mod sandbox_backend;
 mod secrets;
