@@ -41,6 +41,10 @@ use crate::llm_client::{
     OutputBudgetExhaustedError, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
     ToolDefinition,
 };
+use crate::responses_chain::{
+    RESPONSES_CHAIN_CACHE_CAP, ResponsesChainCache, find_responses_continuation,
+    hash_responses_context,
+};
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
 };
@@ -65,6 +69,10 @@ const CHATGPT_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 /// matching it is the difference between the request being honored on
 /// the ChatGPT plan and being rejected as an unrecognized client.
 const ORIGINATOR: &str = "codex_cli_rs";
+
+/// `include` entry that makes the backend return reasoning items with their
+/// encrypted payload attached. See `ResponsesRequest::include`.
+const REASONING_ENCRYPTED_CONTENT_INCLUDE: &str = "reasoning.encrypted_content";
 
 // Idle timeout is no longer a const here -- the real value is threaded
 // through `LlmBackend::stream_chat` from the CLI flag
@@ -115,6 +123,56 @@ fn codex_compat_client_version_cache()
     CODEX_COMPAT_CLIENT_VERSION_CACHE.get_or_init(|| StdMutex::new(None))
 }
 
+/// Per-conversation identity the ChatGPT backend uses to route a turn back
+/// to the prompt cache its predecessor warmed.
+///
+/// `LlmBackend::stream_chat` gives this client no session id, so the identity
+/// is minted on a conversation's first turn and then recovered on every later
+/// turn by matching the message prefix (see
+/// `CodexClient::prompt_cache_identity_for`). It is a transport-level routing
+/// hint only -- nothing about the conversation is stored server-side, and the
+/// full input is still sent on every turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexPromptCacheIdentity {
+    session_id: String,
+    thread_id: String,
+}
+
+impl CodexPromptCacheIdentity {
+    fn mint() -> Self {
+        Self {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+/// Who a turn is from and which conversation it continues -- the four headers
+/// the ChatGPT backend attributes and routes on. They always travel together
+/// and `send_responses_request` is the only thing that applies them, so they
+/// are grouped rather than threaded as four parameters. The 401 retry
+/// deliberately rebuilds this with refreshed credentials and the *same*
+/// conversation identity: refreshing a token must not cost the prompt cache.
+struct RequestIdentity<'a> {
+    creds: &'a ChatGptCredentials,
+    conversation: &'a CodexPromptCacheIdentity,
+}
+
+impl RequestIdentity<'_> {
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.creds.access_token),
+            )
+            .header("ChatGPT-Account-ID", &self.creds.account_id)
+            // These two are what actually steer this backend's prompt cache;
+            // see `build_responses_request` for the measurements.
+            .header("session-id", &self.conversation.session_id)
+            .header("thread-id", &self.conversation.thread_id)
+    }
+}
+
 /// LLM backend that proxies to the ChatGPT subscription via the
 /// Responses API. Reads `~/.codex/auth.json` on every request and
 /// transparently refreshes the OAuth tokens when they go stale.
@@ -126,6 +184,20 @@ pub struct CodexClient {
     /// invalidated by the server's rotation policy.
     refresh_lock: Arc<Mutex<()>>,
     discovery_notices: Arc<StdMutex<Vec<ModelDiscoveryNotice>>>,
+    /// Streaming completions endpoint. Always `CHATGPT_RESPONSES_URL` in
+    /// production; tests point it at a local mock server.
+    responses_url: String,
+    /// Content-keyed cache mapping a hash of a message context to the
+    /// `CodexPromptCacheIdentity` that context was last sent under, so the
+    /// next turn on the same conversation repeats that identity and lands on
+    /// the same warm prompt cache. See `prompt_cache_identity_for`.
+    ///
+    /// In-process and process-lifetime, like the Bedrock chain cache: a
+    /// session resumed in a *new* process starts a fresh identity and rewarms
+    /// from cold. That costs one turn's prefix; making it survive would mean
+    /// persisting the identity with the session, which is a session-storage
+    /// decision, not a transport one.
+    prompt_cache_identities: Arc<StdMutex<ResponsesChainCache<CodexPromptCacheIdentity>>>,
 }
 
 impl std::fmt::Debug for CodexClient {
@@ -177,6 +249,30 @@ impl CodexClient {
             http,
             refresh_lock: Arc::new(Mutex::new(())),
             discovery_notices: Arc::new(StdMutex::new(Vec::new())),
+            responses_url: CHATGPT_RESPONSES_URL.to_string(),
+            prompt_cache_identities: Arc::new(StdMutex::new(ResponsesChainCache::new(
+                RESPONSES_CHAIN_CACHE_CAP,
+            ))),
+        }
+    }
+
+    /// Test client pointed at a local mock of the Responses endpoint. Mirrors
+    /// `BedrockClient::with_base_urls`: the rest of the request path -- header
+    /// set, body shape, identity bookkeeping -- is the production one.
+    #[cfg(test)]
+    fn with_responses_url(responses_url: String) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .build()
+                .expect("failed to build test HTTP client"),
+            refresh_lock: Arc::new(Mutex::new(())),
+            discovery_notices: Arc::new(StdMutex::new(Vec::new())),
+            responses_url,
+            prompt_cache_identities: Arc::new(StdMutex::new(ResponsesChainCache::new(
+                RESPONSES_CHAIN_CACHE_CAP,
+            ))),
         }
     }
 
@@ -245,7 +341,46 @@ impl CodexClient {
         ChatGptCredentials::from_auth(&auth)
     }
 
+    /// Recovers the identity this conversation has been using, or mints a new
+    /// one.
+    ///
+    /// The lookup is the shared prefix match in `responses_chain`: it finds
+    /// the largest earlier turn whose message list is a prefix of this turn's
+    /// and reuses the identity that turn was sent under. A conversation whose
+    /// history was edited, compacted, or rewound no longer has a matching
+    /// prefix, so it mints a fresh identity and starts warming a new cache
+    /// rather than pinning the turn to a prefix the server no longer holds.
+    fn prompt_cache_identity_for(&self, messages: &[ChatMessage]) -> CodexPromptCacheIdentity {
+        let cache = self
+            .prompt_cache_identities
+            .lock()
+            .expect("prompt_cache_identities mutex poisoned");
+        find_responses_continuation(messages, |hash| cache.get(hash))
+            .map(|(_boundary, identity)| identity)
+            .unwrap_or_else(CodexPromptCacheIdentity::mint)
+    }
+
+    fn remember_prompt_cache_identity(
+        &self,
+        messages: &[ChatMessage],
+        identity: &CodexPromptCacheIdentity,
+    ) {
+        self.prompt_cache_identities
+            .lock()
+            .expect("prompt_cache_identities mutex poisoned")
+            .insert(hash_responses_context(messages), identity.clone());
+    }
+
     async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
+        let creds = self.load_credentials().await?;
+        self.stream_chat_with_credentials(creds, request).await
+    }
+
+    async fn stream_chat_with_credentials(
+        &self,
+        creds: ChatGptCredentials,
+        request: StreamChatRequest,
+    ) -> Result<LlmResponse> {
         let StreamChatRequest {
             model,
             messages,
@@ -259,7 +394,7 @@ impl CodexClient {
             cancel,
             idle_timeouts,
         } = request;
-        let creds = self.load_credentials().await?;
+        let identity = self.prompt_cache_identity_for(&messages);
         let body = build_responses_request(
             &model,
             &messages,
@@ -267,14 +402,18 @@ impl CodexClient {
             reasoning_effort.as_deref(),
             service_tier.as_deref(),
             structured_output.as_ref(),
+            &identity,
         );
         // Keep the caller's sinks behind a mutex so a retry can build
         // fresh FnMut wrappers without losing the live callbacks.
         let shared_on_token = Arc::new(std::sync::Mutex::new(on_token));
         let shared_on_thought = Arc::new(std::sync::Mutex::new(on_thought));
-        match self
+        let result = match self
             .send_responses_request(
-                &creds,
+                RequestIdentity {
+                    creds: &creds,
+                    conversation: &identity,
+                },
                 &body,
                 shared_sink_forwarder(shared_on_token.clone()),
                 shared_sink_forwarder(shared_on_thought.clone()),
@@ -288,7 +427,10 @@ impl CodexClient {
                 tracing::info!("ChatGPT backend returned 401; refreshing tokens and retrying once");
                 let creds = self.force_refresh().await?;
                 self.send_responses_request(
-                    &creds,
+                    RequestIdentity {
+                        creds: &creds,
+                        conversation: &identity,
+                    },
                     &body,
                     shared_sink_forwarder(shared_on_token),
                     shared_sink_forwarder(shared_on_thought),
@@ -298,12 +440,24 @@ impl CodexClient {
                 .await
             }
             Err(e) => Err(e),
+        };
+
+        // Record the identity only for a turn the server actually answered:
+        // that is the turn whose prefix is now warm, and it is the prefix the
+        // next turn will match against. A failed turn keeps the identity it
+        // was sent under available for the outer retry -- unlike a
+        // `previous_response_id` chain there is no server-side state that a
+        // failure could have invalidated, so the warm prefix from earlier
+        // turns stays the best thing to retry against.
+        if result.is_ok() {
+            self.remember_prompt_cache_identity(&messages, &identity);
         }
+        result
     }
 
     async fn send_responses_request(
         &self,
-        creds: &ChatGptCredentials,
+        identity: RequestIdentity<'_>,
         body: &ResponsesRequest,
         on_token: Box<dyn FnMut(&str) + Send>,
         on_thought: Box<dyn FnMut(&str) + Send>,
@@ -313,13 +467,13 @@ impl CodexClient {
         let resp = crate::http_retry::send_with_retries(
             "posting Responses API request",
             || {
-                self.http
-                    .post(CHATGPT_RESPONSES_URL)
-                    .header("Authorization", format!("Bearer {}", creds.access_token))
-                    .header("ChatGPT-Account-ID", &creds.account_id)
-                    .header("originator", ORIGINATOR)
-                    .header("Accept", "text/event-stream")
-                    .json(body)
+                identity.apply(
+                    self.http
+                        .post(&self.responses_url)
+                        .header("originator", ORIGINATOR)
+                        .header("Accept", "text/event-stream")
+                        .json(body),
+                )
             },
             Some(&cancel),
             Some(idle_timeouts.first_progress),
@@ -916,10 +1070,30 @@ pub(crate) struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) stream: bool,
-    /// Don't ask the server to retain this request; brokk owns its own
-    /// session/turn persistence and we don't want a side-channel copy
-    /// living on OpenAI's storage tied to the user's subscription.
+    /// Always `false`. Brokk owns its own session/turn persistence and we
+    /// don't want a side-channel copy living on OpenAI's storage tied to the
+    /// user's subscription -- and the backend agrees: a request with
+    /// `store: true` is rejected outright with
+    /// `HTTP 400 {"detail":"Store must be set to false"}` (measured against
+    /// `chatgpt.com/backend-api/codex/responses` on 2026-08-18 with
+    /// ChatGPT-plan auth). That rejection is also why this client cannot
+    /// chain turns with `previous_response_id` the way the Bedrock Mantle
+    /// client does: there is no stored response to chain onto. See
+    /// `build_responses_request` for what it does instead.
     pub(crate) store: bool,
+    /// Ask for reasoning items to come back with their encrypted payload.
+    /// Codex CLI sends this on every request and this backend accepts it;
+    /// the item arrives on `response.output_item.done` with a populated
+    /// `encrypted_content`. Anvil does not echo those items back into the
+    /// next turn's input today -- doing so is a message-construction change,
+    /// not a transport one -- but requesting them keeps this client's
+    /// envelope identical to the reference client's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) include: Vec<String>,
+    /// Stable per-conversation prompt-cache routing hint, set to the
+    /// conversation's session id exactly as Codex CLI does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_key: Option<String>,
     /// Optional per-request reasoning-effort override. The agent layer
     /// resolves "no pick" to the active model's `default_reasoning_level`
     /// upstream so the omitted-vs-explicit distinction here directly
@@ -998,13 +1172,29 @@ pub(crate) struct ResponsesToolDef {
 /// later system prompts can extend earlier ones); the rest map 1:1 with
 /// a small splay because each assistant tool-call expands to one
 /// `function_call` item per call.
-pub(crate) fn build_responses_request(
+///
+/// The whole conversation goes out on every turn. This backend refuses
+/// `store: true`, so the server-side `previous_response_id` chaining the
+/// Bedrock Mantle client uses -- send only the delta, let the server hold the
+/// prefix -- is not available here. What is available is the server's own
+/// prompt cache over the resent prefix, and that cache has to be *routed to*:
+/// measured against the live backend on 2026-08-18 with a 3.3k-token prefix
+/// resent over four turns, a conversation carrying stable `session-id` /
+/// `thread-id` headers hit the cache on 6 of 8 continuation turns (2816 of
+/// ~3300 input tokens served from cache), while the same conversation without
+/// them hit on 0 of 8. `prompt_cache_key` alone, with no identity headers,
+/// also hit 0 of 2 -- so the headers are what steers the routing and the key
+/// rides along because it is the documented hint and Codex CLI sends both.
+/// `identity` supplies all three values and stays fixed for the life of a
+/// conversation.
+fn build_responses_request(
     model: &str,
     messages: &[ChatMessage],
     tools: Option<&[ToolDefinition]>,
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output: Option<&StructuredOutputRequest>,
+    identity: &CodexPromptCacheIdentity,
 ) -> ResponsesRequest {
     let mut instructions_parts: Vec<String> = Vec::new();
     let mut input: Vec<ResponsesInputItem> = Vec::new();
@@ -1134,6 +1324,8 @@ pub(crate) fn build_responses_request(
         parallel_tool_calls,
         stream: true,
         store: false,
+        include: vec![REASONING_ENCRYPTED_CONTENT_INCLUDE.to_string()],
+        prompt_cache_key: Some(identity.session_id.clone()),
         reasoning,
         service_tier: service_tier.map(str::to_string),
         text,
@@ -1600,6 +1792,8 @@ mod tests {
     use crate::structured_output::StructuredOutputRequest;
     use futures::StreamExt;
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sink_collecting(
         buf: std::sync::Arc<std::sync::Mutex<String>>,
@@ -1619,6 +1813,16 @@ mod tests {
         })))
     }
 
+    /// Fixed conversation identity for body-shape tests, which care about
+    /// every other field. The identity-lifecycle tests below mint their own
+    /// through the client and read the values back off the wire.
+    fn test_identity() -> CodexPromptCacheIdentity {
+        CodexPromptCacheIdentity {
+            session_id: "session-fixed".to_string(),
+            thread_id: "thread-fixed".to_string(),
+        }
+    }
+
     #[test]
     fn build_request_collapses_system_messages_into_instructions() {
         let messages = vec![
@@ -1626,7 +1830,15 @@ mod tests {
             ChatMessage::system("also be brief"),
             ChatMessage::user("hi"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None, None, None);
+        let req = build_responses_request(
+            "gpt-5-codex",
+            &messages,
+            None,
+            None,
+            None,
+            None,
+            &test_identity(),
+        );
         assert_eq!(
             req.instructions.as_deref(),
             Some("be helpful\n\nalso be brief")
@@ -1669,7 +1881,15 @@ mod tests {
             }]),
             ChatMessage::tool_result("fc_abc", "search", "no results"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None, None, None);
+        let req = build_responses_request(
+            "gpt-5-codex",
+            &messages,
+            None,
+            None,
+            None,
+            None,
+            &test_identity(),
+        );
         assert_eq!(req.input.len(), 3);
         match &req.input[1] {
             ResponsesInputItem::FunctionCall {
@@ -1709,6 +1929,7 @@ mod tests {
             None,
             None,
             None,
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         let tools = serialized.get("tools").unwrap().as_array().unwrap();
@@ -1744,7 +1965,8 @@ mod tests {
             name: None,
             reasoning_content: None,
         }];
-        let req = build_responses_request("gpt-5", &messages, None, None, None, None);
+        let req =
+            build_responses_request("gpt-5", &messages, None, None, None, None, &test_identity());
         assert_eq!(req.input.len(), 1);
         assert!(matches!(
             req.input[0],
@@ -1771,6 +1993,7 @@ mod tests {
             None,
             None,
             Some(&request),
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized["text"]["format"]["type"], "json_schema");
@@ -1793,6 +2016,7 @@ mod tests {
             Some("xhigh"),
             None,
             None,
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -1814,6 +2038,7 @@ mod tests {
             None,
             None,
             None,
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
@@ -1831,6 +2056,7 @@ mod tests {
             None,
             Some("priority"),
             None,
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(serialized.get("service_tier"), Some(&json!("priority")));
@@ -1845,11 +2071,285 @@ mod tests {
             None,
             None,
             None,
+            &test_identity(),
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
             serialized.get("service_tier").is_none(),
             "service_tier must be omitted unless the user selects a tier"
+        );
+    }
+
+    #[test]
+    fn build_request_never_asks_the_server_to_store_or_chain_the_conversation() {
+        // This backend answers `store: true` with
+        // `HTTP 400 {"detail":"Store must be set to false"}`, so the
+        // server-side chaining the Bedrock Mantle client uses is off the
+        // table and brokk keeps owning the conversation. What we do send is
+        // the routing envelope: the conversation's cache key, and the
+        // encrypted-reasoning include.
+        let req = build_responses_request(
+            "gpt-5.6-sol",
+            &[ChatMessage::user("hi")],
+            None,
+            Some("medium"),
+            None,
+            None,
+            &test_identity(),
+        );
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized["store"], json!(false));
+        assert!(
+            serialized.get("previous_response_id").is_none(),
+            "nothing is stored server-side, so there is no response to chain onto: {serialized}"
+        );
+        assert_eq!(serialized["prompt_cache_key"], json!("session-fixed"));
+        assert_eq!(
+            serialized["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        // The whole conversation still goes out every turn -- the fix is
+        // cache routing, not a smaller payload.
+        assert_eq!(serialized["input"].as_array().unwrap().len(), 1);
+    }
+
+    // ---- Prompt-cache identity lifecycle ----
+    //
+    // These drive the real request path (`stream_chat_with_credentials`)
+    // against a local mock of the Responses endpoint and read the identity
+    // back off the wire, because the identity lives half in the body
+    // (`prompt_cache_key`) and half in the headers (`session-id`,
+    // `thread-id`) and all three have to move together.
+
+    fn fake_credentials() -> ChatGptCredentials {
+        ChatGptCredentials {
+            access_token: "test-access-token".to_string(),
+            account_id: "test-account".to_string(),
+        }
+    }
+
+    fn responses_sse(text: &str) -> String {
+        format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_x\"}}}}\n\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_x\"}}}}\n\n",
+        )
+    }
+
+    fn chat_request(messages: Vec<ChatMessage>) -> StreamChatRequest {
+        StreamChatRequest {
+            model: "gpt-5.6-sol".to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: None,
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: CancellationToken::new(),
+            idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+        }
+    }
+
+    /// The three values that have to stay together for a turn to land on the
+    /// prefix its predecessor warmed.
+    #[derive(Debug, PartialEq, Eq)]
+    struct WireIdentity {
+        session_id: String,
+        thread_id: String,
+        prompt_cache_key: String,
+    }
+
+    fn wire_identity(request: &wiremock::Request) -> WireIdentity {
+        let header = |name: &str| {
+            request
+                .headers
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} header must be present"))
+                .to_str()
+                .expect("header is ASCII")
+                .to_string()
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        WireIdentity {
+            session_id: header("session-id"),
+            thread_id: header("thread-id"),
+            prompt_cache_key: body["prompt_cache_key"]
+                .as_str()
+                .expect("prompt_cache_key must be present")
+                .to_string(),
+        }
+    }
+
+    fn input_len(request: &wiremock::Request) -> usize {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        body["input"].as_array().expect("input array").len()
+    }
+
+    async fn mock_responses_server(body: String) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_identity_stays_fixed_across_a_growing_conversation() {
+        let server = mock_responses_server(responses_sse("ok")).await;
+        let client = CodexClient::with_responses_url(format!("{}/responses", server.uri()));
+
+        // Turn 1, then the caller re-sends the whole conversation with the
+        // assistant echo plus a new user turn, twice more -- the stateless
+        // contract `LlmBackend::stream_chat` imposes.
+        let mut messages = vec![ChatMessage::user("q1")];
+        for turn in 1..=3 {
+            client
+                .stream_chat_with_credentials(fake_credentials(), chat_request(messages.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("turn {turn} should succeed: {e:#}"));
+            messages.push(ChatMessage::assistant("ok"));
+            messages.push(ChatMessage::user(format!("q{}", turn + 1)));
+        }
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+        let first = wire_identity(&requests[0]);
+        assert_eq!(
+            first.session_id, first.prompt_cache_key,
+            "the cache key is the session id, as Codex CLI sends it"
+        );
+        for (i, request) in requests.iter().enumerate().skip(1) {
+            assert_eq!(
+                wire_identity(request),
+                first,
+                "turn {} must repeat turn 1's identity so it routes to the warm prefix",
+                i + 1
+            );
+        }
+        // Full resend every turn: 1, then 3, then 5 input items.
+        let lengths: Vec<usize> = requests.iter().map(input_len).collect();
+        assert_eq!(lengths, vec![1, 3, 5]);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_identity_resets_when_history_diverges() {
+        let server = mock_responses_server(responses_sse("ok")).await;
+        let client = CodexClient::with_responses_url(format!("{}/responses", server.uri()));
+
+        let turn1 = vec![ChatMessage::user("q1")];
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn1.clone()))
+            .await
+            .expect("turn 1 should succeed");
+
+        let mut turn2 = turn1.clone();
+        turn2.push(ChatMessage::assistant("ok"));
+        turn2.push(ChatMessage::user("q2"));
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn2.clone()))
+            .await
+            .expect("turn 2 should succeed");
+
+        // The client edits history (a rewind, a compaction, a corrected
+        // prompt): the earlier prefix is no longer a prefix of this turn, so
+        // the server no longer holds it and pinning to the old identity would
+        // aim at a prefix that cannot match.
+        let mut edited = vec![ChatMessage::user("q1 -- corrected")];
+        edited.push(ChatMessage::assistant("ok"));
+        edited.push(ChatMessage::user("q2"));
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(edited))
+            .await
+            .expect("diverged turn should succeed");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+        let established = wire_identity(&requests[0]);
+        assert_eq!(wire_identity(&requests[1]), established);
+        assert_ne!(
+            wire_identity(&requests[2]),
+            established,
+            "edited history must start warming a fresh prefix, not reuse the old identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_identity_survives_a_failed_turn_and_is_reused_on_retry() {
+        // The Bedrock chain evicts its cached prefixes when a chained call
+        // fails, because a failure may mean the stored response is gone. Here
+        // nothing is stored server-side: the identity is ours, it cannot
+        // expire, and the prefix earlier turns warmed is still the best thing
+        // to retry against. So a failed turn must not throw the identity away.
+        struct FailSecondTurn {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl wiremock::Respond for FailSecondTurn {
+            fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+                let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if attempt == 1 {
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n\
+                     data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"overloaded\"}}}\n\n"
+                        .to_string()
+                } else {
+                    responses_sse("ok")
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body)
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(FailSecondTurn {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .mount(&server)
+            .await;
+        let client = CodexClient::with_responses_url(format!("{}/responses", server.uri()));
+
+        let turn1 = vec![ChatMessage::user("q1")];
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn1.clone()))
+            .await
+            .expect("turn 1 should succeed");
+
+        let mut turn2 = turn1.clone();
+        turn2.push(ChatMessage::assistant("ok"));
+        turn2.push(ChatMessage::user("q2"));
+        let err = client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn2.clone()))
+            .await
+            .expect_err("stream-borne response.failed should propagate to the outer retry loop");
+        assert!(
+            format!("{err:#}").contains("server_error: overloaded"),
+            "{err:#}"
+        );
+
+        client
+            .stream_chat_with_credentials(fake_credentials(), chat_request(turn2))
+            .await
+            .expect("the outer retry should succeed");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+        let established = wire_identity(&requests[0]);
+        assert_eq!(wire_identity(&requests[1]), established);
+        assert_eq!(
+            wire_identity(&requests[2]),
+            established,
+            "the retry must reuse the identity whose prefix the server already has warm"
         );
     }
 
