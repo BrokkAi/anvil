@@ -55,7 +55,11 @@ tokio::task_local! {
 /// Run `future` as though `BRK_CIM_EVAL=1` and `BRK_CIM_CONFIG=config_path` were
 /// set, with `config_path` already parsed into `config`. Give each test its own
 /// `config_path` so it claims step zero for itself.
-#[cfg(test)]
+///
+/// Unix-gated with its only consumers: the tool_loop step-zero tests drive a
+/// fake bifrost shell script, so on Windows this helper would compile unused
+/// and fail the deny-warnings build.
+#[cfg(all(test, unix))]
 pub(crate) async fn with_test_eval<F: std::future::Future>(
     config: CimConfig,
     config_path: PathBuf,

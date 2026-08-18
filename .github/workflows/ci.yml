@@ -74,6 +74,25 @@ jobs:
     - name: Check locked dependencies
       run: npm audit --prefix sdk/typescript --audit-level=high
 
+    # The generator wrapper downloads its pinned JAR from Maven Central on
+    # first use, and a single 429 used to fail the job (run 32158378812).
+    # Cache the JAR across runs and retry the one-time download.
+    - name: Cache the openapi-generator JAR
+      uses: actions/cache@v5
+      with:
+        path: sdk/typescript/.openapi-generator-jars
+        key: openapi-generator-${{ hashFiles('sdk/typescript/openapitools.json') }}
+
+    - name: Fetch the openapi-generator JAR with retries
+      run: |
+        for attempt in 1 2 3 4 5; do
+          npm exec -- openapi-generator-cli version-manager set 7.23.0 && exit 0
+          echo "openapi-generator download attempt ${attempt} failed; backing off"
+          sleep $((attempt * 20))
+        done
+        exit 1
+      working-directory: sdk/typescript
+
     - name: Regenerate every SDK from the wire contract
       run: node scripts/generate-sdks.mjs
 

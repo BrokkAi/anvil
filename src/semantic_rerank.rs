@@ -172,7 +172,11 @@ tokio::task_local! {
     static TEST_SATURATION_RETRY_DELAYS: Vec<Duration>;
 }
 
-#[cfg(test)]
+// Unix-gated with its only consumer: the saturation tests drive a fake bifrost
+// shell script, so on Windows this helper would compile unused and fail the
+// deny-warnings build. The task_local above stays test-wide because the
+// production read at `saturation_retry_delays` compiles on every platform.
+#[cfg(all(test, unix))]
 async fn with_test_saturation_delays<F: std::future::Future>(
     delays: Vec<Duration>,
     future: F,
