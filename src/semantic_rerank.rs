@@ -849,7 +849,7 @@ fn prepare_bifrost_args(query: &str, final_k: usize, workspace: Option<&str>) ->
 /// keeps each caller's own concurrency intact -- the server already bounds how
 /// much work it admits, so a client-side limiter would only duplicate a decision
 /// bifrost has already made.
-async fn call_bifrost_tool_with_backpressure(
+pub(crate) async fn call_bifrost_tool_with_backpressure(
     registry: &ToolRegistry,
     tool: &str,
     args: Value,

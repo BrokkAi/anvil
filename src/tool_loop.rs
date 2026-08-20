@@ -3649,7 +3649,7 @@ async fn execute_step_tool_calls(
                     );
                 }
 
-                let exec = if let Some(exec) =
+                let mut exec = if let Some(exec) =
                     run_pre_tool_use_hooks(registry, &tool_name, &parsed_input).await
                 {
                     exec
@@ -3740,6 +3740,31 @@ async fn execute_step_tool_calls(
                     run_post_tool_use_hooks(registry, &tool_name, &parsed_input, &mut exec).await;
                     exec
                 };
+
+                // Answer coverage, both halves. A successful read, search, or
+                // listing adds what it showed the agent to the visited set; a
+                // successful write of the answer artifact ranks that set against
+                // the task and appends what the answer left out. Off entirely
+                // unless `BRK_ANSWER_COVERAGE` is set, and never a rejection:
+                // the write has already succeeded by this point.
+                if !exec.failed {
+                    crate::answer_coverage::record_visited(
+                        registry,
+                        &tool_name,
+                        &parsed_input,
+                        &exec.output,
+                    );
+                    if let Some(addendum) = crate::answer_coverage::addendum_for_write(
+                        registry,
+                        &tool_name,
+                        &parsed_input,
+                        original_user_request,
+                    )
+                    .await
+                    {
+                        exec.output.push_str(&addendum);
+                    }
+                }
 
                 let (phase, status, replay_diff) = if exec.failed {
                     let clean = strip_sandbox_escalation_hint(&exec.output);
@@ -4235,6 +4260,18 @@ async fn execute_parallel_safe_calls(
                 };
                 run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
                     .await;
+                // The read-only half of the answer-coverage check. Only
+                // concurrency-safe tools reach this path, and `write_file` and
+                // `edit` are not among them, so the trigger itself lives on the
+                // sequential path alone.
+                if !exec.failed {
+                    crate::answer_coverage::record_visited(
+                        registry,
+                        &ready.tool_name,
+                        &ready.parsed_input,
+                        &exec.output,
+                    );
+                }
                 (exec, nested_usage, usage_model, nested_usage_by_model)
             };
             (
@@ -11082,5 +11119,457 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    // --- Answer-coverage check ------------------------------------------
+
+    /// A workspace the answer-coverage tests investigate: three source files the
+    /// fake bifrost also ranks (`app/alpha.py`, `app/beta.py`, `app/gamma.py`)
+    /// plus one it never returns, so a test can tell "visited" from "retrieved".
+    #[cfg(unix)]
+    fn coverage_workspace() -> tempfile::TempDir {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        std::fs::create_dir_all(cwd.path().join("app")).expect("app dir");
+        std::fs::create_dir_all(cwd.path().join("docs")).expect("docs dir");
+        for (path, body) in [
+            ("app/alpha.py", "def run(self):\n    return self.value\n"),
+            ("app/beta.py", "def run(self):\n    return self.value\n"),
+            ("app/gamma.py", "def helper(self):\n    return 42\n"),
+            ("docs/notes.md", "unrelated prose\n"),
+        ] {
+            std::fs::write(cwd.path().join(path), body).expect("fixture file");
+        }
+        cwd
+    }
+
+    #[cfg(unix)]
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    /// Run one step of tool calls against `registry` the way a model turn does,
+    /// and return the recorded exchanges.
+    ///
+    /// The session runs in `bypassPermissions` so a write needs no prompt, and
+    /// the backend is never reached: none of these calls is `semantic_search`,
+    /// and the gate auto-allows in this mode.
+    #[cfg(unix)]
+    async fn run_coverage_step(
+        registry: &ToolRegistry,
+        cwd: &Path,
+        calls: &[ToolCall],
+    ) -> Vec<ToolExchange> {
+        struct SilentSink;
+        impl EventSink for SilentSink {
+            fn emit(&self, _session_id: &str, _event: RuntimeEvent) {}
+        }
+        struct UnusedBackend;
+        impl LlmBackend for UnusedBackend {
+            fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+                unimplemented!("the coverage check never lists models")
+            }
+            fn stream_chat(
+                &self,
+                _request: StreamChatRequest,
+            ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+                unimplemented!("the coverage check never calls the model")
+            }
+        }
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(UnusedBackend);
+        let sessions = SessionStore::new("test-model".to_string());
+        let session = sessions.create_session(cwd.to_path_buf()).await;
+        assert!(
+            sessions
+                .set_permission_mode(&session.id, PermissionMode::BypassPermissions)
+                .await
+        );
+        let broker = RecordingPermissionBroker {
+            decision: PermissionDecision::Cancelled,
+            prompt: Arc::new(Mutex::new(None)),
+        };
+        let advertised = HashSet::from([
+            "read_file".to_string(),
+            "grep_search".to_string(),
+            "list_directory".to_string(),
+            "write_file".to_string(),
+            "edit".to_string(),
+        ]);
+        let mut messages = vec![ChatMessage::user("find the run implementations")];
+        let mut tool_exchanges = Vec::new();
+        let mut replay_events = Vec::new();
+        let mut turn_usage = TokenUsage::default();
+        let mut utility_usage_by_model = BTreeMap::new();
+        let mut current_plan = None;
+
+        let outcome = execute_step_tool_calls(
+            &llm,
+            registry,
+            "test-model",
+            None,
+            None,
+            None,
+            "find the run implementations",
+            calls,
+            &advertised,
+            &mut messages,
+            &mut tool_exchanges,
+            &mut replay_events,
+            &mut turn_usage,
+            &mut utility_usage_by_model,
+            &mut current_plan,
+            4,
+            IdleTimeouts::uniform(Duration::from_secs(30)),
+            CancellationToken::new(),
+            &SilentSink,
+            &broker,
+            &session.id,
+            &sessions,
+            NotificationMode::Silent,
+            0,
+            None,
+        )
+        .await;
+        assert!(!outcome.cancelled, "a coverage step must not be cancelled");
+        tool_exchanges
+    }
+
+    /// The investigation half of one session: a search under `app`, a read of a
+    /// file the search did not match, and a listing of an unrelated directory.
+    #[cfg(unix)]
+    fn investigation_calls() -> Vec<ToolCall> {
+        vec![
+            tool_call(
+                "grep-1",
+                "grep_search",
+                serde_json::json!({ "pattern": "def run", "path": "app" }),
+            ),
+            tool_call(
+                "read-1",
+                "read_file",
+                serde_json::json!({ "file_path": "app/gamma.py" }),
+            ),
+            tool_call(
+                "list-1",
+                "list_directory",
+                serde_json::json!({ "path": "docs" }),
+            ),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn coverage_addendum(exchange: &ToolExchange) -> Option<&str> {
+        exchange
+            .result
+            .split_once("\n\nCoverage check: ")
+            .map(|(_, addendum)| addendum)
+    }
+
+    #[cfg(unix)]
+    fn answer_coverage_record(trace: &Path) -> Option<serde_json::Value> {
+        std::fs::read_to_string(trace)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["type"] == "answer_coverage_check")
+    }
+
+    /// Each of the three tools carries its paths somewhere different, and the
+    /// tracker has to read each of them where they actually are: `grep_search`
+    /// prints paths rooted at the search path, `read_file` names its file in the
+    /// arguments, and `list_directory` prints bare entry names that only mean
+    /// something once the directory argument is joined back on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn visited_tracking_accumulates_from_grep_read_and_list_results() {
+        let cwd = coverage_workspace();
+        let mut registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+
+        run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+
+        assert_eq!(
+            registry
+                .answer_coverage()
+                .expect("the check is on")
+                .visited_snapshot(),
+            vec![
+                "alpha.py".to_string(),
+                "app/gamma.py".to_string(),
+                "beta.py".to_string(),
+                "docs/notes.md".to_string(),
+            ],
+            "grep paths stay rooted at the search path; a listing's bare names get their \
+             directory back"
+        );
+    }
+
+    /// The checklist is the intersection of what the retrieval ranked with what
+    /// the agent visited, minus what the answer already names. `docs/notes.md`
+    /// was visited but never ranked, `app/gamma.py` is ranked and visited but
+    /// already answered, and the two that remain arrive in retrieval order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_checklist_is_ranked_visited_files_the_answer_omits() {
+        let cwd = coverage_workspace();
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let mut registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+
+        let exchanges = crate::trace_logging::with_trace_path(&trace, async {
+            run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+            run_coverage_step(
+                &registry,
+                cwd.path(),
+                &[tool_call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({
+                        "file_path": "answer.json",
+                        "content": "{\"files\": [\"app/gamma.py\"]}",
+                    }),
+                )],
+            )
+            .await
+        })
+        .await;
+
+        assert_eq!(exchanges[0].status, ToolExchangeStatus::Completed);
+        assert_eq!(
+            coverage_addendum(&exchanges[0]),
+            Some(
+                "you examined these files and they rank highly against the task, but they are not \
+                 in your answer: app/alpha.py, app/beta.py. Review whether any belong before \
+                 finalizing."
+            ),
+            "{:?}",
+            exchanges[0].result
+        );
+
+        let record = answer_coverage_record(&trace).expect("one answer_coverage_check record");
+        assert_eq!(record["status"], "delivered");
+        assert_eq!(record["query_source"], "user_request");
+        assert_eq!(record["queries"][0], "find the run implementations");
+        assert_eq!(record["visited_count"], 4);
+        assert_eq!(record["checklist"][0], "app/alpha.py");
+        assert_eq!(record["checklist"][1], "app/beta.py");
+        assert_eq!(record["workspaces"][0]["candidate_count"], 3);
+    }
+
+    /// The check fires once per session. A second write of the same artifact --
+    /// the model revising its answer -- gets the plain write result back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_the_first_matching_write_gets_a_coverage_addendum() {
+        let cwd = coverage_workspace();
+        let mut registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+
+        let write = |id: &str, content: &str| {
+            tool_call(
+                id,
+                "write_file",
+                serde_json::json!({ "file_path": "answer.json", "content": content }),
+            )
+        };
+        run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+        let first = run_coverage_step(&registry, cwd.path(), &[write("write-1", "{}")]).await;
+        let second = run_coverage_step(&registry, cwd.path(), &[write("write-2", "{}")]).await;
+        // A write to some other file is not the answer artifact at all.
+        let other = run_coverage_step(
+            &registry,
+            cwd.path(),
+            &[tool_call(
+                "write-3",
+                "write_file",
+                serde_json::json!({ "file_path": "notes.txt", "content": "scratch" }),
+            )],
+        )
+        .await;
+
+        assert!(coverage_addendum(&first[0]).is_some(), "{:?}", first[0]);
+        assert_eq!(coverage_addendum(&second[0]), None, "{:?}", second[0]);
+        assert_eq!(coverage_addendum(&other[0]), None, "{:?}", other[0]);
+        assert!(
+            [&first[0], &second[0], &other[0]]
+                .iter()
+                .all(|exchange| exchange.status == ToolExchangeStatus::Completed),
+            "every write succeeds whatever the check does"
+        );
+    }
+
+    /// A bifrost that refuses every call costs the checklist and nothing else:
+    /// the write still succeeds, its result is untouched, and the trace says the
+    /// check was skipped rather than empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_retrieval_leaves_the_write_untouched() {
+        let cwd = coverage_workspace();
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let mut registry =
+            retrieval_bifrost_registry(cwd.path(), &["backend"], &["fail_workspace=backend"]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+
+        let exchanges = crate::trace_logging::with_trace_path(&trace, async {
+            run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+            run_coverage_step(
+                &registry,
+                cwd.path(),
+                &[tool_call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({ "file_path": "answer.json", "content": "{}" }),
+                )],
+            )
+            .await
+        })
+        .await;
+
+        assert_eq!(exchanges[0].status, ToolExchangeStatus::Completed);
+        assert_eq!(coverage_addendum(&exchanges[0]), None, "{:?}", exchanges[0]);
+        assert!(
+            cwd.path().join("answer.json").exists(),
+            "the write itself is never blocked by the check"
+        );
+
+        let record = answer_coverage_record(&trace).expect("one answer_coverage_check record");
+        assert_eq!(record["status"], "skipped_error");
+        assert!(
+            record["workspaces"][0]["errors"][0]
+                .as_str()
+                .expect("the refusal is recorded")
+                .contains("index is unavailable"),
+            "{record:?}"
+        );
+    }
+
+    /// Without `BRK_ANSWER_COVERAGE` the registry holds no coverage state, so
+    /// nothing is tracked and no write is inspected. This is the pin on "the
+    /// feature changes nothing when it is off".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_check_is_invisible_when_the_environment_does_not_ask_for_it() {
+        let cwd = coverage_workspace();
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
+        assert!(registry.answer_coverage().is_none());
+
+        let exchanges = crate::trace_logging::with_trace_path(&trace, async {
+            run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+            run_coverage_step(
+                &registry,
+                cwd.path(),
+                &[tool_call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({ "file_path": "answer.json", "content": "{}" }),
+                )],
+            )
+            .await
+        })
+        .await;
+
+        assert_eq!(exchanges[0].status, ToolExchangeStatus::Completed);
+        assert_eq!(exchanges[0].result, "Written 2 bytes to 'answer.json'");
+        assert_eq!(answer_coverage_record(&trace), None);
+    }
+
+    /// The per-task CIM query list is reused when one is configured, and reading
+    /// it does not require `BRK_CIM_EVAL`: the arm this check was built for runs
+    /// no step zero at all, so the queries have to be reachable without it.
+    /// `cim::with_test_eval` stands in for the two environment variables so the
+    /// test does not mutate the process environment other tests are reading.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_cim_query_list_is_reused_without_step_zero() {
+        let cwd = coverage_workspace();
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let mut registry = retrieval_bifrost_registry(cwd.path(), &[], &[]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+        let config = crate::cim::CimConfig {
+            query_manifest_sha256: "abc".to_string(),
+            k: 20,
+            queries: vec![
+                "where does run come from".to_string(),
+                "who calls the helper".to_string(),
+            ],
+        };
+
+        crate::cim::with_test_eval(
+            config,
+            cwd.path().join("cim-config.json"),
+            crate::trace_logging::with_trace_path(&trace, async {
+                run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+                run_coverage_step(
+                    &registry,
+                    cwd.path(),
+                    &[tool_call(
+                        "write-1",
+                        "write_file",
+                        serde_json::json!({ "file_path": "answer.json", "content": "{}" }),
+                    )],
+                )
+                .await
+            }),
+        )
+        .await;
+
+        let record = answer_coverage_record(&trace).expect("one answer_coverage_check record");
+        assert_eq!(record["query_source"], "cim_config");
+        assert_eq!(
+            record["queries"],
+            serde_json::json!(["where does run come from", "who calls the helper"])
+        );
+        assert_eq!(record["status"], "delivered");
+    }
+
+    /// Named-workspace mode. Every harness-issued bifrost call must name a
+    /// configured workspace, so the check asks each of them the same queries and
+    /// the trace records what each one contributed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_check_queries_every_configured_workspace() {
+        let cwd = coverage_workspace();
+        let trace = cwd.path().join("anvil-trace.jsonl");
+        let mut registry =
+            retrieval_bifrost_registry(cwd.path(), &["backend", "frontend"], &[]).await;
+        registry.enable_answer_coverage_for_test("answer.json");
+
+        crate::trace_logging::with_trace_path(&trace, async {
+            run_coverage_step(&registry, cwd.path(), &investigation_calls()).await;
+            run_coverage_step(
+                &registry,
+                cwd.path(),
+                &[tool_call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({ "file_path": "answer.json", "content": "{}" }),
+                )],
+            )
+            .await
+        })
+        .await;
+
+        let record = answer_coverage_record(&trace).expect("one answer_coverage_check record");
+        assert_eq!(
+            record["workspaces"]
+                .as_array()
+                .expect("one entry per workspace")
+                .iter()
+                .map(|entry| (
+                    entry["workspace"].as_str().expect("a named workspace"),
+                    entry["candidate_count"].as_u64().expect("a count"),
+                ))
+                .collect::<Vec<(&str, u64)>>(),
+            vec![("backend", 3), ("frontend", 3)],
+        );
+        assert_eq!(record["status"], "delivered");
     }
 }

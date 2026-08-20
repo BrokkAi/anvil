@@ -99,6 +99,26 @@ pub(crate) fn load_config_from_env(
     load_config(&path).map(Some)
 }
 
+/// The configured step-zero queries, for a consumer that is not step zero.
+///
+/// `None` when `BRK_CIM_CONFIG` names no config. Deliberately independent of
+/// `BRK_CIM_EVAL`: the answer-coverage check reuses the same per-task query list
+/// in an arm that runs no forced step at all, so requiring the step-zero switch
+/// would make the query list unreachable exactly where it is wanted.
+pub(crate) fn configured_queries() -> Option<Result<Vec<String>>> {
+    if let Some((config, _)) = test_eval() {
+        return Some(Ok(config.queries));
+    }
+    if std::env::var(CIM_CONFIG_ENV).is_err() {
+        return None;
+    }
+    Some(
+        config_path_from_env()
+            .and_then(|path| load_config(&path))
+            .map(|config| config.queries),
+    )
+}
+
 fn config_path_from_env() -> Result<PathBuf> {
     let path = PathBuf::from(
         std::env::var(CIM_CONFIG_ENV)

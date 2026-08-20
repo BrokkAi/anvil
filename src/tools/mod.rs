@@ -977,6 +977,10 @@ pub struct ToolRegistry {
     /// Guards the one-time semantic index readiness wait; see
     /// `semantic_readiness`.
     semantic_readiness: tokio::sync::OnceCell<()>,
+    /// Visited-file tracking and the one-shot answer-coverage trigger, or `None`
+    /// when `BRK_ANSWER_COVERAGE` is unset. Held here because the registry lives
+    /// exactly as long as the session, which is the scope the check needs.
+    answer_coverage: Option<crate::answer_coverage::AnswerCoverage>,
     lsp: Option<Arc<crate::lsp::LspManager>>,
 }
 
@@ -1166,6 +1170,7 @@ impl ToolRegistry {
             lsp,
             shell_minimizer,
             semantic_readiness: tokio::sync::OnceCell::new(),
+            answer_coverage: crate::answer_coverage::AnswerCoverage::from_env(),
         }
     }
 
@@ -1602,6 +1607,22 @@ impl ToolRegistry {
     /// makes the wait a once-per-session event rather than a per-turn one.
     pub(crate) fn semantic_readiness_once(&self) -> &tokio::sync::OnceCell<()> {
         &self.semantic_readiness
+    }
+
+    /// This session's answer-coverage state, or `None` when the feature is off.
+    /// `None` is the whole of "the environment variable is unset": no visited
+    /// path is recorded and no write is inspected.
+    pub(crate) fn answer_coverage(&self) -> Option<&crate::answer_coverage::AnswerCoverage> {
+        self.answer_coverage.as_ref()
+    }
+
+    /// Turn the answer-coverage check on for a test without touching the process
+    /// environment, which the unit tests share and read in parallel.
+    #[cfg(test)]
+    pub(crate) fn enable_answer_coverage_for_test(&mut self, pattern: &str) {
+        self.answer_coverage = Some(
+            crate::answer_coverage::AnswerCoverage::new(pattern).expect("a usable filename glob"),
+        );
     }
 
     /// Whether a tool's calls may run concurrently with adjacent safe calls.
@@ -2577,6 +2598,7 @@ mod tests {
             lsp: None,
             shell_minimizer: None,
             semantic_readiness: tokio::sync::OnceCell::new(),
+            answer_coverage: None,
         }
     }
 
@@ -2604,6 +2626,7 @@ mod tests {
             lsp: None,
             shell_minimizer: None,
             semantic_readiness: tokio::sync::OnceCell::new(),
+            answer_coverage: None,
         }
     }
 
@@ -2965,6 +2988,7 @@ done
             lsp: None,
             shell_minimizer: None,
             semantic_readiness: tokio::sync::OnceCell::new(),
+            answer_coverage: None,
         };
         let advertised: Vec<String> = registry
             .tool_definitions()

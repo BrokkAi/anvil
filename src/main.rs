@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 mod acp;
 mod agents;
 mod agents_md;
+mod answer_coverage;
 mod bedrock_auth;
 mod bedrock_client;
 mod bedrock_credits;
@@ -127,6 +128,20 @@ struct Args {
     /// session's original working directory must match.
     #[arg(long, value_name = "SESSION_ID", requires = "print")]
     resume: Option<String>,
+
+    /// JSON Schema file for the final --print response. When supplied, the
+    /// final model turn uses strict provider-side structured output and Anvil
+    /// validates the response before returning it.
+    #[arg(long, value_name = "PATH", requires = "print")]
+    response_schema: Option<PathBuf>,
+
+    /// Stable JSON Schema name sent to the provider with --response-schema.
+    #[arg(long, value_name = "NAME", requires = "response_schema")]
+    response_schema_name: Option<String>,
+
+    /// Additional final-response attempts after JSON Schema validation fails.
+    #[arg(long, default_value_t = 1, requires = "response_schema")]
+    response_schema_retries: usize,
 
     /// Override the default model id for new sessions. Accepts a wire
     /// form (`codex::<id>`, `ollama::llama3:latest`) or a bare id
@@ -937,6 +952,18 @@ async fn anvil_main() -> Result<()> {
     // Headless one-shot mode (#356): drive the same agent component with the
     // built-in ACP client instead of serving stdio.
     if let Some(prompt_arg) = args.print {
+        let structured_output = args
+            .response_schema
+            .as_deref()
+            .map(|path| {
+                headless::load_response_schema(
+                    path,
+                    args.response_schema_name
+                        .as_deref()
+                        .unwrap_or("headless_response"),
+                )
+            })
+            .transpose()?;
         return headless::run(
             headless::RunConfig {
                 prompt_arg,
@@ -947,6 +974,8 @@ async fn anvil_main() -> Result<()> {
                 cwd: args.cwd,
                 model: args.model,
                 resume: args.resume,
+                structured_output,
+                structured_output_retries: args.response_schema_retries,
             },
             llm,
             sessions,
