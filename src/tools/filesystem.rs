@@ -9,11 +9,18 @@ pub(super) const WRITE_MAX_BYTES: usize = 1_048_576; // 1 MiB
 pub(super) const LIST_MAX_ENTRIES: usize = 1_000;
 /// Hard cap on individual file size scanned by `search_file_contents`.
 /// Files larger than this are skipped to keep memory bounded on big repos.
-const SEARCH_MAX_FILE_BYTES: u64 = 1_048_576; // 1 MiB
+/// 10 MiB, not 1 MiB: ordinary source files in large repositories exceed
+/// 1 MiB (android's View.java is 1.4 MiB), and the 2026-08-20 eval-trace
+/// audit caught the old cap silently hiding matches in exactly that file.
+/// Whatever the cap, `search_coverage` reports what it excluded.
+const SEARCH_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Total-bytes-scanned budget across the whole walk. Together with
 /// the per-file cap this bounds the worst case the sandbox has to
-/// chew through for a single `grep_search` call.
-const SEARCH_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// chew through for a single `grep_search` call. The same audit caught
+/// the old 256 MiB budget stopping a firefox-tree walk before the
+/// matching file; the budget still exists to bound one call, but its
+/// effect is now disclosed instead of presented as "no matches".
+const SEARCH_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[cfg(test)]
 pub fn read_file(
@@ -1010,18 +1017,187 @@ fn search_file_contents_with_backend(
         }
     };
 
-    format_search_outcome(pattern, max_results, outcome)
+    let coverage = search_coverage(
+        &root,
+        glob_filter,
+        SEARCH_MAX_FILE_BYTES,
+        SEARCH_MAX_TOTAL_BYTES,
+    );
+    format_search_outcome(pattern, max_results, outcome, coverage.as_ref())
+}
+
+/// What the sandbox scanner never looked at, replayed with metadata only.
+///
+/// The scanner (brokk-acp-sandbox 0.1.0) skips files over `max_file_bytes`
+/// with `continue` and stops the whole walk when cumulative candidate size
+/// passes `max_total_bytes`, and its `SearchOutcome` reports neither. A
+/// capped search rendered as a clean "No matches found" tells the agent
+/// the code does not exist when it was never read: the 2026-08-20
+/// eval-trace audit caught two gold files lost exactly this way. This
+/// replay walks the same entries in the same order with the same pruning,
+/// glob, and budget arithmetic (metadata counts toward the budget before
+/// the binary sniff, so a stat-only replay is exact) and returns what was
+/// excluded so the tool result can say so.
+#[derive(Debug)]
+struct SearchCoverage {
+    /// The caps this coverage was computed with, echoed in the note.
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    /// Glob-matching files over the per-file cap, encountered before any
+    /// budget stop: (workspace-relative path, size). Sorted largest first.
+    over_cap: Vec<(String, u64)>,
+    /// First glob-matching file the budget stop prevented scanning.
+    budget_stopped_before: Option<String>,
+    /// Files and bytes (glob-matching) never scanned after the stop.
+    unscanned_files: usize,
+    unscanned_bytes: u64,
+}
+
+impl SearchCoverage {
+    fn complete(&self) -> bool {
+        self.over_cap.is_empty() && self.budget_stopped_before.is_none()
+    }
+
+    fn note(&self) -> Option<String> {
+        if self.complete() {
+            return None;
+        }
+        let mut lines = vec!["warning: this search could not cover everything:".to_string()];
+        if !self.over_cap.is_empty() {
+            let shown: Vec<String> = self
+                .over_cap
+                .iter()
+                .take(3)
+                .map(|(path, bytes)| format!("{} ({:.1} MiB)", path, mib(*bytes)))
+                .collect();
+            lines.push(format!(
+                "  {} file(s) over the {:.0} MiB per-file limit were not searched: {}{}",
+                self.over_cap.len(),
+                mib(self.max_file_bytes),
+                shown.join(", "),
+                if self.over_cap.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                },
+            ));
+        }
+        if let Some(stopped) = &self.budget_stopped_before {
+            lines.push(format!(
+                "  scanning stopped at the {:.0} MiB total budget before '{}'; {} file(s) ({:.1} MiB) were never searched",
+                mib(self.max_total_bytes),
+                stopped,
+                self.unscanned_files,
+                mib(self.unscanned_bytes),
+            ));
+        }
+        lines.push("  narrow search_path or tighten the glob to search the remainder".to_string());
+        Some(lines.join("\n"))
+    }
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn search_coverage(
+    root: &Path,
+    glob: Option<&str>,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Option<SearchCoverage> {
+    // Glob translation copied from brokk-acp-sandbox 0.1.0 `compile_glob`,
+    // because budget accounting happens after the glob filter and the
+    // replay must count the same files the scanner counted.
+    let glob_re = match glob {
+        Some(g) => {
+            let re_str = g
+                .replace('.', "\\.")
+                .replace("**", "<<GLOBSTAR>>")
+                .replace('*', "[^/]*")
+                .replace("<<GLOBSTAR>>", ".*");
+            Some(regex::Regex::new(&format!("{re_str}$")).ok()?)
+        }
+        None => None,
+    };
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let mut coverage = SearchCoverage {
+        max_file_bytes,
+        max_total_bytes,
+        over_cap: Vec::new(),
+        budget_stopped_before: None,
+        unscanned_files: 0,
+        unscanned_bytes: 0,
+    };
+    let mut total: u64 = 0;
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.')
+                && name != "node_modules"
+                && name != "target"
+                && name != "__pycache__"
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(&root_canonical)
+            .or_else(|_| path.strip_prefix(root))
+            .unwrap_or(path);
+        let rel_str = rel.to_string_lossy();
+        if let Some(g) = &glob_re
+            && !g.is_match(&rel_str)
+        {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else { continue };
+        if coverage.budget_stopped_before.is_some() {
+            coverage.unscanned_files += 1;
+            coverage.unscanned_bytes = coverage.unscanned_bytes.saturating_add(md.len());
+            continue;
+        }
+        if md.len() > max_file_bytes {
+            coverage.over_cap.push((rel_str.into_owned(), md.len()));
+            continue;
+        }
+        total = total.saturating_add(md.len());
+        if total > max_total_bytes {
+            coverage.budget_stopped_before = Some(rel_str.into_owned());
+            coverage.unscanned_files = 1;
+            coverage.unscanned_bytes = md.len();
+        }
+    }
+    coverage
+        .over_cap
+        .sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    Some(coverage)
 }
 
 fn format_search_outcome(
     pattern: &str,
     max_results: usize,
     outcome: brokk_acp_sandbox::SearchOutcome,
+    coverage: Option<&SearchCoverage>,
 ) -> ToolResult {
+    let note = coverage.and_then(SearchCoverage::note);
     if outcome.matches.is_empty() {
+        let mut output = format!("No matches found for '{}'", pattern);
+        if let Some(note) = note {
+            output.push('\n');
+            output.push_str(&note);
+        }
         return ToolResult {
             status: ToolStatus::Success,
-            output: format!("No matches found for '{}'", pattern),
+            output,
         };
     }
 
@@ -1032,6 +1208,9 @@ fn format_search_outcome(
         .collect();
     if outcome.truncated {
         lines.push(format!("... truncated at {} results", max_results));
+    }
+    if let Some(note) = note {
+        lines.push(note);
     }
     ToolResult {
         status: ToolStatus::Success,
@@ -1126,7 +1305,21 @@ fn search_single_file_in_wasm(
             m.path = display_path.clone();
         }
     }
-    format_search_outcome(pattern, max_results, outcome)
+    // An explicitly named file over the per-file cap is skipped by the
+    // scanner like any other; a bare "No matches found" for a file the
+    // agent pointed at directly is the worst version of the silence.
+    let coverage = std::fs::metadata(path)
+        .ok()
+        .filter(|md| md.len() > SEARCH_MAX_FILE_BYTES)
+        .map(|md| SearchCoverage {
+            max_file_bytes: SEARCH_MAX_FILE_BYTES,
+            max_total_bytes: SEARCH_MAX_TOTAL_BYTES,
+            over_cap: vec![(display_path.clone(), md.len())],
+            budget_stopped_before: None,
+            unscanned_files: 0,
+            unscanned_bytes: 0,
+        });
+    format_search_outcome(pattern, max_results, outcome, coverage.as_ref())
 }
 
 fn exact_simple_glob_for_file_name(name: &str) -> Option<String> {
@@ -2513,4 +2706,111 @@ mod tests {
     // The binary-sniff test moved to `brokk-acp-sandbox::search` along
     // with `is_binary_file` itself; the host fn is gone and the test
     // would now be redundant with the sandbox unit test.
+    /// A file over the per-file cap that holds the only match must not
+    /// render as a clean "No matches found": the 2026-08-20 eval audit
+    /// caught android's 1.4 MiB View.java lost exactly that way.
+    #[test]
+    fn coverage_names_the_over_cap_file_a_zero_match_search_skipped() {
+        let cwd = fresh_tmp_dir("coverage-overcap");
+        std::fs::write(cwd.join("small.java"), "nothing here\n").unwrap();
+        std::fs::write(cwd.join("View.java"), "void layout(int l, int t) {}\n").unwrap();
+
+        let coverage = search_coverage(&cwd, None, 20, u64::MAX).expect("coverage");
+        assert_eq!(
+            coverage.over_cap.len(),
+            1,
+            "only View.java exceeds 20 bytes? {:?}",
+            coverage.over_cap
+        );
+        assert!(coverage.over_cap[0].0.contains("View.java"));
+        let note = coverage
+            .note()
+            .expect("incomplete search must produce a note");
+        assert!(note.contains("View.java"), "{note}");
+        assert!(note.contains("per-file limit"), "{note}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The total budget stops the walk mid-tree; the note must name where
+    /// scanning stopped and how much was never searched, because the crate's
+    /// own outcome reports neither.
+    #[test]
+    fn coverage_reports_the_budget_stop_and_the_unscanned_remainder() {
+        let cwd = fresh_tmp_dir("coverage-budget");
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(cwd.join(name), vec![b'x'; 100]).unwrap();
+        }
+
+        let coverage = search_coverage(&cwd, None, u64::MAX, 250).expect("coverage");
+        let stopped = coverage
+            .budget_stopped_before
+            .clone()
+            .expect("budget must stop");
+        // Walk order is OS-dependent; the third file in walk order trips the
+        // 250-byte budget and it plus the fourth are unscanned.
+        assert_eq!(coverage.unscanned_files, 2, "{coverage:?}");
+        assert_eq!(coverage.unscanned_bytes, 200);
+        assert!(stopped.ends_with(".txt"));
+        let note = coverage.note().expect("note");
+        assert!(note.contains("total budget"), "{note}");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// A search that covered everything appends nothing.
+    #[test]
+    fn complete_coverage_adds_no_note() {
+        let cwd = fresh_tmp_dir("coverage-complete");
+        std::fs::write(cwd.join("a.txt"), "hay\n").unwrap();
+        let coverage = search_coverage(&cwd, None, u64::MAX, u64::MAX).expect("coverage");
+        assert!(coverage.complete());
+        assert!(coverage.note().is_none());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The glob filter participates in budget accounting exactly as it does
+    /// in the scanner: non-matching files consume no budget.
+    #[test]
+    fn coverage_glob_filter_excludes_files_from_the_budget() {
+        let cwd = fresh_tmp_dir("coverage-glob");
+        std::fs::write(cwd.join("big.log"), vec![b'x'; 1000]).unwrap();
+        std::fs::write(cwd.join("code.rs"), "fn main() {}\n").unwrap();
+
+        let coverage = search_coverage(&cwd, Some("*.rs"), u64::MAX, 500).expect("coverage");
+        assert!(
+            coverage.complete(),
+            "the 1000-byte log is outside the glob: {coverage:?}"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// End to end through format_search_outcome: zero matches plus incomplete
+    /// coverage renders the warning after the no-matches line.
+    #[test]
+    fn zero_match_output_carries_the_incompleteness_warning() {
+        let coverage = SearchCoverage {
+            max_file_bytes: SEARCH_MAX_FILE_BYTES,
+            max_total_bytes: SEARCH_MAX_TOTAL_BYTES,
+            over_cap: vec![("core/View.java".to_string(), 1_403_569)],
+            budget_stopped_before: None,
+            unscanned_files: 0,
+            unscanned_bytes: 0,
+        };
+        let outcome = brokk_acp_sandbox::SearchOutcome {
+            matches: Vec::new(),
+            truncated: false,
+        };
+        let r = format_search_outcome("layout", 100, outcome, Some(&coverage));
+        assert!(matches!(r.status, ToolStatus::Success));
+        assert!(
+            r.output.starts_with("No matches found for 'layout'"),
+            "{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("core/View.java (1.3 MiB)"),
+            "{}",
+            r.output
+        );
+        std::mem::drop(coverage);
+    }
 }
