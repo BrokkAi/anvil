@@ -5106,11 +5106,10 @@ closest advertised tool instead of guessing at names.
 - Prefer a dedicated tool over its shell equivalent whenever one is advertised: file-read \
 tools over cat/head/sed, edit/write tools over sed or heredocs, content search over \
 grep/rg, directory listing over ls.
-- When code-intelligence tools are advertised, choose by question type: prefer semantic_search \
-to locate unfamiliar code from behavior, intent, concept, or symptom; search_symbols for known \
-declarations; get_summaries for known-container orientation; get_symbol_sources for full \
-definitions; and scan_usages_by_reference for callers. Use text search for exact literals, \
-configuration, and docs.
+- When code-intelligence tools are advertised, choose by question type: prefer \
+most_relevant_files for broad relevance, search_symbols for known declarations, get_summaries \
+for known-container orientation, get_symbol_sources for full definitions, and \
+scan_usages_by_reference for callers. Use text search for exact literals, configuration, and docs.
 - Use the shell where CLI semantics matter: builds, tests, git, package managers, pipelines.
 - If a tool call is denied, do not attempt the same action by another route; ask or move on.
 
@@ -11007,11 +11006,8 @@ mod tests {
                 "system prompt for {mode:?} must carry the shared core guidance, got: {prompt}"
             );
             assert!(
-                prompt.contains(
-                    "prefer semantic_search to locate unfamiliar code from behavior, intent, \
-                     concept, or symptom"
-                ),
-                "system prompt for {mode:?} must route behavioral discovery to semantic search, \
+                prompt.contains("prefer most_relevant_files for broad relevance"),
+                "system prompt for {mode:?} must route broad discovery to most_relevant_files, \
                  got: {prompt}"
             );
             assert!(

@@ -1204,10 +1204,10 @@ impl McpClient {
         self.instructions.read().await.clone()
     }
 
+    #[cfg(test)]
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
-        let timeout =
-            crate::cim::mcp_tool_call_timeout().unwrap_or_else(ordinary_mcp_tool_call_timeout);
-        self.call_tool_with_timeout(name, args, timeout, None).await
+        self.call_tool_with_timeout(name, args, ordinary_mcp_tool_call_timeout(), None)
+            .await
     }
 
     pub async fn call_tool_cancellable(
@@ -1216,9 +1216,7 @@ impl McpClient {
         args: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value, McpError> {
-        let timeout =
-            crate::cim::mcp_tool_call_timeout().unwrap_or_else(ordinary_mcp_tool_call_timeout);
-        self.call_tool_with_timeout(name, args, timeout, cancel)
+        self.call_tool_with_timeout(name, args, ordinary_mcp_tool_call_timeout(), cancel)
             .await
     }
 

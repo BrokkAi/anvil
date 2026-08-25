@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(empty.allowed_tools, Some(Vec::new()));
 
         let configured: SetupState = serde_json::from_value(serde_json::json!({
-            "allowed_tools": ["read_file", "semantic_search", "task"]
+            "allowed_tools": ["read_file", "most_relevant_files", "task"]
         }))
         .expect("deserialize allowed_tools");
         assert_eq!(
@@ -343,7 +343,7 @@ mod tests {
             Some(
                 &[
                     "read_file".to_string(),
-                    "semantic_search".to_string(),
+                    "most_relevant_files".to_string(),
                     "task".to_string()
                 ][..]
             )
