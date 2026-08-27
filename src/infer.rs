@@ -1,4 +1,4 @@
-//! One-shot, tool-free structured inference over Anvil's Codex-auth backend.
+//! One-shot, tool-free structured inference over Anvil's hosted backends.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -17,19 +17,21 @@ use crate::llm_client::{
     stream_chat_no_visible_output_with_retry,
 };
 use crate::structured_output::{
-    StructuredOutputRequest, StructuredOutputResult, validate_response,
+    StructuredOutputRequest, StructuredOutputResult, validate_response, validation_retry_prompt,
 };
 
 const CODEX_MODEL_PREFIX: &str = "codex::";
 const KIMI_MODEL_PREFIX: &str = "kimi::";
+const GROK_MODEL_PREFIX: &str = "grok::";
+const DEEPSEEK_MODEL_PREFIX: &str = "deepseek::";
 
 #[derive(Args, Debug)]
 pub(crate) struct InferArgs {
-    /// Codex wire model id. The codex:: prefix is required to prevent provider fallback.
+    /// Provider-qualified wire model id (codex::, kimi::, grok::, or deepseek::).
     #[arg(long)]
     model: String,
 
-    /// Reasoning effort forwarded to the Codex Responses API.
+    /// Reasoning effort forwarded in the selected provider's dialect.
     #[arg(long)]
     reasoning_effort: Option<String>,
 
@@ -44,6 +46,10 @@ pub(crate) struct InferArgs {
     /// Seconds to wait between meaningful response events.
     #[arg(long, default_value_t = crate::llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS)]
     stall_timeout_secs: u64,
+
+    /// Additional attempts after local structured-output validation fails.
+    #[arg(long, default_value_t = 1)]
+    validation_retries: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,28 +99,51 @@ impl From<TokenUsage> for InferUsage {
 
 pub(crate) async fn run(args: &InferArgs) -> Result<()> {
     // Route on the provider prefix so the same tool-free, schema-constrained
-    // path can judge with either the Codex-auth backend or the Kimi Code
-    // backend. The prefix is required in both cases to prevent provider
+    // path can judge with any explicitly supported hosted backend. The
+    // prefix is required in every case to prevent provider
     // fallback picking a different model than the caller pinned.
-    let (backend, wire_model): (Arc<dyn LlmBackend>, String) =
-        if let Some(model) = args.model.strip_prefix(CODEX_MODEL_PREFIX) {
-            if model.trim().is_empty() {
-                bail!("--model must name a model after the codex:: prefix");
-            }
-            (Arc::new(CodexClient::new()), model.to_string())
-        } else if let Some(model) = args.model.strip_prefix(KIMI_MODEL_PREFIX) {
-            if model.trim().is_empty() {
-                bail!("--model must name a model after the kimi:: prefix");
-            }
-            let backend = crate::build_kimi_backend().ok_or_else(|| {
+    let (backend, wire_model): (Arc<dyn LlmBackend>, String) = if let Some(model) =
+        args.model.strip_prefix(CODEX_MODEL_PREFIX)
+    {
+        if model.trim().is_empty() {
+            bail!("--model must name a model after the codex:: prefix");
+        }
+        (Arc::new(CodexClient::new()), model.to_string())
+    } else if let Some(model) = args.model.strip_prefix(KIMI_MODEL_PREFIX) {
+        if model.trim().is_empty() {
+            bail!("--model must name a model after the kimi:: prefix");
+        }
+        let backend = crate::build_kimi_backend().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kimi backend is not configured; set KIMI_API_KEY or sign in with the Kimi CLI"
+            )
+        })?;
+        (backend, model.to_string())
+    } else if let Some(model) = args.model.strip_prefix(GROK_MODEL_PREFIX) {
+        if model.trim().is_empty() {
+            bail!("--model must name a model after the grok:: prefix");
+        }
+        let backend = crate::build_grok_backend().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Grok backend is not configured; install Grok Build and run `grok login --oauth`"
+            )
+        })?;
+        (backend, model.to_string())
+    } else if let Some(model) = args.model.strip_prefix(DEEPSEEK_MODEL_PREFIX) {
+        if model.trim().is_empty() {
+            bail!("--model must name a model after the deepseek:: prefix");
+        }
+        let backend = crate::build_deepseek_backend().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Kimi backend is not configured; set KIMI_API_KEY or sign in with the Kimi CLI"
+                    "DeepSeek backend is not configured; set DEEPSEEK_API_KEY or run `/setup deepseek key <key>`"
                 )
             })?;
-            (backend, model.to_string())
-        } else {
-            bail!("--model must use the codex::<model-id> or kimi::<model-id> wire form");
-        };
+        (backend, model.to_string())
+    } else {
+        bail!(
+            "--model must use a codex::<model-id>, kimi::<model-id>, grok::<model-id>, or deepseek::<model-id> wire form"
+        );
+    };
 
     let mut raw = String::new();
     std::io::stdin()
@@ -122,7 +151,7 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
         .context("reading inference request from stdin")?;
     let input: InferRequest =
         serde_json::from_str(&raw).context("parsing inference request JSON")?;
-    let messages = validate_messages(input.messages)?;
+    let mut messages = validate_messages(input.messages)?;
     if input.schema_name.trim().is_empty() {
         bail!("schema_name must be non-empty");
     }
@@ -138,43 +167,55 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
     };
 
     let cancel = CancellationToken::new();
-    let response = stream_chat_no_visible_output_with_retry(
-        backend.as_ref(),
-        "bare structured inference",
-        &cancel,
-        || StreamChatRequest {
-            model: wire_model.clone(),
-            messages: messages.clone(),
-            tools: None,
-            reasoning_effort: args.reasoning_effort.clone(),
-            service_tier: args.service_tier.clone(),
-            temperature: None,
-            structured_output: Some(structured_output.clone()),
-            on_token: Box::new(|_| {}),
-            on_thought: Box::new(|_| {}),
-            cancel: cancel.clone(),
-            idle_timeouts: IdleTimeouts {
-                first_progress: Duration::from_secs(args.idle_timeout_secs),
-                inter_chunk: Duration::from_secs(args.stall_timeout_secs),
+    let mut total_usage = TokenUsage::default();
+    let mut validation_attempt = 0;
+    let output = loop {
+        let response = stream_chat_no_visible_output_with_retry(
+            backend.as_ref(),
+            "bare structured inference",
+            &cancel,
+            || StreamChatRequest {
+                model: wire_model.clone(),
+                messages: messages.clone(),
+                tools: None,
+                reasoning_effort: args.reasoning_effort.clone(),
+                service_tier: args.service_tier.clone(),
+                temperature: None,
+                structured_output: Some(structured_output.clone()),
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: IdleTimeouts {
+                    first_progress: Duration::from_secs(args.idle_timeout_secs),
+                    inter_chunk: Duration::from_secs(args.stall_timeout_secs),
+                },
             },
-        },
-    )
-    .await
-    .context("running bare structured inference")?;
+        )
+        .await
+        .context("running bare structured inference")?;
 
-    let (text, usage) = match response {
-        LlmResponse::Text { text, usage, .. } => (text, usage),
-        LlmResponse::ToolCalls { .. } => {
-            bail!("Codex returned tool calls even though no tools were supplied")
-        }
-    };
-    let output = match validate_response(&structured_output, &text) {
-        StructuredOutputResult::Success(success) => success.validated_output,
-        StructuredOutputResult::CoercedSuccess(_) => {
-            unreachable!("bare inference disables structured-output coercion")
-        }
-        StructuredOutputResult::ValidationError(error) => {
-            bail!("structured output validation failed: {:?}", error.errors)
+        let (text, usage) = match response {
+            LlmResponse::Text { text, usage, .. } => (text, usage),
+            LlmResponse::ToolCalls { .. } => {
+                bail!("inference backend returned tool calls even though no tools were supplied")
+            }
+        };
+        total_usage.add(usage);
+        match validate_response(&structured_output, &text) {
+            StructuredOutputResult::Success(success) => break success.validated_output,
+            StructuredOutputResult::CoercedSuccess(_) => {
+                unreachable!("bare inference disables structured-output coercion")
+            }
+            StructuredOutputResult::ValidationError(error)
+                if validation_attempt < args.validation_retries =>
+            {
+                validation_attempt += 1;
+                messages.push(ChatMessage::assistant(text));
+                messages.push(ChatMessage::user(validation_retry_prompt(&error)));
+            }
+            StructuredOutputResult::ValidationError(error) => {
+                bail!("structured output validation failed: {:?}", error.errors)
+            }
         }
     };
     let result = InferResponse {
@@ -182,7 +223,7 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
         reasoning_effort: args.reasoning_effort.clone(),
         service_tier: args.service_tier.clone(),
         output,
-        usage: usage.into(),
+        usage: total_usage.into(),
     };
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .context("writing inference response JSON")?;

@@ -19,6 +19,8 @@ mod deepseek_auth;
 mod deepseek_balance;
 mod discovery;
 mod goal;
+mod grok_auth;
+mod grok_client;
 mod headless;
 mod host_notice;
 #[cfg(feature = "http-api")]
@@ -272,7 +274,7 @@ struct Args {
 enum Command {
     /// Install Anvil as an ACP agent in a supported editor.
     Install(installer::InstallArgs),
-    /// Run one tool-free, schema-constrained Codex inference from JSON on stdin.
+    /// Run one tool-free, schema-constrained provider inference from JSON on stdin.
     Infer(infer::InferArgs),
     /// Run Anvil as an HTTP daemon exposing the versioned REST API
     /// (sessions, models, tools, runs) on a loopback listener.
@@ -512,6 +514,16 @@ fn build_kimi_backend() -> Option<Arc<dyn LlmBackend>> {
     )))
 }
 
+fn build_grok_backend() -> Option<Arc<dyn LlmBackend>> {
+    match grok_client::GrokClient::load() {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!("failed to configure Grok OAuth authentication: {error:#}");
+            None
+        }
+    }
+}
+
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks
 /// the OpenAI Chat Completions wire format verbatim, so we reuse
 /// `OpenAiClient` with the OpenRouter base URL and attach the optional
@@ -659,7 +671,7 @@ fn build_bedrock_backend(
 }
 
 /// Build the full model catalog backend set from every configured provider
-/// (Codex, Ollama, hosted DeepSeek, Kimi, OpenRouter, Bedrock, generic
+/// (Codex, Ollama, hosted DeepSeek, Kimi, Grok, OpenRouter, Bedrock, generic
 /// OpenAI-compatible providers, ds4). Shared by the main agent path and the
 /// `models` CLI subcommand so both always see the same set of backends.
 async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>> {
@@ -676,6 +688,7 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
     let codex_backend = build_codex_backend().await;
     let deepseek_backend = build_deepseek_backend();
     let kimi_backend = build_kimi_backend();
+    let grok_backend = build_grok_backend();
     let openai_backend = build_openai_compatible_backend()?;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
@@ -710,6 +723,11 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
                 .unwrap_or_else(|_| "the Kimi Code credential file".to_string())
         );
     }
+    if grok_backend.is_none() {
+        tracing::info!(
+            "Grok backend not available; install Grok Build and run `grok login --oauth`."
+        );
+    }
     if openrouter_backend.is_none() {
         tracing::info!(
             "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
@@ -733,6 +751,7 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
             deepseek_backend,
         ),
         BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
+        BackendRegistration::new(discovery::ModelSource::GROK, "Grok", grok_backend),
         BackendRegistration::new(
             discovery::ModelSource::OPENAI,
             "OpenAI-compatible",

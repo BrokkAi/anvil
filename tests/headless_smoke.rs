@@ -446,6 +446,56 @@ fn print_json_reports_result_and_stop_reason() {
 }
 
 #[test]
+fn print_structured_output_retries_with_validation_feedback() {
+    let env = smoke_env();
+    let provider = start_provider(vec![
+        text_sse_body(r#"{"rank":"six"}"#),
+        text_sse_body(r#"{"rank":6}"#),
+    ]);
+    let schema_path = env._temp.path().join("evaluation.schema.json");
+    std::fs::write(
+        &schema_path,
+        serde_json::json!({
+            "type": "object",
+            "properties": {"rank": {"type": "integer"}},
+            "required": ["rank"],
+            "additionalProperties": false
+        })
+        .to_string(),
+    )
+    .expect("write response schema");
+    let cwd = env.cwd.display().to_string();
+    let schema = schema_path.display().to_string();
+    let output = run_print(
+        &env,
+        &provider,
+        &[
+            "--print",
+            "Evaluate the task.",
+            "--output-format",
+            "json",
+            "--cwd",
+            &cwd,
+            "--response-schema",
+            &schema,
+            "--response-schema-name",
+            "evaluation",
+        ],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "structured-output repair failed;\nstdout:\n{}\nstderr:\n{}",
+        stdout_str(&output),
+        stderr_str(&output)
+    );
+    let payload = parse_json_stdout(&output);
+    assert_eq!(payload["structured_output"], serde_json::json!({"rank": 6}));
+    assert_eq!(payload["result"], r#"{"rank":6}"#);
+    assert_eq!(payload["error"], Value::Null);
+}
+
+#[test]
 fn print_reads_prompt_from_stdin() {
     let env = smoke_env();
     let provider = start_provider(vec![text_sse_body("Read you loud and clear.")]);

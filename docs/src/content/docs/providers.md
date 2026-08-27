@@ -29,7 +29,7 @@ printf '%s' '{"messages":[{"role":"system","content":"Classify the item."},{"rol
   | anvil infer --model codex::gpt-5.5 --reasoning-effort medium
 ```
 
-This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The model prefix selects the backend and is required so no provider fallback can pick a different model: `codex::<model>` drives the Codex-auth backend from `~/.codex/auth.json`, and `kimi::<model>` drives the Kimi Code backend from `KIMI_API_KEY` or the Kimi CLI credentials. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, token `usage`, and effective request settings.
+This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The required model prefix selects the backend so no provider fallback can pick a different model: `codex::<model>`, `kimi::<model>`, `grok::<model>`, or `deepseek::<model>`. The corresponding credentials are the Codex auth file, Kimi Code credentials, Grok Build OAuth credentials, and the DeepSeek API key. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, aggregate token `usage`, and effective request settings. `--validation-retries` controls additional attempts after local JSON Schema validation fails.
 
 ## Local Models
 
@@ -47,6 +47,18 @@ On macOS and Linux, a running `ds4-server` is discovered from its listening port
 DeepSeek uses `DEEPSEEK_API_KEY` or credentials saved through `/setup deepseek`. Models use `deepseek::*` wire IDs.
 
 Kimi Code uses `KIMI_API_KEY` or the OAuth credentials created by `kimi login`. Set `KIMI_CODE_BASE_URL` to override the default coding endpoint. Kimi models use `kimi::*` IDs.
+
+## Grok Build OAuth
+
+Anvil reuses first-party OAuth credentials created by the official Grok Build CLI. It does not use `XAI_API_KEY` and does not implement a separate Grok login flow:
+
+```text
+grok login --oauth
+/setup grok refresh
+/setup grok status
+```
+
+The credential is read from `$GROK_HOME/auth.json`, or `~/.grok/auth.json` when `GROK_HOME` is unset. Anvil refreshes expiring OAuth tokens using the same cross-process lock as the Grok CLI and writes rotated credentials atomically. Grok models use `grok::*` wire IDs and the Responses API.
 
 ## OpenRouter
 
@@ -98,4 +110,4 @@ These profiles use baseline Chat Completions with streaming, tools, usage, and s
 
 Clients that advertise ACP elicitation forms receive out-of-transcript credential fields for OpenRouter, Bedrock, and DeepSeek. In a text-only client, commands such as `/setup openrouter key <key>` remain available but the pasted secret becomes part of the session transcript. Prefer environment variables or elicitation forms for sensitive credentials.
 
-Provider priority for automatic selection is Bedrock, Codex, local models (Ollama then ds4), DeepSeek, Kimi, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.
+Provider priority for automatic selection is Bedrock, Codex, local models (Ollama then ds4), DeepSeek, Kimi, Grok, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.

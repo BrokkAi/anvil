@@ -31,12 +31,17 @@ pub(crate) struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<ResponsesTextConfig>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ReasoningConfig {
-    pub(crate) effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,8 +206,10 @@ pub(crate) fn build_responses_request(
         store,
         previous_response_id: previous_response_id.map(str::to_string),
         reasoning: reasoning_effort.map(|effort| ReasoningConfig {
-            effort: effort.to_string(),
+            effort: Some(effort.to_string()),
+            summary: None,
         }),
+        include: None,
         text,
     }
 }

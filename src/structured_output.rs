@@ -209,6 +209,30 @@ pub fn validate_response(
     }
 }
 
+/// Feedback for one bounded model repair after schema validation fails.
+/// The preceding assistant response remains in history, so this message only
+/// needs to identify the violations and restate the output contract.
+pub fn validation_retry_prompt(error: &StructuredOutputValidationError) -> String {
+    let violations = error
+        .errors
+        .iter()
+        .map(|item| {
+            let location = if item.instance_location.is_empty() {
+                "<root>"
+            } else {
+                item.instance_location.as_str()
+            };
+            format!("- {location}: {}", item.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your previous response failed JSON Schema validation:\n{violations}\n\
+         Return a corrected response matching the requested schema exactly. \
+         Return only the JSON value, with no markdown or explanation."
+    )
+}
+
 pub fn native_response_format(request: &StructuredOutputRequest) -> NativeResponseFormat {
     NativeResponseFormat {
         name: request.schema_name.clone(),

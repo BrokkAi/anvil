@@ -1510,6 +1510,7 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
         ModelSource::DS4,
         ModelSource::DEEPSEEK,
         ModelSource::KIMI,
+        ModelSource::GROK,
         ModelSource::OPENAI,
         ModelSource::OPENROUTER,
     ]
@@ -1550,6 +1551,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
     let local_count =
         source_count(catalog, ModelSource::OLLAMA) + source_count(catalog, ModelSource::DS4);
     let deepseek_count = source_count(catalog, ModelSource::DEEPSEEK);
+    let grok_count = source_count(catalog, ModelSource::GROK);
     let openrouter_count = source_count(catalog, ModelSource::OPENROUTER);
     let bedrock_state = crate::bedrock_auth::CredentialState::snapshot();
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
@@ -1564,6 +1566,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
                     .as_deref()
                     .is_some_and(|key| !key.trim().is_empty())
         });
+    let grok_connected = matches!(crate::grok_client::GrokClient::load(), Ok(Some(_)));
     let choices = SetupHomeRoute::menu()
         .into_iter()
         .map(SetupHomeRoute::markdown_line)
@@ -1584,6 +1587,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - Codex: {codex_status}\n\
          - Local models (Ollama / ds4): {local_status}\n\
          - DeepSeek: {deepseek_status}\n\
+         - Grok: {grok_status}\n\
          - OpenRouter: {openrouter_status}\n\n\
          You can run `/setup` anytime.",
         bedrock_status = if bedrock_count > 0 {
@@ -1611,6 +1615,13 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
             "not connected".to_string()
         } else {
             "connected, no models found yet".to_string()
+        },
+        grok_status = if grok_count > 0 {
+            "ready".to_string()
+        } else if grok_connected {
+            "credential file found, no models found yet".to_string()
+        } else {
+            "not signed in".to_string()
         },
         openrouter_status = if openrouter_count > 0 {
             "ready".to_string()
@@ -7572,6 +7583,8 @@ enum SetupHomeRoute {
     Local,
     /// Hosted DeepSeek key entry (`/setup deepseek`).
     DeepSeek,
+    /// Grok Build OAuth reuse (`/setup grok`).
+    Grok,
     /// Interactive OpenRouter key entry (`/setup openrouter`).
     OpenRouter,
     /// LSP diagnostics preferences and server commands (`/setup lsp`).
@@ -7592,6 +7605,7 @@ impl SetupHomeRoute {
             Self::BedrockCatalog => "bedrock-catalog",
             Self::Local => "local",
             Self::DeepSeek => "deepseek",
+            Self::Grok => "grok",
             Self::OpenRouter => "openrouter",
             Self::Lsp => "lsp",
             Self::Recap => "recap",
@@ -7615,6 +7629,7 @@ impl SetupHomeRoute {
             Self::BedrockCatalog => "Configure Bedrock model catalog",
             Self::Local => "Use local models (Ollama / ds4)",
             Self::DeepSeek => "Use hosted DeepSeek",
+            Self::Grok => "Use Grok Build OAuth",
             Self::OpenRouter => "Use OpenRouter",
             Self::Lsp => "Configure LSP diagnostics",
             Self::Recap => "Configure automatic turn recaps",
@@ -7624,9 +7639,12 @@ impl SetupHomeRoute {
 
     fn scope(self) -> &'static str {
         match self {
-            Self::Codex | Self::Bedrock | Self::Local | Self::DeepSeek | Self::OpenRouter => {
-                "global provider"
-            }
+            Self::Codex
+            | Self::Bedrock
+            | Self::Local
+            | Self::DeepSeek
+            | Self::Grok
+            | Self::OpenRouter => "global provider",
             Self::Choose => "current session",
             Self::Lsp | Self::Recap | Self::BedrockCatalog => "install default",
             Self::Advanced => "all scopes",
@@ -7641,6 +7659,7 @@ impl SetupHomeRoute {
             Self::BedrockCatalog => "/setup bedrock catalog",
             Self::Local => "/setup local",
             Self::DeepSeek => "/setup deepseek",
+            Self::Grok => "/setup grok",
             Self::OpenRouter => "/setup openrouter",
             Self::Lsp => "/setup lsp",
             Self::Recap => "/setup recap",
@@ -7663,7 +7682,7 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 10] {
+    fn menu() -> [Self; 11] {
         [
             Self::Choose,
             Self::Codex,
@@ -7671,6 +7690,7 @@ impl SetupHomeRoute {
             Self::BedrockCatalog,
             Self::Local,
             Self::DeepSeek,
+            Self::Grok,
             Self::OpenRouter,
             Self::Lsp,
             Self::Recap,
@@ -7761,6 +7781,10 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Grok) => {
+            let message = handle_setup_grok(cx, sessions, session_id, llm, refresh_lock, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Lsp) => {
@@ -7924,6 +7948,17 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "deepseek" => {
             handle_setup_deepseek(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
+        }
+        "grok" => {
+            handle_setup_grok(
                 ctx.cx,
                 ctx.sessions,
                 session_id,
@@ -8810,6 +8845,63 @@ fn render_deepseek_setup_help() -> String {
     )
 }
 
+async fn handle_setup_grok(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    let lower = rest.to_ascii_lowercase();
+    match lower.as_str() {
+        "refresh" | "try-again" => {
+            match crate::build_grok_backend() {
+                Some(backend) => llm.install_grok(backend),
+                None => {
+                    llm.uninstall_grok();
+                    return render_grok_setup_help();
+                }
+            }
+            handle_provider_setup_refresh(
+                cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                ModelSource::GROK,
+                "Grok",
+                render_grok_setup_help,
+            )
+            .await
+        }
+        "" | "status" => render_grok_setup_help(),
+        _ => format!(
+            "Unknown Grok setup option `{rest}`.\n\n{}",
+            render_grok_setup_help()
+        ),
+    }
+}
+
+fn render_grok_setup_help() -> String {
+    let status = match crate::grok_client::GrokClient::load() {
+        Ok(Some(_)) => "Anvil found a first-party Grok OAuth credential.",
+        Ok(None) => "Anvil did not find a first-party Grok OAuth credential.",
+        Err(_) => "Anvil could not read the Grok OAuth credential file.",
+    };
+    format!(
+        "Use Grok Build OAuth\n\n\
+         Scope: global provider connection; model selection applies to the current session.\n\n\
+         {status}\n\n\
+         Anvil reuses the official Grok Build CLI credential and does not accept an xAI API key.\n\n\
+         1. Install Grok Build.\n\
+         2. Run `grok login --oauth` in a terminal.\n\
+         3. Run `/setup grok refresh`.\n\n\
+         Status: `/setup grok status`.\n\
+         Choose for me: `/setup choose`."
+    )
+}
+
 async fn handle_setup_openrouter(
     cx: &ConnectionTo<Client>,
     session_id: &str,
@@ -9428,6 +9520,11 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
             "DeepSeek",
             source_model_ids(catalog, ModelSource::DEEPSEEK, 12),
             "No hosted DeepSeek models found. Export DEEPSEEK_API_KEY and refresh.",
+        );
+        write_group(
+            "Grok",
+            source_model_ids(catalog, ModelSource::GROK, 12),
+            "No Grok models found. Run `grok login --oauth`, then `/setup grok refresh`.",
         );
         write_group(
             "OpenRouter",
@@ -13376,6 +13473,7 @@ mod tests {
                 "bedrock-catalog",
                 "local",
                 "deepseek",
+                "grok",
                 "openrouter",
                 "lsp",
                 "recap",
@@ -13424,6 +13522,10 @@ mod tests {
         assert_eq!(
             parse_setup_home_choice(&accept("codex")),
             Some(SetupHomeRoute::Codex)
+        );
+        assert_eq!(
+            parse_setup_home_choice(&accept("grok")),
+            Some(SetupHomeRoute::Grok)
         );
         assert_eq!(
             parse_setup_home_choice(&accept("openrouter")),
@@ -13682,6 +13784,7 @@ mod tests {
         let mut catalog = vec![
             ModelMetadata::id_only("openrouter::demo"),
             ModelMetadata::id_only("deepseek::demo"),
+            ModelMetadata::id_only("grok::demo"),
             ModelMetadata::id_only("ds4::demo"),
             ModelMetadata::id_only("ollama::demo"),
             ModelMetadata::id_only("codex::demo"),
@@ -13693,6 +13796,7 @@ mod tests {
             "ollama",
             "ds4",
             "deepseek",
+            "grok",
             "openrouter",
         ] {
             let selected = preferred_model(&catalog).expect("a provider should remain");

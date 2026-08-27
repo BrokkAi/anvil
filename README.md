@@ -36,7 +36,7 @@ custom TUI  --------------------------------------->  tools + sessions
 ## Why Anvil
 
 - **One engine, many frontends.** Reuse the same execution semantics from a supported editor or any ACP-over-stdio client.
-- **Model routing built in.** Connect Codex/ChatGPT, Bedrock, Ollama, ds4, DeepSeek, Kimi, OpenAI-compatible providers, or OpenRouter.
+- **Model routing built in.** Connect Codex/ChatGPT, Bedrock, Ollama, ds4, DeepSeek, Kimi, Grok, OpenAI-compatible providers, or OpenRouter.
 - **Real agent tooling.** Filesystem and shell tools, managed Bifrost code intelligence, MCP servers, skills, plugins, and subagents.
 - **Explicit safety boundaries.** Clients choose permission behavior while Anvil applies permission gates, workspace path checks, and the configured sandbox strategy.
 - **Persistent work.** Load and resume sessions with durable history, usage reporting, and context compaction.

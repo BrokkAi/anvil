@@ -4,7 +4,7 @@
 //!
 //! Why a separate type? `OpenAiClient` and `CodexClient` already implement
 //! `LlmBackend` for one transport each. Wrapping the configured sources
-//! (Bedrock, Codex, hosted DeepSeek, Kimi, generic OpenAI profiles,
+//! (Bedrock, Codex, hosted DeepSeek, Kimi, Grok, generic OpenAI profiles,
 //! OpenRouter, Ollama) in a single routing backend lets `agent.rs` stay
 //! oblivious to which model it's talking to -- it just hands the wire id
 //! back to the backend the same way it always has, and the backend strips
@@ -190,6 +190,16 @@ impl MultiBackend {
     /// not configured" instead of firing 401-bound requests.
     pub fn uninstall_deepseek(&self) {
         self.uninstall(ModelSource::DEEPSEEK);
+    }
+
+    /// Install or replace the Grok OAuth backend after the external Grok
+    /// CLI credential file changes.
+    pub fn install_grok(&self, backend: Arc<dyn LlmBackend>) {
+        self.install(ModelSource::GROK, backend);
+    }
+
+    pub fn uninstall_grok(&self) {
+        self.uninstall(ModelSource::GROK);
     }
 
     /// Install (or replace) the OpenRouter backend at runtime. Called

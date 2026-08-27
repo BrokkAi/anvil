@@ -26,9 +26,13 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::multi_backend::MultiBackend;
 use crate::session::SessionStore;
+use crate::structured_output::{
+    StructuredOutputRequest, StructuredOutputResult, validation_retry_prompt,
+};
 
 /// Effort suffixes accepted in `--model MODEL[+EFFORT]`. Matches Mjolnir's
 /// list; `none` canonicalizes to `off` (Anvil's spelling for "no provider
@@ -131,6 +135,8 @@ pub struct RunConfig {
     pub cwd: Option<PathBuf>,
     pub model: Option<(String, Option<String>)>,
     pub resume: Option<String>,
+    pub structured_output: Option<StructuredOutputRequest>,
+    pub structured_output_retries: usize,
 }
 
 /// Everything the final payload needs, accumulated across notification
@@ -151,6 +157,7 @@ struct RunState {
     /// `end_turn`, so this is the only reliable failure signal.
     turn_failure: Option<String>,
     error: Option<String>,
+    validated_output: Option<Value>,
 }
 
 /// Newline-delimited records for `--output-format stream-json`. Internally
@@ -212,6 +219,8 @@ enum StreamRecord<'a> {
         stop_reason: &'a str,
         usage: Option<&'a AcpUsage>,
         error: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        structured_output: Option<&'a Value>,
     },
 }
 
@@ -224,6 +233,8 @@ struct JsonResult<'a> {
     stop_reason: &'a str,
     usage: Option<&'a AcpUsage>,
     error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_output: Option<&'a Value>,
 }
 
 const PRIMARY_ACTOR: &str = "primary";
@@ -302,6 +313,64 @@ fn resolve_prompt(prompt_arg: &str) -> Result<String> {
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut prompt)
         .map_err(|err| anyhow!("failed to read prompt from stdin: {err}"))?;
     Ok(prompt)
+}
+
+pub fn load_response_schema(
+    path: &std::path::Path,
+    schema_name: &str,
+) -> Result<StructuredOutputRequest> {
+    let schema_name = schema_name.trim();
+    if schema_name.is_empty()
+        || schema_name.len() > 64
+        || !schema_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        bail!("--response-schema-name must be 1-64 ASCII letters, digits, '_' or '-'");
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| anyhow!("failed to read response schema {}: {err}", path.display()))?;
+    let schema: Value = serde_json::from_str(&raw)
+        .map_err(|err| anyhow!("invalid response schema JSON in {}: {err}", path.display()))?;
+    if !schema.is_object() {
+        bail!(
+            "response schema in {} must be a JSON object",
+            path.display()
+        );
+    }
+    jsonschema::validator_for(&schema)
+        .map_err(|err| anyhow!("invalid response schema in {}: {err}", path.display()))?;
+    Ok(StructuredOutputRequest {
+        schema_name: schema_name.to_string(),
+        schema,
+        allow_coercion: false,
+        prefer_json_object: false,
+    })
+}
+
+fn structured_output_request_meta(request: &StructuredOutputRequest) -> Meta {
+    serde_json::from_value(serde_json::json!({
+        "anvil": {
+            "structuredOutput": {
+                "schemaName": request.schema_name,
+                "schema": request.schema,
+                "allowCoercion": request.allow_coercion,
+            }
+        }
+    }))
+    .expect("structured-output request metadata has a fixed object shape")
+}
+
+fn structured_output_result(meta: Option<&Meta>) -> Result<Option<StructuredOutputResult>> {
+    let Some(payload) = meta
+        .and_then(|meta| meta.get(crate::structured_output::ACP_META_NAMESPACE))
+        .and_then(|namespace| namespace.get("structuredOutput"))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(payload.clone())
+        .map(Some)
+        .map_err(|err| anyhow!("invalid structured-output response metadata: {err}"))
 }
 
 fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
@@ -483,6 +552,8 @@ async fn drive(
     model: Option<(String, Option<String>)>,
     permission_config: &'static str,
     format: OutputFormat,
+    structured_output: Option<StructuredOutputRequest>,
+    structured_output_retries: usize,
 ) -> agent_client_protocol::Result<()> {
     let init = connection
         .send_request(
@@ -577,18 +648,72 @@ async fn drive(
         .lock()
         .expect("headless state lock poisoned")
         .prompt_sent = true;
-    let response = connection
-        .send_request(PromptRequest::new(
+    let mut next_prompt = prompt;
+    let final_attempt = structured_output
+        .as_ref()
+        .map(|_| structured_output_retries)
+        .unwrap_or(0);
+    for attempt in 0..=final_attempt {
+        if attempt > 0 {
+            state
+                .lock()
+                .expect("headless state lock poisoned")
+                .final_text
+                .clear();
+        }
+        let mut request = PromptRequest::new(
             session_id.clone(),
-            vec![ContentBlock::Text(TextContent::new(prompt))],
-        ))
-        .block_task()
-        .await?;
+            vec![ContentBlock::Text(TextContent::new(next_prompt))],
+        );
+        if let Some(structured_output) = structured_output.as_ref() {
+            request = request.meta(structured_output_request_meta(structured_output));
+        }
+        let response = connection.send_request(request).block_task().await?;
 
-    let mut state = state.lock().expect("headless state lock poisoned");
-    state.stop_reason = Some(response.stop_reason);
-    state.usage = response.usage;
-    Ok(())
+        let parsed = structured_output_result(response.meta.as_ref());
+        {
+            let mut state = state.lock().expect("headless state lock poisoned");
+            state.stop_reason = Some(response.stop_reason);
+            state.usage = response.usage;
+        }
+        match parsed {
+            Ok(Some(StructuredOutputResult::Success(success))) => {
+                state
+                    .lock()
+                    .expect("headless state lock poisoned")
+                    .validated_output = Some(success.validated_output);
+                return Ok(());
+            }
+            Ok(Some(StructuredOutputResult::CoercedSuccess(success))) => {
+                state
+                    .lock()
+                    .expect("headless state lock poisoned")
+                    .validated_output = Some(success.validated_output);
+                return Ok(());
+            }
+            Ok(Some(StructuredOutputResult::ValidationError(error))) if attempt < final_attempt => {
+                next_prompt = validation_retry_prompt(&error);
+            }
+            Ok(Some(StructuredOutputResult::ValidationError(error))) => {
+                state.lock().expect("headless state lock poisoned").error = Some(format!(
+                    "structured output validation failed: {:?}",
+                    error.errors
+                ));
+                return Ok(());
+            }
+            Ok(None) if structured_output.is_none() => return Ok(()),
+            Ok(None) => {
+                state.lock().expect("headless state lock poisoned").error =
+                    Some("structured output result missing from response".to_string());
+                return Ok(());
+            }
+            Err(error) => {
+                state.lock().expect("headless state lock poisoned").error = Some(error.to_string());
+                return Ok(());
+            }
+        }
+    }
+    unreachable!("headless structured-output attempts always return or retry")
 }
 
 /// Run one headless prompt against an in-process Anvil agent. Once the run
@@ -631,6 +756,8 @@ pub async fn run(
     let driver_state = state.clone();
     let resume = config.resume.clone();
     let model = config.model.clone();
+    let structured_output = config.structured_output.clone();
+    let structured_output_retries = config.structured_output_retries;
 
     let client = Client
         .builder()
@@ -670,6 +797,8 @@ pub async fn run(
                 model,
                 permission_config,
                 format,
+                structured_output,
+                structured_output_retries,
             )
         });
 
@@ -719,9 +848,17 @@ pub async fn run(
 
     match format {
         OutputFormat::Text => {
-            print!("{}", state.final_text);
-            if !state.final_text.ends_with('\n') {
-                println!();
+            if let Some(output) = state.validated_output.as_ref() {
+                println!(
+                    "{}",
+                    serde_json::to_string(output)
+                        .expect("validated structured output serializes as JSON")
+                );
+            } else {
+                print!("{}", state.final_text);
+                if !state.final_text.ends_with('\n') {
+                    println!();
+                }
             }
         }
         OutputFormat::Json => {
@@ -732,6 +869,7 @@ pub async fn run(
                 stop_reason,
                 usage: state.usage.as_ref(),
                 error: error.as_deref(),
+                structured_output: state.validated_output.as_ref(),
             });
         }
         OutputFormat::StreamJson => {
@@ -745,6 +883,7 @@ pub async fn run(
                 stop_reason,
                 usage: state.usage.as_ref(),
                 error: error.as_deref(),
+                structured_output: state.validated_output.as_ref(),
             });
         }
     }
@@ -894,11 +1033,63 @@ mod tests {
             stop_reason: "end_turn",
             usage: None,
             error: None,
+            structured_output: None,
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
             r#"{"session_id":"s1","resumed":true,"result":"done","stop_reason":"end_turn","usage":null,"error":null}"#
         );
+    }
+
+    #[test]
+    fn response_schema_round_trips_through_prompt_and_result_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evaluation.schema.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"rank": {"type": "integer"}},
+                "required": ["rank"],
+                "additionalProperties": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let request = load_response_schema(&path, "task_evaluation").unwrap();
+        let meta = structured_output_request_meta(&request);
+        let parsed = crate::structured_output::parse_structured_output_request(Some(&meta))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, request);
+
+        let response_meta: Meta = serde_json::from_value(serde_json::json!({
+            "anvil": {
+                "structuredOutput": {
+                    "status": "success",
+                    "schema_name": "task_evaluation",
+                    "validated_output": {"rank": 6},
+                    "coercion_requested": false
+                }
+            }
+        }))
+        .unwrap();
+        let result = structured_output_result(Some(&response_meta)).unwrap();
+        match result {
+            Some(StructuredOutputResult::Success(success)) => {
+                assert_eq!(success.validated_output, serde_json::json!({"rank": 6}));
+            }
+            other => panic!("unexpected structured output result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_schema_rejects_invalid_schema_before_starting_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.json");
+        std::fs::write(&path, r#"{"type":"definitely-not-a-json-schema-type"}"#).unwrap();
+        assert!(load_response_schema(&path, "evaluation").is_err());
+        assert!(load_response_schema(&path, "not a valid provider name").is_err());
     }
 
     #[test]
