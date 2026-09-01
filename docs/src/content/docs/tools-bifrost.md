@@ -26,14 +26,15 @@ Anvil preconfigures an enabled local Bifrost MCP server:
 
 On first use, Anvil downloads the pinned release for the current platform, verifies its checksum, and caches it under the Anvil configuration directory. Network failure prevents that cold start; later sessions reuse the cached binary.
 
-The managed toolset includes code-intelligence operations such as:
+The managed `core` toolset includes:
 
 - `search_symbols` for declarations;
 - `get_symbol_sources` for exact implementation blocks;
 - `get_summaries` for API shape and orientation;
 - `scan_usages_by_reference` or its compatible usage form for references and callers;
-- `most_relevant_files` for repository relationships; and
-- bounded filename and file-list discovery.
+- `get_definitions_by_reference`, `rename_symbol`, and `usage_graph` for reference-based analysis;
+- `refresh`, `activate_workspace`, and `get_active_workspace` for workspace state; and
+- `analyze_diff`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, and `score_diff` for revision analysis.
 
 Tool names can evolve with the pinned Bifrost release. Use the advertised session catalog rather than assuming a tool exists from an older screenshot.
 
