@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.21";
+const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.10.8";
 
 struct SmokeCase {
     name: &'static str,
@@ -3283,7 +3283,7 @@ fn bifrost_target_triple_for_smoke() -> &'static str {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "x86_64-unknown-linux-musl"
+        "x86_64-unknown-linux-gnu"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {

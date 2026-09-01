@@ -631,6 +631,36 @@ const TOOLS: &[ToolMeta] = &[
         concurrency_safe: true,
     },
     ToolMeta {
+        name: "analyze_diff",
+        kind: ToolKind::Read,
+        display_name: "Analyzing diff",
+        concurrency_safe: true,
+    },
+    ToolMeta {
+        name: "blast_radius",
+        kind: ToolKind::Read,
+        display_name: "Analyzing blast radius",
+        concurrency_safe: true,
+    },
+    ToolMeta {
+        name: "cyclomatic_complexity",
+        kind: ToolKind::Read,
+        display_name: "Computing diff complexity",
+        concurrency_safe: true,
+    },
+    ToolMeta {
+        name: "missing_tests",
+        kind: ToolKind::Read,
+        display_name: "Finding missing tests",
+        concurrency_safe: true,
+    },
+    ToolMeta {
+        name: "score_diff",
+        kind: ToolKind::Read,
+        display_name: "Scoring diff",
+        concurrency_safe: true,
+    },
+    ToolMeta {
         name: "jq",
         kind: ToolKind::Search,
         display_name: "Querying JSON",
