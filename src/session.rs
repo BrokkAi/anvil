@@ -373,7 +373,9 @@ pub(crate) fn acp_mcp_servers_to_configs(
                             value: var.value,
                         })
                         .collect(),
-                    framing: McpFraming::ContentLength,
+                    // MCP stdio messages are newline-delimited, and ACP does
+                    // not expose a framing override for lifecycle servers.
+                    framing: McpFraming::Line,
                     enabled: true,
                 });
             }
@@ -8477,7 +8479,7 @@ done
                     name: "TOKEN".to_string(),
                     value: "secret".to_string(),
                 }],
-                framing: crate::mcp::McpFraming::ContentLength,
+                framing: crate::mcp::McpFraming::Line,
                 enabled: true,
             }]
         );
