@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil-minimizer"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "brush-parser",
  "parking_lot",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil-sdk"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "reqwest",
  "serde",

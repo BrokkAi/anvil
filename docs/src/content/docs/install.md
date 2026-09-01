@@ -24,7 +24,7 @@ version-and-platform-specific cache. Later invocations work from that cache.
 Pin, upgrade, verify, and uninstall with:
 
 ```bash
-uv tool install 'brokk-anvil==0.25.0'  # exact release
+uv tool install 'brokk-anvil==0.26.0'  # exact release
 uv tool upgrade brokk-anvil           # upgrade package and native release
 anvil --version                       # verify the selected native version
 uv tool uninstall brokk-anvil

@@ -1,6 +1,6 @@
 {
   "name": "@brokkai/anvil-sdk",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "Official TypeScript SDK for the Anvil Agent HTTP API",
   "type": "module",
   "license": "LGPL-3.0-only",

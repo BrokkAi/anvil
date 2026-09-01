@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0-only"
@@ -36,7 +36,7 @@ axum = { version = "0.8", optional = true }
 # crate is namespaced. The minimizer is versioned in lockstep with this crate:
 # bump this requirement, the minimizer's version, and the root version
 # together on every release (CI enforces the match).
-anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.25.0", path = "crates/anvil-minimizer" }
+anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.26.0", path = "crates/anvil-minimizer" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
