@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.8.21";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.10.8";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 /// Budget for setup RPCs: the initialize handshake, `tools/list`, and SSE
 /// endpoint discovery. These are expected to be fast; a long stall here
@@ -61,7 +61,7 @@ fn parse_mcp_tool_call_timeout(raw: &str) -> Option<Duration> {
 #[cfg(target_os = "macos")]
 const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const BIFROST_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
+const BIFROST_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const BIFROST_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

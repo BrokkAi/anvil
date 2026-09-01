@@ -26,6 +26,11 @@ tools:
   - search_git_commit_messages
   - get_git_log
   - get_commit_diff
+  - analyze_diff
+  - blast_radius
+  - cyclomatic_complexity
+  - missing_tests
+  - score_diff
   - analyze_git_hotspots
   - usage_graph
   - compute_cyclomatic_complexity
