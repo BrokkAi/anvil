@@ -815,6 +815,61 @@ fn permission_grant_for_selection(
 /// into each streaming turn's `Box<dyn FnMut>` without being consumed.
 pub type TextSink = Arc<Mutex<dyn FnMut(&str) + Send>>;
 
+/// Batching wrapper for high-frequency streaming deltas (reasoning
+/// streams). Providers emit arbitrarily small fragments, and forwarding
+/// each one as its own session update makes clients render the thought as
+/// dozens of separate one-word blocks. The sink buffers deltas; a flusher
+/// task drains the buffer on a fixed interval and emits each batch as a
+/// single update.
+pub(crate) struct CoalescingSink {
+    buffer: Arc<Mutex<String>>,
+    flusher: tokio::task::JoinHandle<()>,
+}
+
+impl CoalescingSink {
+    /// Start a coalescing [`TextSink`] whose flusher sends drained batches
+    /// through `send` every `interval`.
+    pub(crate) fn start(
+        interval: std::time::Duration,
+        send: impl Fn(String) + Send + 'static,
+    ) -> (TextSink, Self) {
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let sink_buffer = buffer.clone();
+        let sink: TextSink = Arc::new(Mutex::new(move |token: &str| {
+            if let Ok(mut pending) = sink_buffer.lock() {
+                pending.push_str(token);
+            }
+        }));
+        let flusher_buffer = buffer.clone();
+        let flusher = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                let batch = drain(&flusher_buffer);
+                if !batch.is_empty() {
+                    send(batch);
+                }
+            }
+        });
+        (sink, Self { buffer, flusher })
+    }
+
+    /// Abort the flusher and drain whatever the sink had buffered. A
+    /// reasoning burst can end between flushes; without this drain the
+    /// tail of the thought would be silently dropped.
+    pub(crate) fn stop(self) -> String {
+        self.flusher.abort();
+        drain(&self.buffer)
+    }
+}
+
+fn drain(buffer: &Arc<Mutex<String>>) -> String {
+    match buffer.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(_) => String::new(),
+    }
+}
+
 /// Whether `run()` emits per-tool `SessionUpdate` notifications to the
 /// ACP client.
 ///
@@ -6345,6 +6400,50 @@ fn parallel_batch_len(
 
 #[cfg(test)]
 mod tests {
+    use super::TextSink;
+    use tokio::sync::mpsc;
+
+    fn push(sink: &TextSink, token: &str) {
+        if let Ok(mut emit) = sink.lock() {
+            emit(token);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_sink_batches_fragments_into_fewer_calls() {
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<String>();
+        let send = move |batch: String| {
+            let _ = updates_tx.send(batch);
+        };
+        let (sink, coalescer) =
+            super::CoalescingSink::start(std::time::Duration::from_millis(50), send);
+        // Simulate fragment-scale reasoning deltas like the Codex
+        // raw-reasoning stream.
+        for token in ["Playback", ":", " audio"] {
+            push(&sink, token);
+        }
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        let first = updates_rx.recv().await.expect("flusher emits one batch");
+        assert_eq!(first, "Playback: audio");
+        assert!(updates_rx.is_empty(), "one interval, one update");
+        let leftover = coalescer.stop();
+        assert!(leftover.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_sink_stop_drains_unflushed_remainder() {
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel::<String>();
+        let send = move |batch: String| {
+            let _ = updates_tx.send(batch);
+        };
+        let (sink, coalescer) =
+            super::CoalescingSink::start(std::time::Duration::from_millis(50), send);
+        push(&sink, "tail");
+        tokio::time::advance(std::time::Duration::from_millis(25)).await;
+        assert!(updates_rx.is_empty(), "nothing flushed yet");
+        let leftover = coalescer.stop();
+        assert_eq!(leftover, "tail");
+    }
     use super::*;
 
     #[test]
