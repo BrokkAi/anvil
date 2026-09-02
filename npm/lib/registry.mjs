@@ -5,7 +5,7 @@
 // the CDN edge in front of it) answering with pre-publish data for up to five
 // minutes afterwards. A freshly published version therefore looks like an E404
 // long after the publish itself succeeded — the failure mode that made a
-// completed 0.25.0 SDK publication report as a failed job.
+// completed 0.25.0 publication report as a failed job.
 //
 // Two things keep that from happening: `--prefer-online` forces npm to
 // revalidate instead of trusting its local copy, and the wait window is longer

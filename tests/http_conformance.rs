@@ -587,14 +587,7 @@ impl Harness {
 
 #[test]
 fn daemon_conforms_to_checked_in_contract() {
-    let typescript_sdk_conformance = std::env::var_os("ANVIL_TS_SDK_CONFORMANCE").is_some();
-    let all_sdk_conformance = std::env::var_os("ANVIL_ALL_SDK_CONFORMANCE").is_some();
     let mut script = Vec::new();
-    let sdk_runs = usize::from(typescript_sdk_conformance || all_sdk_conformance)
-        + if all_sdk_conformance { 2 } else { 0 };
-    for _ in 0..sdk_runs {
-        script.push(sse_text("SDK conformance complete", None));
-    }
     script.extend([
         // Run A (acceptEdits session): plan, write-with-diff, execution
         // failure, malformed arguments, then a final reasoning + text turn.
@@ -644,41 +637,6 @@ fn daemon_conforms_to_checked_in_contract() {
     };
     let contract = &harness.contract;
     let base = &harness.base;
-
-    if typescript_sdk_conformance || all_sdk_conformance {
-        let workspace = tempfile::tempdir().expect("TypeScript SDK workspace");
-        let status = Command::new("node")
-            .arg("sdk/typescript/tests/conformance.mjs")
-            .arg(base)
-            .arg(workspace.path())
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .expect("run TypeScript SDK conformance client");
-        assert!(status.success(), "TypeScript SDK conformance failed");
-    }
-    if all_sdk_conformance {
-        let workspace = tempfile::tempdir().expect("Rust SDK workspace");
-        let rust_sdk_client = std::env::var_os("ANVIL_RUST_SDK_CONFORMANCE_BIN")
-            .expect("ANVIL_RUST_SDK_CONFORMANCE_BIN is required for all-SDK conformance");
-        let status = Command::new(rust_sdk_client)
-            .arg(base)
-            .arg(workspace.path())
-            .status()
-            .expect("run Rust SDK conformance client");
-        assert!(status.success(), "Rust SDK conformance failed");
-
-        let workspace = tempfile::tempdir().expect("Python SDK workspace");
-        let python =
-            std::env::var_os("ANVIL_PYTHON").unwrap_or_else(|| std::ffi::OsString::from("python3"));
-        let status = Command::new(python)
-            .arg("tests/sdk_conformance/python.py")
-            .arg(base)
-            .arg(workspace.path())
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .expect("run Python SDK conformance client");
-        assert!(status.success(), "Python SDK conformance failed");
-    }
 
     // Server + catalog endpoints.
     get_json(contract, base, "/health", "/health");

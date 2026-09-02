@@ -48,6 +48,3 @@ __pycache__/
 
 # PyPI packaging build output
 /python/dist/
-
-# Derived contract consumed by SDK generators
-/sdk/.generated/

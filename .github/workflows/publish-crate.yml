@@ -36,25 +36,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
           targets: wasm32-wasip2
-
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
-
-      - name: Regenerate every SDK from the wire contract
-        run: |
-          npm ci --prefix sdk/typescript
-          node scripts/generate-sdks.mjs
-          git diff --exit-code -- sdk/typescript/src/generated sdk/rust sdk/python
 
       - name: Cache cargo registry and build
         uses: actions/cache@v5
@@ -90,16 +72,12 @@ jobs:
           set -euo pipefail
           ROOT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           MINI=$(grep -m1 '^version = ' crates/anvil-minimizer/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          SDK=$(grep -m1 '^version = ' sdk/rust/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           REQ=$(grep -m1 '^anvil-minimizer = ' Cargo.toml | sed -E 's/.*version = "([^"]*)".*/\1/')
-          if [ "$ROOT" != "$MINI" ] || [ "$ROOT" != "$SDK" ] || [ "$ROOT" != "$REQ" ]; then
-            echo "::error::Version lockstep violated: brokk-anvil=$ROOT, brokk-anvil-minimizer=$MINI, brokk-anvil-sdk=$SDK, dependency requirement=$REQ."
+          if [ "$ROOT" != "$MINI" ] || [ "$ROOT" != "$REQ" ]; then
+            echo "::error::Version lockstep violated: brokk-anvil=$ROOT, brokk-anvil-minimizer=$MINI, dependency requirement=$REQ."
             exit 1
           fi
-          echo "Workspace and generated SDK versions in lockstep: $ROOT"
-
-      - name: Verify generated Rust SDK package
-        run: cargo publish --dry-run -p brokk-anvil-sdk --locked
+          echo "Workspace versions in lockstep: $ROOT"
 
       - name: Verify minimizer package
         run: cargo publish --dry-run -p brokk-anvil-minimizer --locked
@@ -148,6 +126,5 @@ jobs:
               cargo publish -p "$crate" --locked
             fi
           }
-          publish_if_missing brokk-anvil-sdk sdk/rust/Cargo.toml
           publish_if_missing brokk-anvil-minimizer crates/anvil-minimizer/Cargo.toml
           publish_if_missing brokk-anvil Cargo.toml
