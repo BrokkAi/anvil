@@ -403,7 +403,7 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
 
     // A single client with an explicit timeout shared across both requests so a
     // slow or dropped CDN connection does not stall startup indefinitely.
-    let client = crate::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
+    let client = anvil_llm::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)),
         &url,
     )
@@ -1535,7 +1535,7 @@ fn build_http_headers(headers: &[McpEnvVar]) -> Result<reqwest::header::HeaderMa
 }
 
 fn build_mcp_http_client(url: &str) -> Result<reqwest::Client, McpError> {
-    crate::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
+    anvil_llm::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
         url,
     )

@@ -56,7 +56,7 @@ struct RawOpenAiProviderProfile {
 }
 
 pub fn path() -> Result<PathBuf> {
-    Ok(crate::setup_state::config_home()?.join(PROVIDERS_FILE_NAME))
+    Ok(crate::secrets::config_home()?.join(PROVIDERS_FILE_NAME))
 }
 
 pub fn read() -> Result<OpenAiProviderConfig> {
@@ -302,7 +302,7 @@ impl LlmBackend for OpenAiProvidersBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup_state::TestConfigHomeScope;
+    use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
     use futures::FutureExt;
     use std::process::Command;
     use std::sync::Mutex;
@@ -373,8 +373,9 @@ mod tests {
 
     #[test]
     fn missing_file_is_empty_config() {
+        let _lock = ENV_GUARD.blocking_lock();
         let dir = tempfile::tempdir().expect("config dir");
-        let _scope = TestConfigHomeScope::set(dir.path().to_path_buf());
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", dir.path());
 
         let config = read().expect("missing providers.json is ok");
 

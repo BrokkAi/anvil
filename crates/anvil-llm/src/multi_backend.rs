@@ -86,7 +86,7 @@ pub struct MultiBackend {
 }
 
 impl MultiBackend {
-    pub(crate) fn validate_explicit_model_route(&self, wire_model: &str) -> Result<()> {
+    pub fn validate_explicit_model_route(&self, wire_model: &str) -> Result<()> {
         if split_wire_id(wire_model).is_none() {
             anyhow::bail!(
                 "utility model {wire_model:?} must be provider-qualified as <source>::<id>"

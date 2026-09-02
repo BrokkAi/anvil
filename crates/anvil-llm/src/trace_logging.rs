@@ -17,7 +17,7 @@ tokio::task_local! {
 /// The one `tool_timing` shape every model-visible tool call must leave behind.
 /// Trace consumers count calls per tool by `tool` and sum `duration_ms`, so a
 /// dispatch path that skips this record makes its tool look unused.
-pub(crate) fn tool_timing_record(
+pub fn tool_timing_record(
     tool_name: &str,
     shell_command: Option<&str>,
     duration: Duration,
@@ -39,8 +39,8 @@ pub(crate) fn tool_timing_record(
 
 /// Route the records written by `future` to `path` for this task only, so a
 /// test can read them back without setting the process-global trace env var.
-#[cfg(test)]
-pub(crate) async fn with_trace_path<F: std::future::Future>(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn with_trace_path<F: std::future::Future>(
     path: &std::path::Path,
     future: F,
 ) -> F::Output {

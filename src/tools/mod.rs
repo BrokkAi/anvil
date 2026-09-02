@@ -4,10 +4,10 @@ mod shell;
 mod web_search;
 
 use crate::agents::AgentRegistry;
-use crate::llm_client::{FunctionDef, ToolDefinition};
 use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
+use anvil_llm::llm_client::{FunctionDef, ToolDefinition};
 use sandbox::SandboxPolicy;
 use serde::de;
 use serde::de::DeserializeOwned;

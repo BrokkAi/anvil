@@ -62,16 +62,27 @@ pub struct SetupSecrets {
     pub bedrock: Option<BedrockAuth>,
 }
 
+/// Resolve the Brokk config home directory: `$BROKK_CONFIG_HOME` when that
+/// override is set (so tests and power users can redirect every config file
+/// without touching the real one), otherwise `<os-config>/brokk`
+/// (`~/.config/brokk` on Linux, `~/Library/Application Support/brokk` on
+/// macOS, `%APPDATA%\brokk` on Windows).
+pub fn config_home() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("BROKK_CONFIG_HOME")
+        && !custom.trim().is_empty()
+    {
+        return Ok(PathBuf::from(custom));
+    }
+    let base = dirs::config_dir()
+        .ok_or_else(|| anyhow!("could not resolve OS config directory for setup secrets"))?;
+    Ok(base.join("brokk"))
+}
+
 /// Resolve `<config>/brokk/secrets.json`. Honours `$BROKK_CONFIG_HOME`
 /// if set so tests (and power users) can redirect the credential file
 /// without touching the real one.
 pub fn secrets_path() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("BROKK_CONFIG_HOME") {
-        return Ok(PathBuf::from(custom).join("secrets.json"));
-    }
-    let base = dirs::config_dir()
-        .ok_or_else(|| anyhow!("could not resolve OS config directory for setup secrets"))?;
-    Ok(base.join("brokk").join("secrets.json"))
+    Ok(config_home()?.join("secrets.json"))
 }
 
 pub fn read() -> Result<Option<SetupSecrets>> {

@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::discovery::{ModelSource, split_wire_id};
+use anvil_llm::discovery::{ModelSource, split_wire_id};
 
 pub(crate) fn usage_by_model_meta(
-    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
+    usage_by_model: &BTreeMap<String, anvil_llm::llm_client::TokenUsage>,
 ) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([(
-        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
         serde_json::json!({
             "usageByModel": usage_by_model
                 .iter()
@@ -31,7 +31,7 @@ pub(crate) fn insert_turn_failure_meta(
     failure: &crate::tool_loop::TurnFailure,
 ) {
     let mut namespace = meta
-        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .remove(anvil_llm::structured_output::ACP_META_NAMESPACE)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     namespace.insert(
@@ -42,7 +42,7 @@ pub(crate) fn insert_turn_failure_meta(
         }),
     );
     meta.insert(
-        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
         serde_json::Value::Object(namespace),
     );
 }
@@ -50,13 +50,13 @@ pub(crate) fn insert_turn_failure_meta(
 pub(crate) fn insert_bedrock_credits_meta(
     meta: &mut serde_json::Map<String, serde_json::Value>,
     model_wire_id: &str,
-    status: crate::bedrock_credits::Status,
+    status: anvil_llm::bedrock_credits::Status,
 ) {
     if !is_bedrock_model(model_wire_id) {
         return;
     }
     let mut namespace = meta
-        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .remove(anvil_llm::structured_output::ACP_META_NAMESPACE)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     namespace.insert(
@@ -64,7 +64,7 @@ pub(crate) fn insert_bedrock_credits_meta(
         serde_json::to_value(status).expect("Bedrock credit status is serializable"),
     );
     meta.insert(
-        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
         serde_json::Value::Object(namespace),
     );
 }
@@ -74,7 +74,7 @@ pub(crate) fn attach_bedrock_credits_meta<F>(
     model_wire_id: &str,
     status: F,
 ) where
-    F: FnOnce() -> crate::bedrock_credits::Status,
+    F: FnOnce() -> anvil_llm::bedrock_credits::Status,
 {
     if is_bedrock_model(model_wire_id) {
         insert_bedrock_credits_meta(meta, model_wire_id, status());
@@ -88,13 +88,13 @@ pub(crate) fn is_bedrock_model(model_wire_id: &str) -> bool {
 pub(crate) fn insert_openrouter_balance_meta(
     meta: &mut serde_json::Map<String, serde_json::Value>,
     model_wire_id: &str,
-    status: crate::openrouter_credits::Status,
+    status: anvil_llm::openrouter_credits::Status,
 ) {
     if !is_openrouter_model(model_wire_id) {
         return;
     }
     let mut namespace = meta
-        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .remove(anvil_llm::structured_output::ACP_META_NAMESPACE)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     namespace.insert(
@@ -102,7 +102,7 @@ pub(crate) fn insert_openrouter_balance_meta(
         serde_json::to_value(status).expect("OpenRouter balance status is serializable"),
     );
     meta.insert(
-        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
         serde_json::Value::Object(namespace),
     );
 }
@@ -112,7 +112,7 @@ pub(crate) fn attach_openrouter_balance_meta<F>(
     model_wire_id: &str,
     status: F,
 ) where
-    F: FnOnce() -> crate::openrouter_credits::Status,
+    F: FnOnce() -> anvil_llm::openrouter_credits::Status,
 {
     if is_openrouter_model(model_wire_id) {
         insert_openrouter_balance_meta(meta, model_wire_id, status());
@@ -129,13 +129,13 @@ pub(crate) fn is_openrouter_model(model_wire_id: &str) -> bool {
 pub(crate) fn insert_deepseek_balance_meta(
     meta: &mut serde_json::Map<String, serde_json::Value>,
     model_wire_id: &str,
-    status: crate::deepseek_balance::Status,
+    status: anvil_llm::deepseek_balance::Status,
 ) {
     if !is_deepseek_model(model_wire_id) {
         return;
     }
     let mut namespace = meta
-        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .remove(anvil_llm::structured_output::ACP_META_NAMESPACE)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     namespace.insert(
@@ -143,7 +143,7 @@ pub(crate) fn insert_deepseek_balance_meta(
         serde_json::to_value(status).expect("DeepSeek balance status is serializable"),
     );
     meta.insert(
-        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
         serde_json::Value::Object(namespace),
     );
 }
@@ -153,7 +153,7 @@ pub(crate) fn attach_deepseek_balance_meta<F>(
     model_wire_id: &str,
     status: F,
 ) where
-    F: FnOnce() -> crate::deepseek_balance::Status,
+    F: FnOnce() -> anvil_llm::deepseek_balance::Status,
 {
     if is_deepseek_model(model_wire_id) {
         insert_deepseek_balance_meta(meta, model_wire_id, status());
@@ -173,8 +173,8 @@ pub(crate) fn is_deepseek_model(model_wire_id: &str) -> bool {
 /// when any model that actually spent tokens has no price, so a partial
 /// figure is never reported as the whole turn's cost.
 pub(crate) fn estimate_usage_by_model_cost(
-    metadata: &[crate::llm_client::ModelMetadata],
-    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
+    metadata: &[anvil_llm::llm_client::ModelMetadata],
+    usage_by_model: &BTreeMap<String, anvil_llm::llm_client::TokenUsage>,
 ) -> Option<f64> {
     usage_by_model
         .iter()
@@ -196,7 +196,7 @@ pub(crate) enum OpenRouterCreditsOutcome {
     /// user hasn't logged in, or the active model isn't an OpenRouter
     /// one and we deliberately skipped the lookup.
     Skipped,
-    Fetched(crate::openrouter_credits::Credits),
+    Fetched(anvil_llm::openrouter_credits::Credits),
     Failed(String),
 }
 
@@ -215,7 +215,7 @@ pub(crate) enum CodexCreditsOutcome {
     /// On a Codex model and authenticated, but with an api-key billing
     /// path that the subscription `wham/usage` endpoint doesn't cover.
     ApiKeyMode,
-    Fetched(crate::codex_credits::CodexUsage),
+    Fetched(anvil_llm::codex_credits::CodexUsage),
     Failed(String),
 }
 
@@ -246,12 +246,12 @@ pub(crate) async fn fetch_openrouter_credits_for_usage(
     if active_source != Some(ModelSource::OPENROUTER) {
         return OpenRouterCreditsOutcome::Skipped;
     }
-    let Some(key) = crate::openrouter_credits::active_api_key() else {
+    let Some(key) = anvil_llm::openrouter_credits::active_api_key() else {
         return OpenRouterCreditsOutcome::Skipped;
     };
     match tokio::time::timeout(
         USAGE_CREDITS_FETCH_TIMEOUT,
-        crate::openrouter_credits::fetch(&key),
+        anvil_llm::openrouter_credits::fetch(&key),
     )
     .await
     {
@@ -280,15 +280,20 @@ pub(crate) async fn fetch_codex_credits_for_usage(model_wire_id: &str) -> CodexC
     if active_source != Some(ModelSource::CODEX) {
         return CodexCreditsOutcome::NotApplicable;
     }
-    match crate::codex_credits::auth_status() {
-        Ok(crate::codex_credits::AuthStatus::Missing) => return CodexCreditsOutcome::NoAuth,
-        Ok(crate::codex_credits::AuthStatus::ApiKeyMode) => {
+    match anvil_llm::codex_credits::auth_status() {
+        Ok(anvil_llm::codex_credits::AuthStatus::Missing) => return CodexCreditsOutcome::NoAuth,
+        Ok(anvil_llm::codex_credits::AuthStatus::ApiKeyMode) => {
             return CodexCreditsOutcome::ApiKeyMode;
         }
-        Ok(crate::codex_credits::AuthStatus::ChatGptMode) => {}
+        Ok(anvil_llm::codex_credits::AuthStatus::ChatGptMode) => {}
         Err(e) => return CodexCreditsOutcome::Failed(format!("{e:#}")),
     }
-    match tokio::time::timeout(USAGE_CREDITS_FETCH_TIMEOUT, crate::codex_credits::fetch()).await {
+    match tokio::time::timeout(
+        USAGE_CREDITS_FETCH_TIMEOUT,
+        anvil_llm::codex_credits::fetch(),
+    )
+    .await
+    {
         Ok(Ok(Some(usage))) => CodexCreditsOutcome::Fetched(usage),
         // `fetch` only returns Ok(None) for the same conditions
         // `auth_status` already classified, but auth.json could have
@@ -347,7 +352,7 @@ pub(crate) fn format_reset_after(seconds: i32) -> String {
 /// is invoked by the slash dispatch sites.
 pub(crate) fn render_usage_report(
     snap: &crate::session::SessionSnapshot,
-    usage: crate::llm_client::TokenUsage,
+    usage: anvil_llm::llm_client::TokenUsage,
     cost_usd: Option<f64>,
     openrouter_credits: OpenRouterCreditsOutcome,
     codex_credits: CodexCreditsOutcome,
@@ -504,14 +509,14 @@ mod tests {
     #[test]
     fn render_usage_report_with_openrouter_balance_shows_all_lines() {
         let snap = usage_snapshot("openrouter::anthropic/claude-sonnet-4.5");
-        let usage = crate::llm_client::TokenUsage {
+        let usage = anvil_llm::llm_client::TokenUsage {
             input_tokens: 1_000,
             output_tokens: 500,
             thought_tokens: 200,
             cached_read_tokens: 50,
             cached_write_tokens: 25,
         };
-        let credits = crate::openrouter_credits::Credits {
+        let credits = anvil_llm::openrouter_credits::Credits {
             total_credits: 50.0,
             total_usage: 7.5,
         };
@@ -542,7 +547,7 @@ mod tests {
         let snap = usage_snapshot("codex::gpt-5-codex");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::NoAuth,
@@ -569,7 +574,7 @@ mod tests {
         let snap = usage_snapshot("codex::gpt-5-codex");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::ApiKeyMode,
@@ -588,7 +593,7 @@ mod tests {
         let snap = usage_snapshot("openrouter::openai/gpt-4o");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::NotApplicable,
@@ -610,7 +615,7 @@ mod tests {
         let snap = usage_snapshot("openrouter::openai/gpt-4o");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Failed("HTTP 401: invalid api key".into()),
             CodexCreditsOutcome::NotApplicable,
@@ -622,7 +627,7 @@ mod tests {
     #[test]
     fn render_usage_report_marks_partial_pricing_as_unavailable() {
         let snap = usage_snapshot("openrouter::openai/gpt-4o");
-        let usage = crate::llm_client::TokenUsage {
+        let usage = anvil_llm::llm_client::TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
             ..Default::default()
@@ -648,7 +653,7 @@ mod tests {
         let snap = usage_snapshot("llama3:latest");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::NotApplicable,
@@ -660,15 +665,15 @@ mod tests {
     #[test]
     fn render_usage_report_shows_codex_metered_credits() {
         let snap = usage_snapshot("codex::gpt-5-codex");
-        let usage = crate::codex_credits::CodexUsage {
+        let usage = anvil_llm::codex_credits::CodexUsage {
             plan_type: Some("plus".to_string()),
-            credits: Some(crate::codex_credits::CreditStatus {
+            credits: Some(anvil_llm::codex_credits::CreditStatus {
                 has_credits: true,
                 unlimited: false,
                 balance: Some("12.50".to_string()),
             }),
-            rate_limit: Some(crate::codex_credits::RateLimitStatus {
-                primary_window: Some(crate::codex_credits::RateLimitWindow {
+            rate_limit: Some(anvil_llm::codex_credits::RateLimitStatus {
+                primary_window: Some(anvil_llm::codex_credits::RateLimitWindow {
                     used_percent: 42,
                     reset_after_seconds: 7_200,
                 }),
@@ -676,7 +681,7 @@ mod tests {
         };
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::Fetched(usage),
@@ -690,9 +695,9 @@ mod tests {
     #[test]
     fn render_usage_report_shows_codex_unlimited_plan() {
         let snap = usage_snapshot("codex::gpt-5-codex");
-        let usage = crate::codex_credits::CodexUsage {
+        let usage = anvil_llm::codex_credits::CodexUsage {
             plan_type: Some("pro".to_string()),
-            credits: Some(crate::codex_credits::CreditStatus {
+            credits: Some(anvil_llm::codex_credits::CreditStatus {
                 has_credits: true,
                 unlimited: true,
                 balance: None,
@@ -701,7 +706,7 @@ mod tests {
         };
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::Fetched(usage),
@@ -718,7 +723,7 @@ mod tests {
         let snap = usage_snapshot("codex::gpt-5-codex");
         let report = render_usage_report(
             &snap,
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
             CodexCreditsOutcome::Failed(
@@ -757,14 +762,14 @@ mod tests {
 
     #[test]
     fn usage_by_model_keeps_model_attribution_for_cost_and_acp_metadata() {
-        let flash_usage = crate::llm_client::TokenUsage {
+        let flash_usage = anvil_llm::llm_client::TokenUsage {
             input_tokens: 100,
             output_tokens: 10,
             thought_tokens: 2,
             cached_read_tokens: 20,
             cached_write_tokens: 0,
         };
-        let pro_usage = crate::llm_client::TokenUsage {
+        let pro_usage = anvil_llm::llm_client::TokenUsage {
             input_tokens: 200,
             output_tokens: 30,
             thought_tokens: 4,
@@ -803,7 +808,7 @@ mod tests {
     fn bedrock_credit_metadata_attaches_and_preserves_existing_anvil_metadata() {
         let mut meta = usage_by_model_meta(&BTreeMap::from([(
             "bedrock::model".to_string(),
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
         )]));
         insert_turn_failure_meta(
             &mut meta,
@@ -815,7 +820,7 @@ mod tests {
         insert_bedrock_credits_meta(
             &mut meta,
             "bedrock::model",
-            crate::bedrock_credits::Status::Unavailable {
+            anvil_llm::bedrock_credits::Status::Unavailable {
                 reason: "billing credentials are unavailable".into(),
                 as_of: "2026-07-15T18:42:00Z".into(),
             },
@@ -831,7 +836,7 @@ mod tests {
         insert_bedrock_credits_meta(
             &mut meta,
             "openrouter::model",
-            crate::bedrock_credits::Status::Unavailable {
+            anvil_llm::bedrock_credits::Status::Unavailable {
                 reason: "billing credentials are unavailable".into(),
                 as_of: "2026-07-15T18:42:00Z".into(),
             },
@@ -846,7 +851,7 @@ mod tests {
 
         attach_bedrock_credits_meta(&mut meta, "openrouter::model", || {
             looked_up = true;
-            crate::bedrock_credits::Status::Unavailable {
+            anvil_llm::bedrock_credits::Status::Unavailable {
                 reason: "refresh pending".into(),
                 as_of: "2026-07-15T18:42:00Z".into(),
             }
@@ -860,7 +865,7 @@ mod tests {
     fn openrouter_balance_metadata_attaches_and_preserves_existing_anvil_metadata() {
         let mut meta = usage_by_model_meta(&BTreeMap::from([(
             "openrouter::vendor/model".to_string(),
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
         )]));
         insert_turn_failure_meta(
             &mut meta,
@@ -872,7 +877,7 @@ mod tests {
         insert_openrouter_balance_meta(
             &mut meta,
             "openrouter::vendor/model",
-            crate::openrouter_credits::Status::Available {
+            anvil_llm::openrouter_credits::Status::Available {
                 remaining_usd: 0.0,
                 total_credits_usd: 10.0,
                 total_usage_usd: 10.0,
@@ -892,7 +897,7 @@ mod tests {
 
         attach_openrouter_balance_meta(&mut meta, "bedrock::model", || {
             looked_up = true;
-            crate::openrouter_credits::Status::Unavailable {
+            anvil_llm::openrouter_credits::Status::Unavailable {
                 reason: "refresh pending".into(),
                 as_of: "2026-07-15T18:42:00Z".into(),
             }
@@ -907,7 +912,7 @@ mod tests {
     fn deepseek_balance_metadata_attaches_and_preserves_existing_anvil_metadata() {
         let mut meta = usage_by_model_meta(&BTreeMap::from([(
             "deepseek::deepseek-chat".to_string(),
-            crate::llm_client::TokenUsage::default(),
+            anvil_llm::llm_client::TokenUsage::default(),
         )]));
         insert_turn_failure_meta(
             &mut meta,
@@ -919,8 +924,8 @@ mod tests {
         insert_deepseek_balance_meta(
             &mut meta,
             "deepseek::deepseek-chat",
-            crate::deepseek_balance::Status::Available {
-                balances: vec![crate::deepseek_balance::Balance {
+            anvil_llm::deepseek_balance::Status::Available {
+                balances: vec![anvil_llm::deepseek_balance::Balance {
                     currency: "CNY".into(),
                     total_balance: "12.3400".into(),
                     granted_balance: "2.0000".into(),
@@ -944,7 +949,7 @@ mod tests {
         let mut looked_up = false;
         attach_deepseek_balance_meta(&mut meta, "openrouter::model", || {
             looked_up = true;
-            crate::deepseek_balance::Status::Unavailable {
+            anvil_llm::deepseek_balance::Status::Unavailable {
                 reason: "refresh pending".into(),
                 as_of: "2026-07-15T18:42:00Z".into(),
             }

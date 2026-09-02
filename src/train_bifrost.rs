@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{
+use crate::session::ToolExchange;
+use crate::tools::tool_result_failed;
+use anvil_llm::llm_client::{
     ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
     is_retryable_llm_error, stream_chat_no_visible_output_with_retry,
 };
-use crate::session::ToolExchange;
-use crate::tools::tool_result_failed;
-use crate::trace_logging::append_trace_record;
+use anvil_llm::trace_logging::append_trace_record;
 
 pub(crate) const TRAIN_BIFROST_PACKET_ENV: &str = "BRK_TRAIN_BIFROST_PACKET";
 pub(crate) const TRAIN_BIFROST_HINT_MODEL: &str = "openrouter::deepseek/deepseek-v4-flash";
@@ -547,7 +547,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{ChatContentPart, LlmResponse};
+    use anvil_llm::llm_client::{ChatContentPart, LlmResponse};
     use futures::FutureExt;
     use futures::future::BoxFuture;
     use std::sync::Mutex;
@@ -751,7 +751,7 @@ mod tests {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 if fail_first_incomplete && attempt == 1 {
                     return Err(anyhow::Error::new(
-                        crate::llm_client::IncompleteStreamError::new(
+                        anvil_llm::llm_client::IncompleteStreamError::new(
                             "test SSE",
                             "response.completed",
                         ),

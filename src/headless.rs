@@ -28,9 +28,9 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::multi_backend::MultiBackend;
 use crate::session::SessionStore;
-use crate::structured_output::{
+use anvil_llm::multi_backend::MultiBackend;
+use anvil_llm::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, validation_retry_prompt,
 };
 
@@ -363,7 +363,7 @@ fn structured_output_request_meta(request: &StructuredOutputRequest) -> Meta {
 
 fn structured_output_result(meta: Option<&Meta>) -> Result<Option<StructuredOutputResult>> {
     let Some(payload) = meta
-        .and_then(|meta| meta.get(crate::structured_output::ACP_META_NAMESPACE))
+        .and_then(|meta| meta.get(anvil_llm::structured_output::ACP_META_NAMESPACE))
         .and_then(|namespace| namespace.get("structuredOutput"))
     else {
         return Ok(None);
@@ -446,7 +446,7 @@ fn answer_permission(
 
 fn turn_failure_message(meta: Option<&Meta>) -> Option<String> {
     meta?
-        .get(crate::structured_output::ACP_META_NAMESPACE)?
+        .get(anvil_llm::structured_output::ACP_META_NAMESPACE)?
         .get("turnFailure")?
         .get("message")?
         .as_str()
@@ -1058,7 +1058,7 @@ mod tests {
         .unwrap();
         let request = load_response_schema(&path, "task_evaluation").unwrap();
         let meta = structured_output_request_meta(&request);
-        let parsed = crate::structured_output::parse_structured_output_request(Some(&meta))
+        let parsed = anvil_llm::structured_output::parse_structured_output_request(Some(&meta))
             .unwrap()
             .unwrap();
         assert_eq!(parsed, request);

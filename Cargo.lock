@@ -894,6 +894,7 @@ dependencies = [
  "axum",
  "base64",
  "brokk-acp-sandbox",
+ "brokk-anvil-llm",
  "brokk-anvil-minimizer",
  "bytes",
  "chrono",
@@ -927,8 +928,42 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "webbrowser",
- "wiremock",
  "zip",
+]
+
+[[package]]
+name = "brokk-anvil-llm"
+version = "0.27.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "base64",
+ "bytes",
+ "chrono",
+ "dirs",
+ "fs2",
+ "futures",
+ "http 1.4.2",
+ "jsonschema",
+ "oauth2",
+ "rand 0.10.1",
+ "reqwest",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tiny_http",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -1,0 +1,64 @@
+[package]
+name = "brokk-anvil-llm"
+version = "0.27.0"
+edition = "2024"
+description = "Standalone LLM client extracted from Anvil: OpenAI-compatible, Bedrock, Codex, Grok, Ollama, OpenRouter, DeepSeek, and Kimi backends with auth, discovery, and usage accounting"
+license = "LGPL-3.0-only"
+repository = "https://github.com/BrokkAi/anvil"
+homepage = "https://github.com/BrokkAi/anvil"
+
+# Dependency-renamed by dependents so imports stay `anvil_llm::` while the
+# published crate is namespaced. Versioned in lockstep with brokk-anvil: bump
+# this version, the root version, and the root dependency requirement together
+# on every release (CI enforces the match).
+[lib]
+name = "anvil_llm"
+path = "src/lib.rs"
+
+[features]
+# Exposes `openrouter_auth::test_support` (env-var guard/scope helpers) to
+# dependents' test builds. Anvil enables this only through its
+# [dev-dependencies] entry, so published binaries never see it.
+test-support = []
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+fs2 = "0.4"
+http = "1"
+rand = "0.10"
+reqwest = { version = "0.13", features = ["stream", "json", "cookies", "form"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonschema = "0.46"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+rustls-native-certs = "0.8"
+sha2 = "0.11"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+# Codex login. Browser login uses PKCE + a localhost loopback callback; device
+# authorization covers SSH/remote clients. RFC 8693 token exchange and refresh
+# are direct `reqwest` calls in `codex_auth.rs`.
+oauth2 = { version = "5", default-features = false }
+tiny_http = "0.12"
+# AWS SigV4 signing for Bedrock. Credentials resolve through the standard
+# AWS chain (env, profile, SSO, credentials-process) via `aws-config`.
+aws-config = { version = "1.9", default-features = false, features = ["credentials-process", "rt-tokio", "sso"] }
+aws-credential-types = "1.3"
+aws-sigv4 = "1.5"
+aws-smithy-runtime-api = "1.13"
+aws-smithy-http-client = { version = "1.2", default-features = false, features = ["rustls-ring"] }
+
+[dev-dependencies]
+# `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
+# used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.
+tokio = { version = "1", features = ["test-util"] }
+# Mocks the Ollama `/v1/models` HTTP response shape in `discovery::tests`.
+wiremock = "0.6"
+tempfile = "3"

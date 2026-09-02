@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "crates/anvil-minimizer"]
+members = ["xtask", "crates/anvil-minimizer", "crates/anvil-llm"]
 # Keep `cargo build` / `cargo test` from the workspace root focused on the
 # root crate. The xtask sub-crate is dev-only and is invoked through the
 # `cargo xtask` alias (see .cargo/config.toml), which builds it on demand.
@@ -32,11 +32,12 @@ agent-client-protocol = { version = "2", features = ["unstable"] }
 # HTTP daemon for `anvil serve` (#317). Server-side only; LLM/MCP client
 # traffic stays on `reqwest`. Optional: gated behind the `http-api` feature.
 axum = { version = "0.8", optional = true }
-# Dependency-renamed so imports stay `anvil_minimizer::` while the published
-# crate is namespaced. The minimizer is versioned in lockstep with this crate:
-# bump this requirement, the minimizer's version, and the root version
+# Dependency-renamed so imports stay `anvil_minimizer::`/`anvil_llm::` while
+# the published crates are namespaced. Both are versioned in lockstep with this
+# crate: bump the requirement, the sub-crate's version, and the root version
 # together on every release (CI enforces the match).
 anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.27.0", path = "crates/anvil-minimizer" }
+anvil-llm = { package = "brokk-anvil-llm", version = "0.27.0", path = "crates/anvil-llm" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
@@ -104,17 +105,16 @@ libc = "0.2"
 
 [dev-dependencies]
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
-# used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.
+# used by the tool-loop coalescing-sink tests to avoid waiting wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
 # Used by `agents_md` tests to build throwaway project trees (`.git`
 # marker + AGENTS.md/CLAUDE.md fixtures) without polluting the working
 # directory.
 tempfile = "3"
-# Used by `discovery::tests` to mock the Ollama `/v1/models` HTTP
-# response shape and validate that `discover_ollama` parses it
-# correctly. Without a mock, the existing tests only exercise the
-# connection-refused error path.
-wiremock = "0.6"
+# Enables anvil-llm's `test-support` feature so Anvil's tests can use
+# `openrouter_auth::test_support` (env-var guard/scope helpers). Feature
+# unification means only test builds see it; published binaries never do.
+anvil-llm = { package = "brokk-anvil-llm", version = "0.27.0", path = "crates/anvil-llm", features = ["test-support"] }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

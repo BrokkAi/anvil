@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::ModelMetadata;
 use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
-use crate::structured_output::StructuredOutputResult;
 use crate::tools::{ToolRegistry, ToolRegistryOptions};
+use anvil_llm::llm_client::ModelMetadata;
+use anvil_llm::structured_output::StructuredOutputResult;
 
 // ---------------------------------------------------------------------------
 // Sandbox-bounded read limits
@@ -607,7 +607,7 @@ pub struct ConversationTurn {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionCheckpoint {
-    pub messages: Vec<crate::llm_client::ChatMessage>,
+    pub messages: Vec<anvil_llm::llm_client::ChatMessage>,
     pub current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
@@ -934,7 +934,7 @@ pub struct Session {
     /// across all turns", ...). In-memory only: a session reload
     /// starts the counters fresh because we don't persist per-call
     /// usage on disk yet.
-    pub usage: crate::llm_client::TokenUsage,
+    pub usage: anvil_llm::llm_client::TokenUsage,
     /// Cumulative session cost in USD when every token-using turn so far
     /// had an exact provider pricing source. If any non-zero turn lacks
     /// pricing metadata, the session cost becomes unavailable rather than
@@ -973,7 +973,7 @@ impl Default for SessionUsageCost {
 }
 
 impl SessionUsageCost {
-    fn record(&mut self, usage: crate::llm_client::TokenUsage, delta_usd: Option<f64>) {
+    fn record(&mut self, usage: anvil_llm::llm_client::TokenUsage, delta_usd: Option<f64>) {
         if self.unavailable || usage.is_zero() {
             return;
         }
@@ -1058,7 +1058,7 @@ impl Session {
             skills,
             agents,
             activated_skills: HashSet::new(),
-            usage: crate::llm_client::TokenUsage::default(),
+            usage: anvil_llm::llm_client::TokenUsage::default(),
             usage_cost: SessionUsageCost::default(),
         }
     }
@@ -1150,7 +1150,7 @@ impl Session {
             skills,
             agents,
             activated_skills: HashSet::new(),
-            usage: crate::llm_client::TokenUsage::default(),
+            usage: anvil_llm::llm_client::TokenUsage::default(),
             usage_cost: SessionUsageCost::default(),
         })
     }
@@ -4595,9 +4595,9 @@ impl SessionStore {
     pub async fn record_usage(
         &self,
         id: &str,
-        delta: crate::llm_client::TokenUsage,
+        delta: anvil_llm::llm_client::TokenUsage,
         cost_delta_usd: Option<f64>,
-    ) -> Option<crate::llm_client::TokenUsage> {
+    ) -> Option<anvil_llm::llm_client::TokenUsage> {
         let mut sessions = self.sessions.write().await;
         let session = sessions.get_mut(id)?;
         session.usage.add(delta);
@@ -4619,7 +4619,10 @@ impl SessionStore {
     /// hasn't issued any LLM turns yet still returns a zero-filled
     /// `TokenUsage`. Used by `/usage` so the report can show the same
     /// numbers `PromptResponse.usage` carries.
-    pub async fn cumulative_token_usage(&self, id: &str) -> Option<crate::llm_client::TokenUsage> {
+    pub async fn cumulative_token_usage(
+        &self,
+        id: &str,
+    ) -> Option<anvil_llm::llm_client::TokenUsage> {
         let sessions = self.sessions.read().await;
         sessions.get(id).map(|session| session.usage)
     }
@@ -5329,8 +5332,8 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
     use crate::setup_state::TestConfigHomeScope;
+    use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
 
     fn write_legacy_session_config_setup(config_dir: &Path) {
         std::fs::create_dir_all(config_dir).expect("create config dir");
@@ -5807,7 +5810,7 @@ mod tests {
     /// Model-specific reasoning/service-tier cleanup still applies in memory.
     #[tokio::test]
     async fn set_model_live_only_without_session_zip() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-big".to_string());
         store
@@ -6058,7 +6061,7 @@ mod tests {
     /// source of truth and must resend model/reasoning choices.
     #[tokio::test(flavor = "current_thread")]
     async fn create_session_ignores_legacy_persisted_model_and_reasoning_effort() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
@@ -6352,8 +6355,8 @@ mod tests {
     /// sessions or cold reloads.
     #[tokio::test(flavor = "current_thread")]
     async fn transient_setup_does_not_persist_session_config_options() {
-        use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         // `create_session` mints `permission_mode` via `initial_permission_mode`,
         // which reads the process-wide `BROKK_ACP_PERMISSION_MODE` that the
@@ -7429,7 +7432,7 @@ mod tests {
     /// `create_session` calls without polluting persisted setup state.
     #[tokio::test]
     async fn set_default_reasoning_effort_drives_subsequent_create_session() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-mini".to_string());
         store
@@ -7473,7 +7476,7 @@ mod tests {
     /// reasoning controls rather than falling back to the model default.
     #[tokio::test]
     async fn set_default_reasoning_off_drives_subsequent_create_session() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-mini".to_string());
         store
@@ -7546,7 +7549,7 @@ mod tests {
     /// to the new model's default happens at the next `snapshot()`.
     #[tokio::test]
     async fn set_model_clears_reasoning_effort_when_unsupported() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-big".to_string());
         store
@@ -7633,7 +7636,7 @@ mod tests {
     /// must clear the per-session pick instead of forwarding a stale value.
     #[tokio::test]
     async fn set_model_clears_service_tier_when_unsupported() {
-        use crate::llm_client::ModelServiceTier;
+        use anvil_llm::llm_client::ModelServiceTier;
 
         let store = SessionStore::new("codex::gpt-5.5".to_string());
         store
@@ -7681,7 +7684,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_refresh_clears_service_tier_when_current_model_drops_it() {
-        use crate::llm_client::ModelServiceTier;
+        use anvil_llm::llm_client::ModelServiceTier;
 
         let store = SessionStore::new("codex::gpt-5.5".to_string());
         store
@@ -7771,7 +7774,7 @@ mod tests {
     /// not fall back to the new model's default.
     #[tokio::test]
     async fn set_model_preserves_reasoning_off_when_unsupported() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-big".to_string());
         store
@@ -7849,7 +7852,7 @@ mod tests {
     /// a slug bump within the same family (e.g. gpt-5.4 -> gpt-5.5).
     #[tokio::test]
     async fn set_model_preserves_reasoning_effort_when_supported() {
-        use crate::llm_client::ReasoningLevelPreset;
+        use anvil_llm::llm_client::ReasoningLevelPreset;
 
         let supported = vec![
             ReasoningLevelPreset {
@@ -9231,7 +9234,7 @@ done
                     replay_events: Vec::new(),
                     tool_exchanges: Vec::new(),
                     structured_output: Some(StructuredOutputResult::CoercedSuccess(
-                        crate::structured_output::StructuredOutputCoercedSuccess {
+                        anvil_llm::structured_output::StructuredOutputCoercedSuccess {
                             schema_name: "audit_result".into(),
                             validated_output: serde_json::json!({"answer":"one\ntwo"}),
                             coercions: vec!["response.answer array -> string".into()],
@@ -9812,7 +9815,7 @@ done
             .await
             .expect("turn persists");
         let checkpoint = CompactionCheckpoint {
-            messages: vec![crate::llm_client::ChatMessage::user(
+            messages: vec![anvil_llm::llm_client::ChatMessage::user(
                 "<state_snapshot>compact</state_snapshot>",
             )],
             current_plan: None,

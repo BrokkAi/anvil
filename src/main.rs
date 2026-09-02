@@ -8,62 +8,45 @@ use clap::{Parser, Subcommand};
 mod acp;
 mod agents;
 mod agents_md;
-mod bedrock_auth;
-mod bedrock_client;
-mod bedrock_credits;
-mod codex_auth;
-mod codex_client;
-mod codex_credits;
 mod context_manager;
-mod deepseek_auth;
-mod deepseek_balance;
-mod discovery;
 mod goal;
-mod grok_auth;
-mod grok_client;
 mod headless;
 mod host_notice;
 #[cfg(feature = "http-api")]
 mod http_api;
-mod http_retry;
 mod infer;
 mod installer;
-mod kimi_auth;
-mod llm_client;
 mod lsp;
 mod mcp;
-mod multi_backend;
-mod openai_providers;
-mod openrouter_auth;
-mod openrouter_credits;
 mod p2t;
 mod plan;
 mod plugins;
-mod responses_api;
-mod responses_chain;
 mod runtime;
 mod sandbox_backend;
-mod secrets;
 mod session;
 mod setup_state;
 mod skills;
 mod slash;
-mod structured_output;
 mod terminal_notifications;
 mod text;
 mod tokens;
-mod tool_arguments;
 mod tool_loop;
 mod tools;
-mod trace_logging;
 mod train_bifrost;
 mod turn_runner;
 mod usage_report;
 mod utility_model;
 mod workspace_delta;
 
-use crate::llm_client::LlmBackend;
-use crate::multi_backend::{BackendRegistration, MultiBackend};
+// The LLM client (providers, auth, discovery, secrets) lives in the
+// standalone `anvil_llm` crate; these module imports keep the bare
+// `<module>::` paths below working.
+use anvil_llm::llm_client::LlmBackend;
+use anvil_llm::multi_backend::{BackendRegistration, MultiBackend};
+use anvil_llm::{
+    bedrock_auth, bedrock_client, codex_auth, codex_client, deepseek_auth, discovery, grok_client,
+    kimi_auth, llm_client, openai_providers, openrouter_auth, secrets,
+};
 
 /// Anvil -- Rust-based Agent Client Protocol (ACP) server with
 /// first-run setup and zero-config auto-discovery: at startup we read

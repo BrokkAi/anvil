@@ -27,12 +27,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{
+use crate::session::ConversationTurn;
+use crate::tokens::{approximate_tokens, approximate_tokens_messages};
+use anvil_llm::llm_client::{
     ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
     TokenUsage, ToolDefinition, stream_chat_no_visible_output_with_retry,
 };
-use crate::session::ConversationTurn;
-use crate::tokens::{approximate_tokens, approximate_tokens_messages};
 
 /// Maximum number of summarization LLM calls in flight at one time.
 /// Keeps oversized recap summarization from saturating provider rate
@@ -1679,7 +1679,7 @@ mod tests {
 
     #[test]
     fn exact_tail_keeps_tool_call_and_result_together() {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         let messages = vec![
             ChatMessage::user("old".repeat(8_000)),
@@ -1837,7 +1837,7 @@ mod tests {
                 Ok(LlmResponse::Text {
                     text: response,
                     reasoning_content: None,
-                    usage: crate::llm_client::TokenUsage::default(),
+                    usage: anvil_llm::llm_client::TokenUsage::default(),
                     codex_reasoning: None,
                 })
             }
@@ -1860,7 +1860,7 @@ mod tests {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 if attempt == 1 {
                     return Err(anyhow::Error::new(
-                        crate::llm_client::IncompleteStreamError::new(
+                        anvil_llm::llm_client::IncompleteStreamError::new(
                             "test SSE",
                             "response.completed",
                         ),
@@ -1870,7 +1870,7 @@ mod tests {
                     text: "<conversation_summary>\n- recovered\n</conversation_summary>"
                         .to_string(),
                     reasoning_content: None,
-                    usage: crate::llm_client::TokenUsage::default(),
+                    usage: anvil_llm::llm_client::TokenUsage::default(),
                     codex_reasoning: None,
                 })
             }
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_history_emits_snapshot_then_exact_tail() {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         let (backend, _, seen) = ScriptedBackend::new(
             "<state_snapshot><pending_tasks>finish parser</pending_tasks></state_snapshot>",
@@ -1985,7 +1985,7 @@ mod tests {
     /// request's messages/tools for inspection.
     type CapturedCompactionRequest = (
         Vec<ChatMessage>,
-        Option<Vec<crate::llm_client::ToolDefinition>>,
+        Option<Vec<anvil_llm::llm_client::ToolDefinition>>,
     );
 
     struct NativeAwareBackend {
@@ -2036,7 +2036,7 @@ mod tests {
                     Ok(LlmResponse::Text {
                         text: response,
                         reasoning_content: None,
-                        usage: crate::llm_client::TokenUsage::default(),
+                        usage: anvil_llm::llm_client::TokenUsage::default(),
                         codex_reasoning: None,
                     })
                 }
@@ -2060,7 +2060,7 @@ mod tests {
                 Ok(LlmResponse::Text {
                     text: response,
                     reasoning_content: None,
-                    usage: crate::llm_client::TokenUsage::default(),
+                    usage: anvil_llm::llm_client::TokenUsage::default(),
                     codex_reasoning: None,
                 })
             }
@@ -2068,10 +2068,10 @@ mod tests {
         }
     }
 
-    fn read_file_tool_definition() -> crate::llm_client::ToolDefinition {
-        crate::llm_client::ToolDefinition {
+    fn read_file_tool_definition() -> anvil_llm::llm_client::ToolDefinition {
+        anvil_llm::llm_client::ToolDefinition {
             r#type: "function".to_string(),
-            function: crate::llm_client::FunctionDef {
+            function: anvil_llm::llm_client::FunctionDef {
                 name: "read_file".to_string(),
                 description: "Read a file.".to_string(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
@@ -2085,7 +2085,7 @@ mod tests {
     /// promises over the old flatten-to-text request.
     #[tokio::test]
     async fn compact_history_native_path_sends_native_messages_and_tools() {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         let backend = NativeAwareBackend::new(
             false,
@@ -2269,7 +2269,7 @@ mod tests {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> ChatMessage {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         let mut args = serde_json::Map::new();
         args.insert(
@@ -2331,7 +2331,7 @@ mod tests {
 
     #[test]
     fn files_already_read_digest_ignores_unparseable_and_missing_path() {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         let bad_json = ChatMessage::assistant_tool_calls(vec![ToolCall {
             id: "c1".into(),
@@ -2373,7 +2373,7 @@ mod tests {
         args: &str,
         result: &str,
     ) -> Vec<ChatMessage> {
-        use crate::llm_client::{FunctionCall, ToolCall};
+        use anvil_llm::llm_client::{FunctionCall, ToolCall};
 
         vec![
             ChatMessage::assistant_tool_calls(vec![ToolCall {
@@ -2617,7 +2617,7 @@ mod tests {
                     Ok(LlmResponse::Text {
                         text: "- partial".into(),
                         reasoning_content: None,
-                        usage: crate::llm_client::TokenUsage::default(),
+                        usage: anvil_llm::llm_client::TokenUsage::default(),
                         codex_reasoning: None,
                     })
                 }
@@ -2711,7 +2711,7 @@ mod tests {
                     Ok(LlmResponse::Text {
                         text: response,
                         reasoning_content: None,
-                        usage: crate::llm_client::TokenUsage::default(),
+                        usage: anvil_llm::llm_client::TokenUsage::default(),
                         codex_reasoning: None,
                     })
                 }

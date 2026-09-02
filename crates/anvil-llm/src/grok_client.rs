@@ -16,7 +16,7 @@ use crate::responses_api::{ReasoningConfig, build_responses_request, drive_respo
 
 const GROK_API_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 
-pub(crate) struct GrokClient {
+pub struct GrokClient {
     auth: Arc<GrokAuthManager>,
     http: reqwest::Client,
     base_url: String,
@@ -24,7 +24,7 @@ pub(crate) struct GrokClient {
 }
 
 impl GrokClient {
-    pub(crate) fn load() -> Result<Option<Arc<dyn LlmBackend>>> {
+    pub fn load() -> Result<Option<Arc<dyn LlmBackend>>> {
         let Some(auth) = GrokAuthManager::load()? else {
             return Ok(None);
         };

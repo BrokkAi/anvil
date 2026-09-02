@@ -69,7 +69,7 @@ async fn search_duckduckgo_html(query: &str, max_results: usize) -> Result<Vec<W
 }
 
 fn web_search_http_client() -> Result<reqwest::Client> {
-    crate::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
+    anvil_llm::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))

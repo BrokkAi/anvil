@@ -17,40 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BedrockCatalogMode {
-    MantleOnly,
-    NativeOnly,
-    #[default]
-    MantlePreferred,
-    NativePreferred,
-}
-
-impl BedrockCatalogMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MantleOnly => "mantle-only",
-            Self::NativeOnly => "native-only",
-            Self::MantlePreferred => "mantle-preferred",
-            Self::NativePreferred => "native-preferred",
-        }
-    }
-}
-
-impl std::str::FromStr for BedrockCatalogMode {
-    type Err = ();
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "mantle-only" => Ok(Self::MantleOnly),
-            "native-only" => Ok(Self::NativeOnly),
-            "mantle-preferred" => Ok(Self::MantlePreferred),
-            "native-preferred" => Ok(Self::NativePreferred),
-            _ => Err(()),
-        }
-    }
-}
+// The enum lives with the Bedrock client in the standalone `anvil_llm` crate;
+// re-exported here because it is persisted as part of `SetupState` and
+// surfaced through this module's accessors.
+pub use anvil_llm::bedrock_client::BedrockCatalogMode;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SetupState {

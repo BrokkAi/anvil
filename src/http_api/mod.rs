@@ -60,10 +60,10 @@ use crate::acp::{
     REASONING_EFFORT_CONFIG_ID, SERVICE_TIER_CONFIG_ID, apply_config_option,
     seed_default_model_if_empty,
 };
-use crate::llm_client::ModelMetadata;
 use crate::mcp::McpServerConfig;
-use crate::multi_backend::MultiBackend;
 use crate::session::{LifecycleReopen, Session, SessionStore, validate_additional_directories};
+use anvil_llm::llm_client::ModelMetadata;
+use anvil_llm::multi_backend::MultiBackend;
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct ServeArgs {
@@ -741,7 +741,7 @@ struct SessionListEntry {
     resident: bool,
 }
 
-fn usage_resource(usage: crate::llm_client::TokenUsage) -> UsageResource {
+fn usage_resource(usage: anvil_llm::llm_client::TokenUsage) -> UsageResource {
     UsageResource {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,

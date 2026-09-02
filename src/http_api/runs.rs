@@ -33,8 +33,8 @@ use tokio::sync::broadcast;
 
 use crate::runtime::{EventSink, RuntimeEvent, ToolCallPhase};
 use crate::session::{PromptStartError, SessionSnapshot};
-use crate::structured_output::StructuredOutputRequest;
 use crate::tool_loop::{LoopStop, TextSink};
+use anvil_llm::structured_output::StructuredOutputRequest;
 
 use super::{ApiError, ApiJson, ApiState, fallback_cwd, unknown_session_error};
 
@@ -378,7 +378,7 @@ fn stop_reason_and_status(stop: &LoopStop, cancelled: bool) -> (RunStatus, &'sta
     }
 }
 
-fn usage_value(usage: crate::llm_client::TokenUsage) -> Value {
+fn usage_value(usage: anvil_llm::llm_client::TokenUsage) -> Value {
     json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -402,7 +402,7 @@ async fn execute_run(
 ) {
     let session_id = run.session_id.clone();
     let sessions = state.sessions.clone();
-    let llm: Arc<dyn crate::llm_client::LlmBackend> = state.llm.clone();
+    let llm: Arc<dyn anvil_llm::llm_client::LlmBackend> = state.llm.clone();
 
     let Some(registry) = sessions
         .get_or_create_registry(&session_id, snap.cwd.clone())

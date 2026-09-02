@@ -48,19 +48,21 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    # brokk-anvil-minimizer is versioned in lockstep with brokk-anvil; catch a
-    # missed bump on the PR instead of at publish time.
+    # brokk-anvil-minimizer and brokk-anvil-llm are versioned in lockstep with
+    # brokk-anvil; catch a missed bump on the PR instead of at publish time.
     - name: Verify workspace version lockstep
       shell: bash
       run: |
         set -euo pipefail
         ROOT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-        MINI=$(grep -m1 '^version = ' crates/anvil-minimizer/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-        REQ=$(grep -m1 '^anvil-minimizer = ' Cargo.toml | sed -E 's/.*version = "([^"]*)".*/\1/')
-        if [ "$ROOT" != "$MINI" ] || [ "$ROOT" != "$REQ" ]; then
-          echo "::error::Version lockstep violated: brokk-anvil=$ROOT, brokk-anvil-minimizer=$MINI, dependency requirement=$REQ. Bump all three together."
-          exit 1
-        fi
+        for CRATE in minimizer llm; do
+          SUB=$(grep -m1 '^version = ' crates/anvil-$CRATE/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          REQ=$(grep -m1 "^anvil-$CRATE = " Cargo.toml | sed -E 's/.*version = "([^"]*)".*/\1/')
+          if [ "$ROOT" != "$SUB" ] || [ "$ROOT" != "$REQ" ]; then
+            echo "::error::Version lockstep violated: brokk-anvil=$ROOT, brokk-anvil-$CRATE=$SUB, dependency requirement=$REQ. Bump all three together."
+            exit 1
+          fi
+        done
         echo "Workspace versions in lockstep: $ROOT"
 
     - name: Install Rust toolchain
@@ -141,6 +143,9 @@ jobs:
 
     - name: Run minimizer crate tests
       run: cargo test -p brokk-anvil-minimizer --locked
+
+    - name: Run LLM client crate tests
+      run: cargo test -p brokk-anvil-llm --locked
 
   build-android:
     name: Build aarch64-linux-android

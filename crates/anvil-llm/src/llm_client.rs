@@ -82,13 +82,13 @@ const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
 const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug)]
-pub(crate) struct IncompleteStreamError {
+pub struct IncompleteStreamError {
     protocol: &'static str,
     expected_marker: &'static str,
 }
 
 impl IncompleteStreamError {
-    pub(crate) fn new(protocol: &'static str, expected_marker: &'static str) -> Self {
+    pub fn new(protocol: &'static str, expected_marker: &'static str) -> Self {
         Self {
             protocol,
             expected_marker,
@@ -115,7 +115,7 @@ pub(crate) fn is_incomplete_stream_error(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) struct OutputBudgetExhaustedError;
+pub struct OutputBudgetExhaustedError;
 
 impl fmt::Display for OutputBudgetExhaustedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -128,17 +128,17 @@ impl fmt::Display for OutputBudgetExhaustedError {
 
 impl std::error::Error for OutputBudgetExhaustedError {}
 
-pub(crate) fn is_output_budget_exhausted_error(error: &anyhow::Error) -> bool {
+pub fn is_output_budget_exhausted_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<OutputBudgetExhaustedError>().is_some())
 }
 
-pub(crate) fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+pub fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
     llm_retry_tier(error).is_some()
 }
 
-pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
+pub fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
     if is_output_budget_exhausted_error(error) {
         return None;
     }
@@ -159,10 +159,10 @@ pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
         .map(RetryableLlmError::tier)
 }
 
-pub(crate) const EMPTY_COMPLETION_RETRY_REASON: &str =
+pub const EMPTY_COMPLETION_RETRY_REASON: &str =
     "no meaningful progress: empty completion (no text, no tool calls)";
 
-pub(crate) fn is_degenerate_empty_completion(response: &LlmResponse) -> bool {
+pub fn is_degenerate_empty_completion(response: &LlmResponse) -> bool {
     match response {
         LlmResponse::Text { text, .. } => text.trim().is_empty(),
         LlmResponse::ToolCalls { text, calls, .. } => text.trim().is_empty() && calls.is_empty(),
@@ -172,7 +172,7 @@ pub(crate) fn is_degenerate_empty_completion(response: &LlmResponse) -> bool {
 /// Retry a streamed LLM request when the caller guarantees streamed
 /// deltas are not user-visible. Use the main tool-loop wrapper instead
 /// when callbacks can emit text or thought updates to the client.
-pub(crate) async fn stream_chat_no_visible_output_with_retry<F>(
+pub async fn stream_chat_no_visible_output_with_retry<F>(
     llm: &dyn LlmBackend,
     operation: &str,
     cancel: &CancellationToken,

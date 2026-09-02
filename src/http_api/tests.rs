@@ -9,9 +9,9 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::{ApiState, router};
-use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
-use crate::multi_backend::MultiBackend;
 use crate::session::SessionStore;
+use anvil_llm::llm_client::{ModelMetadata, ReasoningLevelPreset};
+use anvil_llm::multi_backend::MultiBackend;
 
 #[derive(Default)]
 struct TestConfig {
@@ -450,8 +450,8 @@ async fn malformed_json_body_uses_error_envelope() {
 use futures::FutureExt;
 use futures::future::BoxFuture;
 
-use crate::llm_client::{LlmBackend, LlmResponse, StreamChatRequest, TokenUsage};
-use crate::multi_backend::BackendRegistration;
+use anvil_llm::llm_client::{LlmBackend, LlmResponse, StreamChatRequest, TokenUsage};
+use anvil_llm::multi_backend::BackendRegistration;
 
 /// Scripted backend for the `test::` source: streams a fixed reply, hangs
 /// until cancellation, or requests one `write_file` tool call before
@@ -508,10 +508,10 @@ impl LlmBackend for MockBackend {
                         Ok(LlmResponse::ToolCalls {
                             text: String::new(),
                             reasoning_content: None,
-                            calls: vec![crate::llm_client::ToolCall {
+                            calls: vec![anvil_llm::llm_client::ToolCall {
                                 id: "call-1".to_string(),
                                 r#type: "function".to_string(),
-                                function: crate::llm_client::FunctionCall {
+                                function: anvil_llm::llm_client::FunctionCall {
                                     name: "write_file".to_string(),
                                     arguments: serde_json::json!({
                                         "file_path": "hello.txt",

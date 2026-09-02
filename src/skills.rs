@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn user_codex_system_skills_are_discovered() {
-        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.blocking_lock();
         let _codex_home = EnvScope::remove("CODEX_HOME");
 

@@ -11,12 +11,12 @@ use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-use crate::codex_client::CodexClient;
-use crate::llm_client::{
+use anvil_llm::codex_client::CodexClient;
+use anvil_llm::llm_client::{
     ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
     stream_chat_no_visible_output_with_retry,
 };
-use crate::structured_output::{
+use anvil_llm::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, validate_response, validation_retry_prompt,
 };
 
@@ -40,11 +40,11 @@ pub(crate) struct InferArgs {
     service_tier: Option<String>,
 
     /// Seconds to wait for the first meaningful response event.
-    #[arg(long, default_value_t = crate::llm_client::DEFAULT_IDLE_CHUNK_TIMEOUT_SECS)]
+    #[arg(long, default_value_t = anvil_llm::llm_client::DEFAULT_IDLE_CHUNK_TIMEOUT_SECS)]
     idle_timeout_secs: u64,
 
     /// Seconds to wait between meaningful response events.
-    #[arg(long, default_value_t = crate::llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS)]
+    #[arg(long, default_value_t = anvil_llm::llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS)]
     stall_timeout_secs: u64,
 
     /// Additional attempts after local structured-output validation fails.

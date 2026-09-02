@@ -425,7 +425,7 @@ pub(crate) enum GoalFailureAction {
 
 /// Classify a failed goal turn. Transient failures back off and retry; fatal
 /// ones stop. Mirrors Codex's retryable/fatal split (the underlying predicate
-/// is [`crate::llm_client::is_retryable_llm_error`], applied in
+/// is [`anvil_llm::llm_client::is_retryable_llm_error`], applied in
 /// [`crate::tool_loop::run`]); the divergence is deliberate -- Codex bounds
 /// transient retries by a fixed count then aborts the turn, whereas an
 /// unbounded goal keeps retrying (with a capped delay) to survive the outage.
@@ -443,7 +443,7 @@ pub(crate) fn decide_after_goal_failure(
 }
 
 /// Upper bound on the inter-turn backoff for a goal surviving an outage. The
-/// base schedule is the codex-compatible [`crate::http_retry::retry_backoff`]
+/// base schedule is the codex-compatible [`anvil_llm::http_retry::retry_backoff`]
 /// (200ms * 2^(n-1) + jitter); because a goal retries an unbounded number of
 /// times, the delay is capped here so a long outage settles into a steady
 /// ~1-minute poll rather than growing without limit.
@@ -452,7 +452,8 @@ const GOAL_FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// Capped exponential backoff for the `consecutive_failures`-th transient
 /// failure in a row (1-based).
 pub(crate) fn goal_failure_backoff(consecutive_failures: u32) -> Duration {
-    crate::http_retry::retry_backoff(u64::from(consecutive_failures)).min(GOAL_FAILURE_BACKOFF_CAP)
+    anvil_llm::http_retry::retry_backoff(u64::from(consecutive_failures))
+        .min(GOAL_FAILURE_BACKOFF_CAP)
 }
 
 /// Build the continuation prompt injected as the user message for one goal

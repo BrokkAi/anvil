@@ -22,6 +22,44 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+/// Which Bedrock model catalog(s) discovery lists, in preference order.
+/// Persisted by hosts (Anvil stores it in its setup state) and passed to
+/// [`BedrockClient::new_with_catalog_mode`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BedrockCatalogMode {
+    MantleOnly,
+    NativeOnly,
+    #[default]
+    MantlePreferred,
+    NativePreferred,
+}
+
+impl BedrockCatalogMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MantleOnly => "mantle-only",
+            Self::NativeOnly => "native-only",
+            Self::MantlePreferred => "mantle-preferred",
+            Self::NativePreferred => "native-preferred",
+        }
+    }
+}
+
+impl std::str::FromStr for BedrockCatalogMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "mantle-only" => Ok(Self::MantleOnly),
+            "native-only" => Ok(Self::NativeOnly),
+            "mantle-preferred" => Ok(Self::MantlePreferred),
+            "native-preferred" => Ok(Self::NativePreferred),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Returns true when the model supports Anthropic-style prompt caching
 /// and needs explicit `cache_control` breakpoints in the request body.
 /// All Bedrock-hosted Claude models have "anthropic" in their id
@@ -431,7 +469,7 @@ pub struct BedrockClient {
     runtime_base_url: String,
     mantle_base_url: String,
     control_base_url: String,
-    catalog_mode: crate::setup_state::BedrockCatalogMode,
+    catalog_mode: BedrockCatalogMode,
     /// Per-resolved-model record of which Anthropic thinking wire shape the
     /// model actually accepts. Most shapes are selected from the documented
     /// model family, but this cache preserves the provider-directed adaptive
@@ -593,12 +631,15 @@ fn discovery_result_or_last_good<T: Clone>(
 }
 
 impl BedrockClient {
+    /// Builds a client with the default catalog mode. Hosts that persist a
+    /// user-selected catalog preference should call
+    /// [`Self::new_with_catalog_mode`] instead.
     pub fn new(bearer_token: String, region: String, default_model: String) -> Self {
         Self::new_with_catalog_mode(
             bearer_token,
             region,
             default_model,
-            crate::setup_state::bedrock_catalog_mode(),
+            BedrockCatalogMode::default(),
         )
     }
 
@@ -606,7 +647,7 @@ impl BedrockClient {
         bearer_token: String,
         region: String,
         default_model: String,
-        catalog_mode: crate::setup_state::BedrockCatalogMode,
+        catalog_mode: BedrockCatalogMode,
     ) -> Self {
         let http = OpenAiClient::apply_runtime_tls_workarounds(
             reqwest::Client::builder()
@@ -655,7 +696,7 @@ impl BedrockClient {
             runtime_base_url,
             mantle_base_url,
             control_base_url,
-            catalog_mode: crate::setup_state::BedrockCatalogMode::MantlePreferred,
+            catalog_mode: BedrockCatalogMode::MantlePreferred,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
             responses_chain: Arc::new(std::sync::Mutex::new(ResponsesChainCache::new(
                 RESPONSES_CHAIN_CACHE_CAP,
@@ -1332,8 +1373,6 @@ impl LlmBackend for BedrockClient {
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         Box::pin(async move {
-            use crate::setup_state::BedrockCatalogMode;
-
             let discover_mantle =
                 || async { self.list_mantle_model_metadata_with_fallback().await };
             let discover_native = || async { self.discover_model_metadata_with_fallback().await };
@@ -5364,8 +5403,6 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_mode_controls_sources_and_duplicate_precedence() {
-        use crate::setup_state::BedrockCatalogMode;
-
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -5473,8 +5510,6 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_discovery_uses_last_good_after_later_total_failure() {
-        use crate::setup_state::BedrockCatalogMode;
-
         let server = MockServer::start().await;
         let foundation_calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("GET"))

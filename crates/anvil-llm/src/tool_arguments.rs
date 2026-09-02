@@ -6,26 +6,26 @@ use std::error::Error;
 use std::fmt;
 
 #[derive(Debug, Clone)]
-pub(crate) struct NormalizedToolArguments {
-    pub(crate) value: Value,
-    pub(crate) arguments: String,
-    pub(crate) repaired: bool,
+pub struct NormalizedToolArguments {
+    pub value: Value,
+    pub arguments: String,
+    pub repaired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolArgumentErrorKind {
+pub enum ToolArgumentErrorKind {
     Invalid,
     Incomplete,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolArgumentParseError {
+pub struct ToolArgumentParseError {
     kind: ToolArgumentErrorKind,
     message: String,
 }
 
 impl ToolArgumentParseError {
-    pub(crate) fn kind(&self) -> ToolArgumentErrorKind {
+    pub fn kind(&self) -> ToolArgumentErrorKind {
         self.kind
     }
 }
@@ -38,7 +38,7 @@ impl fmt::Display for ToolArgumentParseError {
 
 impl Error for ToolArgumentParseError {}
 
-pub(crate) fn normalize_tool_arguments(
+pub fn normalize_tool_arguments(
     raw: &str,
 ) -> Result<NormalizedToolArguments, ToolArgumentParseError> {
     match serde_json::from_str::<Value>(raw) {

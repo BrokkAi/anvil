@@ -16,31 +16,31 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{
-    ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
-    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
-    is_output_budget_exhausted_error, is_retryable_llm_error, llm_retry_tier,
-    messages_include_images, rewrite_image_prompt_provider_error,
-};
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::runtime::{
     EventSink, PermissionBroker, PermissionDecision, PermissionOption as RuntimePermissionOption,
     PermissionOptionKind as RuntimePermissionOptionKind, PermissionPrompt, RuntimeEvent,
     ToolCallPhase,
 };
+use anvil_llm::llm_client::{
+    ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
+    is_output_budget_exhausted_error, is_retryable_llm_error, llm_retry_tier,
+    messages_include_images, rewrite_image_prompt_provider_error,
+};
 
 use crate::session::{
     PermissionMode, SessionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
     ToolExchangeStatus, TurnReplayEvent,
 };
-use crate::structured_output::StructuredOutputRequest;
 use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots, tool_result_failed};
-use crate::trace_logging::{append_trace_record, tool_timing_record};
 use crate::train_bifrost::{self, TrainingPacket};
+use anvil_llm::structured_output::StructuredOutputRequest;
+use anvil_llm::trace_logging::{append_trace_record, tool_timing_record};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
@@ -308,7 +308,7 @@ fn normalize_llm_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
     calls
         .into_iter()
         .map(|mut call| {
-            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+            match anvil_llm::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
                 Ok(normalized) => {
                     if normalized.repaired {
                         tracing::warn!(
@@ -417,10 +417,10 @@ async fn stream_chat_with_transient_retry(
             Ok(ref response)
                 if !cancel.is_cancelled()
                     && is_degenerate_empty_completion(response)
-                    && attempt < crate::http_retry::LlmRetryTier::Fast.max_attempts() =>
+                    && attempt < anvil_llm::http_retry::LlmRetryTier::Fast.max_attempts() =>
             {
-                let tier = crate::http_retry::LlmRetryTier::Fast;
-                let delay = crate::http_retry::retry_backoff_for_tier(tier, attempt);
+                let tier = anvil_llm::http_retry::LlmRetryTier::Fast;
+                let delay = anvil_llm::http_retry::retry_backoff_for_tier(tier, attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
@@ -436,7 +436,7 @@ async fn stream_chat_with_transient_retry(
                     max_attempts = tier.max_attempts(),
                     "retrying empty model completion (the model ended the turn without a message)"
                 );
-                crate::http_retry::sleep_before_retry_for_tier(
+                anvil_llm::http_retry::sleep_before_retry_for_tier(
                     "streaming LLM response",
                     tier,
                     attempt,
@@ -452,7 +452,7 @@ async fn stream_chat_with_transient_retry(
                     && llm_retry_tier(&error).is_some_and(|tier| attempt < tier.max_attempts()) =>
             {
                 let tier = llm_retry_tier(&error).expect("guard checked retry tier");
-                let delay = crate::http_retry::retry_backoff_for_tier(tier, attempt);
+                let delay = anvil_llm::http_retry::retry_backoff_for_tier(tier, attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
@@ -470,7 +470,7 @@ async fn stream_chat_with_transient_retry(
                     "retrying transient LLM stream failure (replaying the request; \
                      already-streamed text may be re-emitted)"
                 );
-                crate::http_retry::sleep_before_retry_for_tier(
+                anvil_llm::http_retry::sleep_before_retry_for_tier(
                     "streaming LLM response",
                     tier,
                     attempt,
@@ -490,7 +490,7 @@ async fn stream_chat_with_transient_retry(
 /// Surfaced out of [`run`] so autonomous drivers (e.g. `/goal`) can decide
 /// whether to back off and retry (transient outage) or stop and hand back to
 /// the user (fatal). `retryable` mirrors the classification the inner
-/// stream-retry already uses via [`crate::llm_client::is_retryable_llm_error`]
+/// stream-retry already uses via [`anvil_llm::llm_client::is_retryable_llm_error`]
 /// -- transient signals (server overload, rate limit, stream disconnect,
 /// network) are retryable; auth/invalid-request and panics are not.
 #[derive(Debug, Clone)]
@@ -664,7 +664,7 @@ fn trace_llm_text_response(turn: usize, text: &str, usage: TokenUsage) {
 fn trace_llm_tool_response(
     turn: usize,
     text: &str,
-    calls: &[crate::llm_client::ToolCall],
+    calls: &[anvil_llm::llm_client::ToolCall],
     usage: TokenUsage,
 ) {
     append_trace_record(serde_json::json!({
@@ -3146,7 +3146,7 @@ async fn execute_step_tool_calls(
         let kind = ToolRegistry::tool_kind(&tool_name);
 
         let normalized_arguments =
-            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+            match anvil_llm::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
                 Ok(normalized) => {
                     if normalized.repaired {
                         tracing::warn!(
@@ -3694,7 +3694,7 @@ async fn execute_parallel_safe_calls(
         let kind = ToolRegistry::tool_kind(&tool_name);
 
         let normalized_arguments =
-            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+            match anvil_llm::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
                 Ok(normalized) => {
                     if normalized.repaired {
                         tracing::warn!(
@@ -4946,18 +4946,18 @@ where
             Ok(response)
                 if !cancel.is_cancelled()
                     && is_degenerate_empty_completion(&response)
-                    && attempt < crate::http_retry::LlmRetryTier::Fast.max_attempts() =>
+                    && attempt < anvil_llm::http_retry::LlmRetryTier::Fast.max_attempts() =>
             {
                 usage.add(response.usage());
                 tracing::warn!(
                     attempt,
-                    max_attempts = crate::http_retry::LlmRetryTier::Fast.max_attempts(),
+                    max_attempts = anvil_llm::http_retry::LlmRetryTier::Fast.max_attempts(),
                     operation,
                     "retrying empty LLM completion with no visible output"
                 );
-                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                if let Err(error) = anvil_llm::http_retry::sleep_before_retry_for_tier(
                     operation,
-                    crate::http_retry::LlmRetryTier::Fast,
+                    anvil_llm::http_retry::LlmRetryTier::Fast,
                     attempt,
                     EMPTY_COMPLETION_RETRY_REASON.to_string(),
                     Some(cancel),
@@ -4983,7 +4983,7 @@ where
                     operation,
                     "retrying transient LLM stream failure with no visible output"
                 );
-                if let Err(error) = crate::http_retry::sleep_before_retry_for_tier(
+                if let Err(error) = anvil_llm::http_retry::sleep_before_retry_for_tier(
                     operation,
                     tier,
                     attempt,
@@ -6475,7 +6475,7 @@ mod tests {
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback["bedrock::luna"].input_tokens, 100);
     }
-    use crate::llm_client::{
+    use anvil_llm::llm_client::{
         FunctionCall, FunctionDef, IncompleteStreamError, OutputBudgetExhaustedError,
     };
     use futures::future::{BoxFuture, FutureExt};
@@ -7164,28 +7164,28 @@ mod tests {
     }
 
     fn codex_stream_read_error() -> anyhow::Error {
-        crate::http_retry::retryable_llm_error(
+        anvil_llm::http_retry::retryable_llm_error(
             "Codex stream read error: simulated disconnect",
-            crate::http_retry::RetryableLlmError::fast("Codex stream read error"),
+            anvil_llm::http_retry::RetryableLlmError::fast("Codex stream read error"),
         )
     }
 
     fn codex_server_overloaded_error() -> anyhow::Error {
-        crate::http_retry::retryable_llm_error_for_responses_failure(
+        anvil_llm::http_retry::retryable_llm_error_for_responses_failure(
             "Codex Responses stream failed: server_is_overloaded: Our servers are currently overloaded. Please try again later.",
             "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
         )
     }
 
     fn responses_server_error() -> anyhow::Error {
-        crate::http_retry::retryable_llm_error_for_responses_failure(
+        anvil_llm::http_retry::retryable_llm_error_for_responses_failure(
             "Responses stream failed: server_error: The server had an error while processing your request.",
             "server_error: The server had an error while processing your request.",
         )
     }
 
     fn responses_rate_limit_error() -> anyhow::Error {
-        crate::http_retry::retryable_llm_error_for_responses_failure(
+        anvil_llm::http_retry::retryable_llm_error_for_responses_failure(
             "Responses stream failed: rate_limit_exceeded: slow down",
             "rate_limit_exceeded: slow down",
         )
@@ -7925,18 +7925,19 @@ mod tests {
 
     #[test]
     fn train_bifrost_policy_is_env_controlled() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _lock = anvil_llm::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
 
-        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(TRAIN_BIFROST_ENV);
+        let _scope = anvil_llm::openrouter_auth::test_support::EnvScope::remove(TRAIN_BIFROST_ENV);
         assert!(!train_bifrost_enabled());
         drop(_scope);
 
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "1");
+        let _scope =
+            anvil_llm::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "1");
         assert!(train_bifrost_enabled());
         drop(_scope);
 
         let _scope =
-            crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "false");
+            anvil_llm::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "false");
         assert!(!train_bifrost_enabled());
     }
 
@@ -8042,7 +8043,7 @@ mod tests {
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            crate::http_retry::LLM_MAX_ATTEMPTS as usize
+            anvil_llm::http_retry::LLM_MAX_ATTEMPTS as usize
         );
         assert!(matches!(response, LlmResponse::Text { text, .. } if text.is_empty()));
         assert!(output.lock().unwrap().is_empty());
@@ -8109,7 +8110,9 @@ mod tests {
         .expect_err("output budget exhaustion should not retry");
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(crate::llm_client::is_output_budget_exhausted_error(&err));
+        assert!(anvil_llm::llm_client::is_output_budget_exhausted_error(
+            &err
+        ));
         assert!(!is_retryable_llm_error(&err));
         assert!(output.lock().unwrap().is_empty());
     }
@@ -9010,7 +9013,7 @@ mod tests {
         };
         let sessions = SessionStore::new("m".to_string());
 
-        let (exec, _usage, _usage_by_model) = crate::trace_logging::with_trace_path(
+        let (exec, _usage, _usage_by_model) = anvil_llm::trace_logging::with_trace_path(
             &trace,
             execute_subagent(
                 &llm,
@@ -9096,7 +9099,7 @@ mod tests {
         let sessions = SessionStore::new("m".to_string());
         let mut current_plan = None;
 
-        let exec = crate::trace_logging::with_trace_path(
+        let exec = anvil_llm::trace_logging::with_trace_path(
             &trace,
             execute_update_plan(
                 &registry,

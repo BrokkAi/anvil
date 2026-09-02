@@ -4,20 +4,20 @@ use anyhow::{Context, Result};
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const LLM_MAX_ATTEMPTS: u64 = 4;
+pub const LLM_MAX_ATTEMPTS: u64 = 4;
 pub(crate) const LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS: u64 = 12;
 const REQUEST_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const GATEWAY_TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const GATEWAY_TRANSIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmRetryTier {
+pub enum LlmRetryTier {
     Fast,
     GatewayTransient,
 }
 
 impl LlmRetryTier {
-    pub(crate) fn max_attempts(self) -> u64 {
+    pub fn max_attempts(self) -> u64 {
         match self {
             Self::Fast => LLM_MAX_ATTEMPTS,
             Self::GatewayTransient => LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS,
@@ -26,25 +26,25 @@ impl LlmRetryTier {
 }
 
 #[derive(Debug)]
-pub(crate) struct RetryableLlmError {
+pub struct RetryableLlmError {
     tier: LlmRetryTier,
     reason: &'static str,
 }
 
 impl RetryableLlmError {
-    pub(crate) fn new(tier: LlmRetryTier, reason: &'static str) -> Self {
+    pub fn new(tier: LlmRetryTier, reason: &'static str) -> Self {
         Self { tier, reason }
     }
 
-    pub(crate) fn fast(reason: &'static str) -> Self {
+    pub fn fast(reason: &'static str) -> Self {
         Self::new(LlmRetryTier::Fast, reason)
     }
 
-    pub(crate) fn gateway_transient(reason: &'static str) -> Self {
+    pub fn gateway_transient(reason: &'static str) -> Self {
         Self::new(LlmRetryTier::GatewayTransient, reason)
     }
 
-    pub(crate) fn tier(&self) -> LlmRetryTier {
+    pub fn tier(&self) -> LlmRetryTier {
         self.tier
     }
 }
@@ -128,10 +128,7 @@ pub(crate) fn fatal_daily_quota_error(message: &str, body: &str) -> Option<anyho
     Some(anyhow::Error::new(FatalLlmQuotaError { quota }).context(message.to_string()))
 }
 
-pub(crate) fn retryable_llm_error(
-    message: impl Into<String>,
-    marker: RetryableLlmError,
-) -> anyhow::Error {
+pub fn retryable_llm_error(message: impl Into<String>, marker: RetryableLlmError) -> anyhow::Error {
     anyhow::Error::new(marker).context(message.into())
 }
 
@@ -211,7 +208,7 @@ pub(crate) fn retryable_llm_error_for_status_and_body(
     retryable_llm_error_for_body(message, body)
 }
 
-pub(crate) fn retryable_llm_error_for_responses_failure(
+pub fn retryable_llm_error_for_responses_failure(
     message: impl Into<String>,
     failure: &str,
 ) -> anyhow::Error {
@@ -355,7 +352,7 @@ pub(crate) async fn sleep_before_retry(
     sleep_before_retry_for_tier(operation, LlmRetryTier::Fast, attempt, reason, cancel).await
 }
 
-pub(crate) async fn sleep_before_retry_for_tier(
+pub async fn sleep_before_retry_for_tier(
     operation: &str,
     tier: LlmRetryTier,
     attempt: u64,
@@ -382,14 +379,14 @@ pub(crate) async fn sleep_before_retry_for_tier(
     Ok(())
 }
 
-pub(crate) fn retry_backoff_for_tier(tier: LlmRetryTier, attempt: u64) -> Duration {
+pub fn retry_backoff_for_tier(tier: LlmRetryTier, attempt: u64) -> Duration {
     match tier {
         LlmRetryTier::Fast => retry_backoff(attempt),
         LlmRetryTier::GatewayTransient => gateway_transient_retry_backoff(attempt),
     }
 }
 
-pub(crate) fn retry_backoff(attempt: u64) -> Duration {
+pub fn retry_backoff(attempt: u64) -> Duration {
     let exp = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
     let raw = REQUEST_RETRY_BASE_DELAY
         .as_millis()

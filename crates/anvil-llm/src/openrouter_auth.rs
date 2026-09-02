@@ -200,8 +200,8 @@ pub fn logout() -> Result<()> {
 /// single process-wide mutex. Env mutation in multi-threaded Rust is
 /// `unsafe` (POSIX `getenv` is not atomic), so one guard for all
 /// env-touching tests is the minimum-friction safe pattern.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use std::ffi::OsStr;
     use tokio::sync::Mutex;
 
@@ -216,18 +216,18 @@ pub(crate) mod test_support {
     /// `#[test]` cases acquire it via `blocking_lock()`; async cases
     /// use `.lock().await`. The mutex is constructed via `const_new`
     /// so it fits in a plain `static`.
-    pub(crate) static ENV_GUARD: Mutex<()> = Mutex::const_new(());
+    pub static ENV_GUARD: Mutex<()> = Mutex::const_new(());
 
     /// RAII guard that sets (or removes) an env var on construction and
     /// restores the previous value on drop. Pair with a held lock on
     /// `ENV_GUARD` for cross-test safety.
-    pub(crate) struct EnvScope {
+    pub struct EnvScope {
         var: &'static str,
         prev: Option<String>,
     }
 
     impl EnvScope {
-        pub(crate) fn set(var: &'static str, value: impl AsRef<OsStr>) -> Self {
+        pub fn set(var: &'static str, value: impl AsRef<OsStr>) -> Self {
             let prev = std::env::var(var).ok();
             // SAFETY: callers hold `ENV_GUARD` so no concurrent thread
             // is reading or writing this process's env table.
@@ -237,7 +237,7 @@ pub(crate) mod test_support {
             Self { var, prev }
         }
 
-        pub(crate) fn remove(var: &'static str) -> Self {
+        pub fn remove(var: &'static str) -> Self {
             let prev = std::env::var(var).ok();
             // SAFETY: see `set`.
             unsafe {
