@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::llm_client::BearerTokenProvider;
+use crate::llm_client::{BearerTokenProvider, LlmBackend, OpenAiClient};
 
 pub const KIMI_API_KEY_ENV: &str = "KIMI_API_KEY";
 pub const KIMI_CODE_BASE_URL_ENV: &str = "KIMI_CODE_BASE_URL";
@@ -22,6 +22,88 @@ const KIMI_CUSTOM_HEADERS_ENV: &str = "KIMI_CODE_CUSTOM_HEADERS";
 const DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
 const OAUTH_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const REFRESH_MARGIN_SECS: u64 = 60;
+
+/// Explicit, process-environment-independent configuration for one Kimi profile.
+#[derive(Clone)]
+pub struct KimiBackendConfig {
+    pub api_key: Option<String>,
+    pub credentials_path: PathBuf,
+    pub device_id_path: Option<PathBuf>,
+    pub oauth_host: String,
+    pub base_url: String,
+    pub custom_headers: reqwest::header::HeaderMap,
+}
+
+impl KimiBackendConfig {
+    pub fn from_home(home: impl AsRef<Path>) -> Self {
+        let home = home.as_ref();
+        Self {
+            api_key: None,
+            credentials_path: home.join("credentials").join("kimi-code.json"),
+            device_id_path: Some(home.join("device_id")),
+            oauth_host: DEFAULT_OAUTH_HOST.to_string(),
+            base_url: DEFAULT_KIMI_CODE_BASE_URL.to_string(),
+            custom_headers: reqwest::header::HeaderMap::new(),
+        }
+    }
+
+    pub fn build(self) -> Result<Option<Arc<dyn LlmBackend>>> {
+        let auth: Arc<dyn BearerTokenProvider> =
+            if let Some(api_key) = self.api_key.filter(|value| !value.trim().is_empty()) {
+                Arc::new(StaticToken { token: api_key })
+            } else {
+                if !self.credentials_path.is_file() {
+                    return Ok(None);
+                }
+                Arc::new(KimiOAuthTokenProvider {
+                    path: self.credentials_path,
+                    oauth_host: self.oauth_host,
+                    http: reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(10))
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .context("building Kimi OAuth HTTP client")?,
+                    refresh_lock: tokio::sync::Mutex::new(()),
+                })
+            };
+        let headers = profile_headers(self.device_id_path.as_deref(), self.custom_headers)?;
+        Ok(Some(Arc::new(OpenAiClient::with_kimi_support(
+            self.base_url.trim_end_matches('/').to_string(),
+            auth,
+            headers,
+        ))))
+    }
+}
+
+fn profile_headers(
+    device_id_path: Option<&Path>,
+    mut headers: reqwest::header::HeaderMap,
+) -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_str(concat!("anvil/", env!("CARGO_PKG_VERSION")))?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-platform"),
+        HeaderValue::from_static("kimi_code_cli"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-version"),
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    if let Some(device_id) = device_id_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        headers.insert(
+            HeaderName::from_static("x-msh-device-id"),
+            HeaderValue::from_str(&device_id)?,
+        );
+    }
+    Ok(headers)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KimiCredentials {
@@ -457,5 +539,18 @@ mod tests {
             LlmResponse::Text { text, .. } => assert!(!text.trim().is_empty()),
             LlmResponse::ToolCalls { .. } => panic!("K3 unexpectedly returned a tool call"),
         }
+    }
+
+    #[test]
+    fn explicit_profile_config_derives_only_from_its_home() {
+        let config = KimiBackendConfig::from_home("/profiles/kimi-two");
+        assert_eq!(
+            config.credentials_path,
+            Path::new("/profiles/kimi-two/credentials/kimi-code.json")
+        );
+        assert_eq!(
+            config.device_id_path.as_deref(),
+            Some(Path::new("/profiles/kimi-two/device_id"))
+        );
     }
 }

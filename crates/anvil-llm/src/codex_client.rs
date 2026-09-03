@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
+use crate::codex_auth::{
+    AuthDotJson, auth_json_path, is_stale, read_auth_dot_json_at, refresh_if_stale_at, urlencode,
+};
 use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, CodexReasoningItem, FunctionCall, IdleTimeouts,
@@ -198,6 +200,7 @@ impl RequestIdentity<'_> {
 /// transparently refreshes the OAuth tokens when they go stale.
 pub struct CodexClient {
     http: reqwest::Client,
+    auth_path: std::path::PathBuf,
     /// Serialize concurrent token-refresh attempts. Without this, two
     /// in-flight prompts hitting a 401 race each other into the refresh
     /// endpoint and one of the resulting `refresh_token` values gets
@@ -234,6 +237,14 @@ impl Default for CodexClient {
 
 impl CodexClient {
     pub fn new() -> Self {
+        Self::with_auth_path(
+            auth_json_path().unwrap_or_else(|_| std::path::PathBuf::from("auth.json")),
+        )
+    }
+
+    /// Build a ChatGPT-subscription client bound to one profile's auth file.
+    /// Every read and token-refresh write remains scoped to this path.
+    pub fn with_auth_path(auth_path: impl Into<std::path::PathBuf>) -> Self {
         // The ChatGPT backend sits behind Cloudflare. Without a cookie
         // jar we drop Cloudflare's `__cf_bm` / `cf_clearance` / etc. set
         // on the first response, which makes the bot manager
@@ -267,6 +278,7 @@ impl CodexClient {
         .expect("failed to build HTTP client");
         Self {
             http,
+            auth_path: auth_path.into(),
             refresh_lock: Arc::new(Mutex::new(())),
             discovery_notices: Arc::new(StdMutex::new(Vec::new())),
             responses_url: CHATGPT_RESPONSES_URL.to_string(),
@@ -287,6 +299,7 @@ impl CodexClient {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("failed to build test HTTP client"),
+            auth_path: auth_json_path().unwrap_or_else(|_| std::path::PathBuf::from("auth.json")),
             refresh_lock: Arc::new(Mutex::new(())),
             discovery_notices: Arc::new(StdMutex::new(Vec::new())),
             responses_url,
@@ -304,7 +317,7 @@ impl CodexClient {
     /// at which point we re-read under the lock to avoid duplicate
     /// refreshes if another worker beat us to it.
     async fn load_credentials(&self) -> Result<ChatGptCredentials> {
-        let auth = read_auth_dot_json()?.ok_or_else(|| {
+        let auth = read_auth_dot_json_at(&self.auth_path)?.ok_or_else(|| {
             anyhow!("~/.codex/auth.json not found; run /setup codex to authenticate")
         })?;
         if !is_chatgpt_mode(&auth) {
@@ -325,14 +338,14 @@ impl CodexClient {
         let _guard = self.refresh_lock.lock().await;
         // Re-read under the lock: another worker might have refreshed
         // while we waited. Skip the refresh if so.
-        let mut auth = read_auth_dot_json()?.ok_or_else(|| {
+        let mut auth = read_auth_dot_json_at(&self.auth_path)?.ok_or_else(|| {
             anyhow!("~/.codex/auth.json disappeared while waiting for refresh lock")
         })?;
         if !is_chatgpt_mode(&auth) {
             anyhow::bail!("auth.json switched out of chatgpt mode while waiting for refresh lock");
         }
         if is_stale(&auth)
-            && let Err(e) = refresh_if_stale(&mut auth).await
+            && let Err(e) = refresh_if_stale_at(&self.auth_path, &mut auth).await
         {
             tracing::warn!("proactive token refresh failed (will retry on 401): {e:#}");
         }
@@ -343,7 +356,7 @@ impl CodexClient {
     /// 401 to retry once with rotated credentials before giving up.
     async fn force_refresh(&self) -> Result<ChatGptCredentials> {
         let _guard = self.refresh_lock.lock().await;
-        let mut auth = read_auth_dot_json()?
+        let mut auth = read_auth_dot_json_at(&self.auth_path)?
             .ok_or_else(|| anyhow!("~/.codex/auth.json disappeared between requests"))?;
         if !is_chatgpt_mode(&auth) {
             anyhow::bail!("auth.json no longer in chatgpt mode");
@@ -355,7 +368,7 @@ impl CodexClient {
         // into the refresh endpoint themselves. refresh_if_stale will
         // persist the new credentials atomically on success.
         auth.last_refresh = Some(chrono::Utc::now() - chrono::Duration::days(30));
-        if let Err(e) = refresh_if_stale(&mut auth).await {
+        if let Err(e) = refresh_if_stale_at(&self.auth_path, &mut auth).await {
             return Err(e.context("forced token refresh failed"));
         }
         ChatGptCredentials::from_auth(&auth)

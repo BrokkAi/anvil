@@ -23,6 +23,23 @@ pub struct GrokClient {
     client_version: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct GrokClientConfig {
+    pub auth_path: std::path::PathBuf,
+    pub version_path: Option<std::path::PathBuf>,
+    pub base_url: String,
+}
+
+impl GrokClientConfig {
+    pub fn from_home(home: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            auth_path: home.as_ref().join("auth.json"),
+            version_path: Some(home.as_ref().join("version.json")),
+            base_url: GROK_API_BASE_URL.to_string(),
+        }
+    }
+}
+
 impl GrokClient {
     pub fn load() -> Result<Option<Arc<dyn LlmBackend>>> {
         let Some(auth) = GrokAuthManager::load()? else {
@@ -33,6 +50,20 @@ impl GrokClient {
             http: reqwest::Client::new(),
             base_url: GROK_API_BASE_URL.to_string(),
             client_version: crate::grok_auth::client_version(),
+        })))
+    }
+
+    pub fn load_with_config(config: GrokClientConfig) -> Result<Option<Arc<dyn LlmBackend>>> {
+        let Some(auth) = GrokAuthManager::load_from_path(config.auth_path)? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            auth,
+            http: reqwest::Client::new(),
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            client_version: crate::grok_auth::client_version_from_path(
+                config.version_path.as_deref(),
+            ),
         })))
     }
 
@@ -314,6 +345,19 @@ fn model_metadata(value: Value) -> Option<ModelMetadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_profile_config_derives_only_from_its_home() {
+        let config = GrokClientConfig::from_home("/profiles/grok-two");
+        assert_eq!(
+            config.auth_path,
+            std::path::Path::new("/profiles/grok-two/auth.json")
+        );
+        assert_eq!(
+            config.version_path.as_deref(),
+            Some(std::path::Path::new("/profiles/grok-two/version.json"))
+        );
+    }
     use serde_json::json;
 
     #[test]

@@ -5,20 +5,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
 use anvil_llm::codex_client::CodexClient;
-use anvil_llm::llm_client::{
-    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
-    stream_chat_no_visible_output_with_retry,
-};
-use anvil_llm::structured_output::{
-    StructuredOutputRequest, StructuredOutputResult, validate_response, validation_retry_prompt,
-};
+use anvil_llm::infer::{InferOptions, StructuredInferRequest, infer_structured};
+use anvil_llm::llm_client::{IdleTimeouts, LlmBackend};
 
 const CODEX_MODEL_PREFIX: &str = "codex::";
 const KIMI_MODEL_PREFIX: &str = "kimi::";
@@ -50,51 +43,6 @@ pub(crate) struct InferArgs {
     /// Additional attempts after local structured-output validation fails.
     #[arg(long, default_value_t = 1)]
     validation_retries: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferRequest {
-    messages: Vec<InferMessage>,
-    schema_name: String,
-    schema: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct InferResponse {
-    model: String,
-    reasoning_effort: Option<String>,
-    service_tier: Option<String>,
-    output: Value,
-    usage: InferUsage,
-}
-
-#[derive(Debug, Serialize)]
-struct InferUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    thought_tokens: u64,
-    cached_read_tokens: u64,
-    cached_write_tokens: u64,
-}
-
-impl From<TokenUsage> for InferUsage {
-    fn from(value: TokenUsage) -> Self {
-        Self {
-            input_tokens: value.input_tokens,
-            output_tokens: value.output_tokens,
-            thought_tokens: value.thought_tokens,
-            cached_read_tokens: value.cached_read_tokens,
-            cached_write_tokens: value.cached_write_tokens,
-        }
-    }
 }
 
 pub(crate) async fn run(args: &InferArgs) -> Result<()> {
@@ -149,107 +97,54 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
     std::io::stdin()
         .read_to_string(&mut raw)
         .context("reading inference request from stdin")?;
-    let input: InferRequest =
+    let input: StructuredInferRequest =
         serde_json::from_str(&raw).context("parsing inference request JSON")?;
-    let mut messages = validate_messages(input.messages)?;
-    if input.schema_name.trim().is_empty() {
-        bail!("schema_name must be non-empty");
-    }
-    if !input.schema.is_object() {
-        bail!("schema must be a JSON object");
-    }
-    jsonschema::validator_for(&input.schema).context("compiling structured-output schema")?;
-    let structured_output = StructuredOutputRequest {
-        schema_name: input.schema_name,
-        schema: input.schema,
-        allow_coercion: false,
-        prefer_json_object: false,
-    };
-
     let cancel = CancellationToken::new();
-    let mut total_usage = TokenUsage::default();
-    let mut validation_attempt = 0;
-    let output = loop {
-        let response = stream_chat_no_visible_output_with_retry(
-            backend.as_ref(),
-            "bare structured inference",
-            &cancel,
-            || StreamChatRequest {
-                model: wire_model.clone(),
-                messages: messages.clone(),
-                tools: None,
-                reasoning_effort: args.reasoning_effort.clone(),
-                service_tier: args.service_tier.clone(),
-                temperature: None,
-                structured_output: Some(structured_output.clone()),
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: IdleTimeouts {
-                    first_progress: Duration::from_secs(args.idle_timeout_secs),
-                    inter_chunk: Duration::from_secs(args.stall_timeout_secs),
-                },
+    let mut result = infer_structured(
+        backend.as_ref(),
+        wire_model,
+        input,
+        InferOptions {
+            reasoning_effort: args.reasoning_effort.clone(),
+            service_tier: args.service_tier.clone(),
+            idle_timeouts: IdleTimeouts {
+                first_progress: Duration::from_secs(args.idle_timeout_secs),
+                inter_chunk: Duration::from_secs(args.stall_timeout_secs),
             },
-        )
-        .await
-        .context("running bare structured inference")?;
-
-        let (text, usage) = match response {
-            LlmResponse::Text { text, usage, .. } => (text, usage),
-            LlmResponse::ToolCalls { .. } => {
-                bail!("inference backend returned tool calls even though no tools were supplied")
-            }
-        };
-        total_usage.add(usage);
-        match validate_response(&structured_output, &text) {
-            StructuredOutputResult::Success(success) => break success.validated_output,
-            StructuredOutputResult::CoercedSuccess(_) => {
-                unreachable!("bare inference disables structured-output coercion")
-            }
-            StructuredOutputResult::ValidationError(error)
-                if validation_attempt < args.validation_retries =>
-            {
-                validation_attempt += 1;
-                messages.push(ChatMessage::assistant(text));
-                messages.push(ChatMessage::user(validation_retry_prompt(&error)));
-            }
-            StructuredOutputResult::ValidationError(error) => {
-                bail!("structured output validation failed: {:?}", error.errors)
-            }
-        }
-    };
-    let result = InferResponse {
-        model: args.model.clone(),
-        reasoning_effort: args.reasoning_effort.clone(),
-        service_tier: args.service_tier.clone(),
-        output,
-        usage: total_usage.into(),
-    };
+            validation_retries: args.validation_retries,
+        },
+        cancel,
+    )
+    .await
+    .map_err(InferErrorContext::from)?;
+    result.model.clone_from(&args.model);
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .context("writing inference response JSON")?;
     std::io::stdout().lock().write_all(b"\n")?;
     Ok(())
 }
 
-fn validate_messages(messages: Vec<InferMessage>) -> Result<Vec<ChatMessage>> {
-    if messages.is_empty() {
-        bail!("messages must contain at least one system or user message");
+struct InferErrorContext(anvil_llm::infer::InferError);
+
+impl From<anvil_llm::infer::InferError> for InferErrorContext {
+    fn from(error: anvil_llm::infer::InferError) -> Self {
+        Self(error)
     }
-    messages
-        .into_iter()
-        .enumerate()
-        .map(|(index, message)| {
-            if message.content.is_empty() {
-                bail!("messages[{index}].content must be non-empty");
-            }
-            match message.role.as_str() {
-                "system" => Ok(ChatMessage::system(message.content)),
-                "user" => Ok(ChatMessage::user(message.content)),
-                role => bail!("messages[{index}].role must be system or user, got {role:?}"),
-            }
-        })
-        .collect()
 }
+
+impl std::fmt::Debug for InferErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::fmt::Display for InferErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InferErrorContext {}
 
 #[cfg(test)]
 mod tests {
@@ -257,29 +152,26 @@ mod tests {
 
     #[test]
     fn messages_reject_agent_and_tool_history() {
-        let error = validate_messages(vec![InferMessage {
-            role: "assistant".into(),
-            content: "prior answer".into(),
-        }])
+        let error = serde_json::from_value::<StructuredInferRequest>(serde_json::json!({
+            "messages": [{"role": "assistant", "content": "prior answer"}],
+            "schema_name": "answer",
+            "schema": {"type": "object"}
+        }))
         .unwrap_err();
-        assert!(error.to_string().contains("must be system or user"));
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]
     fn messages_accept_system_and_user_text() {
-        let messages = validate_messages(vec![
-            InferMessage {
-                role: "system".into(),
-                content: "judge carefully".into(),
-            },
-            InferMessage {
-                role: "user".into(),
-                content: "item".into(),
-            },
-        ])
+        let request = serde_json::from_value::<StructuredInferRequest>(serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "judge carefully"},
+                {"role": "user", "content": "item"}
+            ],
+            "schema_name": "answer",
+            "schema": {"type": "object"}
+        }))
         .unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
+        assert_eq!(request.messages.len(), 2);
     }
 }

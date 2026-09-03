@@ -220,10 +220,14 @@ pub fn auth_json_path() -> Result<PathBuf> {
 
 pub fn read_auth_dot_json() -> Result<Option<AuthDotJson>> {
     let path = auth_json_path()?;
+    read_auth_dot_json_at(&path)
+}
+
+pub fn read_auth_dot_json_at(path: &Path) -> Result<Option<AuthDotJson>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let parsed = serde_json::from_slice::<AuthDotJson>(&bytes)
         .with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(parsed))
@@ -234,6 +238,10 @@ pub fn read_auth_dot_json() -> Result<Option<AuthDotJson>> {
 /// process is interrupted mid-flush.
 pub fn write_auth_dot_json(auth: &AuthDotJson) -> Result<()> {
     let path = auth_json_path()?;
+    write_auth_dot_json_at(&path, auth)
+}
+
+pub fn write_auth_dot_json_at(path: &Path, auth: &AuthDotJson) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -242,7 +250,7 @@ pub fn write_auth_dot_json(auth: &AuthDotJson) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(auth).context("serializing AuthDotJson")?;
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
     set_user_only_perms(&tmp)?;
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
@@ -797,6 +805,11 @@ pub fn is_stale(auth: &AuthDotJson) -> bool {
 /// Refresh the API key if the stored credentials are stale. Used on
 /// startup so long-running ACP sessions don't 401 mid-flight.
 pub async fn refresh_if_stale(auth: &mut AuthDotJson) -> Result<bool> {
+    let path = auth_json_path()?;
+    refresh_if_stale_at(&path, auth).await
+}
+
+pub async fn refresh_if_stale_at(path: &Path, auth: &mut AuthDotJson) -> Result<bool> {
     if !is_stale(auth) {
         return Ok(false);
     }
@@ -841,7 +854,7 @@ pub async fn refresh_if_stale(auth: &mut AuthDotJson) -> Result<bool> {
         }),
         last_refresh: Some(Utc::now()),
     };
-    write_auth_dot_json(auth)?;
+    write_auth_dot_json_at(path, auth)?;
     Ok(true)
 }
 
@@ -1019,6 +1032,42 @@ mod tests {
         assert_eq!(
             p,
             std::path::PathBuf::from("/tmp/codex-home-test-xyz/auth.json")
+        );
+    }
+
+    #[test]
+    fn explicit_auth_paths_are_isolated() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_path = first.path().join("auth.json");
+        let second_path = second.path().join("auth.json");
+        let first_auth = AuthDotJson {
+            auth_mode: Some("apikey".into()),
+            openai_api_key: Some("first".into()),
+            tokens: None,
+            last_refresh: None,
+        };
+        let second_auth = AuthDotJson {
+            openai_api_key: Some("second".into()),
+            ..first_auth.clone()
+        };
+        write_auth_dot_json_at(&first_path, &first_auth).unwrap();
+        write_auth_dot_json_at(&second_path, &second_auth).unwrap();
+        assert_eq!(
+            read_auth_dot_json_at(&first_path)
+                .unwrap()
+                .unwrap()
+                .openai_api_key
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            read_auth_dot_json_at(&second_path)
+                .unwrap()
+                .unwrap()
+                .openai_api_key
+                .as_deref(),
+            Some("second")
         );
     }
 

@@ -75,6 +75,10 @@ pub(crate) struct GrokAuthManager {
 impl GrokAuthManager {
     pub(crate) fn load() -> Result<Option<Arc<Self>>> {
         let path = credentials_path()?;
+        Self::load_from_path(path)
+    }
+
+    pub(crate) fn load_from_path(path: PathBuf) -> Result<Option<Arc<Self>>> {
         if !path.is_file() {
             return Ok(None);
         }
@@ -246,6 +250,10 @@ pub(crate) fn client_version() -> String {
     let version_path = credentials_path()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("version.json")));
+    client_version_from_path(version_path.as_deref())
+}
+
+pub(crate) fn client_version_from_path(version_path: Option<&Path>) -> String {
     version_path
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
