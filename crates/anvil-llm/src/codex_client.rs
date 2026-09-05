@@ -21,6 +21,13 @@
 //! up identically to Codex CLI from the server's perspective -- this is
 //! a pragmatic compatibility choice, not impersonation: the user *is*
 //! authenticating with their own OAuth tokens.
+//!
+//! In addition to the Responses API, this client can send audio to
+//! `https://chatgpt.com/backend-api/transcribe`. That endpoint uses the same
+//! OAuth bearer token and `ChatGPT-Account-ID` account binding, so its usage
+//! is charged to the user's ChatGPT subscription. Callers should treat the
+//! audio and transcript as passing through the ChatGPT backend under that
+//! same trust posture.
 
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -50,6 +57,7 @@ use crate::responses_chain::{
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
 };
+use crate::transcribe::{TranscribeRequest, TranscribeResponse};
 
 // Codex CLI's `chatgpt_base_url` default is
 // `https://chatgpt.com/backend-api/codex`; the Responses API and the
@@ -59,6 +67,9 @@ use crate::structured_output::{
 
 /// Streaming completions endpoint (Responses API).
 const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+/// ChatGPT subscription-backed audio transcription endpoint.
+const CHATGPT_TRANSCRIBE_URL: &str = "https://chatgpt.com/backend-api/transcribe";
 
 /// Model discovery endpoint. Returns `{"models": [{"slug": ..., "display_name": ..., ...}]}`
 /// for the slugs the user's ChatGPT plan can route to. Codex CLI fetches
@@ -182,17 +193,24 @@ struct RequestIdentity<'a> {
 
 impl RequestIdentity<'_> {
     fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.creds.access_token),
-            )
-            .header("ChatGPT-Account-ID", &self.creds.account_id)
+        apply_chatgpt_auth(request, self.creds)
             // These two are what actually steer this backend's prompt cache;
             // see `build_responses_request` for the measurements.
             .header("session-id", &self.conversation.session_id)
             .header("thread-id", &self.conversation.thread_id)
     }
+}
+
+/// Apply the account-bound authentication headers shared by ChatGPT backend
+/// endpoints. Conversation-specific routing headers are added by
+/// `RequestIdentity` only where the endpoint supports them.
+fn apply_chatgpt_auth(
+    request: reqwest::RequestBuilder,
+    creds: &ChatGptCredentials,
+) -> reqwest::RequestBuilder {
+    request
+        .header("Authorization", format!("Bearer {}", creds.access_token))
+        .header("ChatGPT-Account-ID", &creds.account_id)
 }
 
 /// LLM backend that proxies to the ChatGPT subscription via the
@@ -210,6 +228,9 @@ pub struct CodexClient {
     /// Streaming completions endpoint. Always `CHATGPT_RESPONSES_URL` in
     /// production; tests point it at a local mock server.
     responses_url: String,
+    /// Audio transcription endpoint. Always `CHATGPT_TRANSCRIBE_URL` in
+    /// production; tests point it at a local mock server.
+    transcribe_url: String,
     /// Content-keyed cache mapping a hash of a message context to the
     /// `CodexPromptCacheIdentity` that context was last sent under, so the
     /// next turn on the same conversation repeats that identity and lands on
@@ -282,6 +303,7 @@ impl CodexClient {
             refresh_lock: Arc::new(Mutex::new(())),
             discovery_notices: Arc::new(StdMutex::new(Vec::new())),
             responses_url: CHATGPT_RESPONSES_URL.to_string(),
+            transcribe_url: CHATGPT_TRANSCRIBE_URL.to_string(),
             prompt_cache_identities: Arc::new(StdMutex::new(ResponsesChainCache::new(
                 RESPONSES_CHAIN_CACHE_CAP,
             ))),
@@ -293,6 +315,12 @@ impl CodexClient {
     /// set, body shape, identity bookkeeping -- is the production one.
     #[cfg(test)]
     fn with_responses_url(responses_url: String) -> Self {
+        Self::with_responses_and_transcribe_urls(responses_url, CHATGPT_TRANSCRIBE_URL.to_string())
+    }
+
+    /// Test client pointed at local mocks of both ChatGPT endpoints.
+    #[cfg(test)]
+    fn with_responses_and_transcribe_urls(responses_url: String, transcribe_url: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -303,6 +331,7 @@ impl CodexClient {
             refresh_lock: Arc::new(Mutex::new(())),
             discovery_notices: Arc::new(StdMutex::new(Vec::new())),
             responses_url,
+            transcribe_url,
             prompt_cache_identities: Arc::new(StdMutex::new(ResponsesChainCache::new(
                 RESPONSES_CHAIN_CACHE_CAP,
             ))),
@@ -416,6 +445,121 @@ impl CodexClient {
     async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
         let creds = self.load_credentials().await?;
         self.stream_chat_with_credentials(creds, request).await
+    }
+
+    /// Transcribe audio through ChatGPT's subscription-backed endpoint.
+    /// Credentials are loaded (and proactively refreshed) exactly as they are
+    /// for Responses requests. A 401 refreshes the OAuth credentials once and
+    /// retries the multipart request; the request's timeout covers the whole
+    /// operation, including retries and response-body parsing.
+    pub async fn transcribe(&self, request: TranscribeRequest) -> Result<TranscribeResponse> {
+        let timeout = request.timeout;
+        let cancel = request.cancel.clone();
+        let operation = async {
+            let creds = self.load_credentials().await?;
+            match self.send_transcribe_request(&creds, &request).await {
+                Ok(response) => Ok(response),
+                Err(error) if is_unauthorized(&error) => {
+                    tracing::info!(
+                        "ChatGPT transcription endpoint returned 401; refreshing tokens and retrying once"
+                    );
+                    let creds = self.force_refresh().await?;
+                    self.send_transcribe_request(&creds, &request).await
+                }
+                Err(error) => Err(error),
+            }
+        };
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                anyhow::bail!("transcription request was cancelled");
+            }
+            result = tokio::time::timeout(timeout, operation) => {
+                result.map_err(|_| anyhow!("transcription request timed out after {timeout:?}"))?
+            }
+        }
+    }
+
+    async fn send_transcribe_request(
+        &self,
+        creds: &ChatGptCredentials,
+        request: &TranscribeRequest,
+    ) -> Result<TranscribeResponse> {
+        // Validate once before entering the retry closure. Multipart::Part is
+        // intentionally not Clone, so each retry rebuilds it from the cheap
+        // Bytes clone below; this validation makes the `expect` in that
+        // closure unreachable for the same request values.
+        reqwest::multipart::Part::bytes(Vec::new())
+            .mime_str(&request.mime_type)
+            .with_context(|| format!("invalid audio MIME type {:?}", request.mime_type))?;
+
+        let audio = request.audio.clone();
+        let file_name = request.file_name.clone();
+        let mime_type = request.mime_type.clone();
+        let model = request.model.clone();
+        let language = request.language.clone();
+        let prompt = request.prompt.clone();
+        let temperature = request.temperature;
+        let resp = crate::http_retry::send_with_retries(
+            "posting transcription request",
+            || {
+                let file = reqwest::multipart::Part::bytes(audio.to_vec())
+                    .file_name(file_name.clone())
+                    .mime_str(&mime_type)
+                    .expect("audio MIME type was validated before building the request");
+                let mut form = reqwest::multipart::Form::new().part("file", file);
+                if let Some(value) = &model {
+                    form = form.text("model", value.clone());
+                }
+                if let Some(value) = &language {
+                    form = form.text("language", value.clone());
+                }
+                if let Some(value) = &prompt {
+                    form = form.text("prompt", value.clone());
+                }
+                if let Some(value) = temperature {
+                    form = form.text("temperature", value.to_string());
+                }
+                apply_chatgpt_auth(
+                    self.http
+                        .post(&self.transcribe_url)
+                        .multipart(form)
+                        .header("originator", ORIGINATOR)
+                        .header("Accept", "application/json"),
+                    creds,
+                )
+            },
+            Some(&request.cancel),
+            Some(request.timeout),
+        )
+        .await?;
+        let status = resp.status();
+        let body = tokio::select! {
+            biased;
+            _ = request.cancel.cancelled() => {
+                anyhow::bail!("transcription request was cancelled while reading response");
+            }
+            body = resp.bytes() => body.context("reading transcription response body")?,
+        };
+        let body_text = String::from_utf8_lossy(&body).into_owned();
+        if !status.is_success() {
+            return Err(chatgpt_http_error(status, body_text));
+        }
+
+        let parsed: TranscribeResponse = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "parsing ChatGPT transcription response (body: {})",
+                body_excerpt(&body, 512)
+            )
+        })?;
+        if parsed.text.trim().is_empty() {
+            anyhow::bail!(
+                "ChatGPT transcription response contained empty text (body: {})",
+                body_excerpt(&body, 512)
+            );
+        }
+        Ok(parsed)
     }
 
     async fn stream_chat_with_credentials(
@@ -616,11 +760,12 @@ async fn fetch_chatgpt_models(
     let resp = crate::http_retry::send_with_retries(
         "GET /models",
         || {
-            http.get(&url)
-                .header("Authorization", format!("Bearer {}", creds.access_token))
-                .header("ChatGPT-Account-ID", &creds.account_id)
-                .header("originator", ORIGINATOR)
-                .header("Accept", "application/json")
+            apply_chatgpt_auth(
+                http.get(&url)
+                    .header("originator", ORIGINATOR)
+                    .header("Accept", "application/json"),
+                creds,
+            )
         },
         None,
         None,
@@ -1039,7 +1184,7 @@ impl std::fmt::Display for ChatGptHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ChatGPT Responses API returned HTTP {}: {}",
+            "ChatGPT backend returned HTTP {}: {}",
             self.status, self.body
         )
     }
@@ -1048,7 +1193,7 @@ impl std::fmt::Display for ChatGptHttpError {
 impl std::error::Error for ChatGptHttpError {}
 
 fn chatgpt_http_error(status: reqwest::StatusCode, body: String) -> anyhow::Error {
-    let message = format!("ChatGPT Responses API returned HTTP {status}: {body}");
+    let message = format!("ChatGPT backend returned HTTP {status}: {body}");
     let error = anyhow::Error::new(ChatGptHttpError {
         status,
         body: body.clone(),
@@ -1933,10 +2078,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_auth::{TokenData, write_auth_dot_json_at};
     use crate::llm_client::{ChatMessage, FunctionCall, FunctionDef, ToolCall, ToolDefinition};
     use crate::structured_output::StructuredOutputRequest;
+    use crate::transcribe::DEFAULT_CODEX_TRANSCRIBE_MODEL;
+    use bytes::Bytes;
     use futures::StreamExt;
     use serde_json::json;
+    use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2433,6 +2582,189 @@ mod tests {
             access_token: "test-access-token".to_string(),
             account_id: "test-account".to_string(),
         }
+    }
+
+    fn write_test_auth(path: &std::path::Path, auth_mode: &str) {
+        write_auth_dot_json_at(
+            path,
+            &AuthDotJson {
+                auth_mode: Some(auth_mode.to_string()),
+                openai_api_key: None,
+                tokens: Some(TokenData {
+                    id_token: "test-id-token".to_string(),
+                    access_token: "test-access-token".to_string(),
+                    refresh_token: "test-refresh-token".to_string(),
+                    account_id: "test-account".to_string(),
+                }),
+                last_refresh: None,
+            },
+        )
+        .expect("write test auth.json");
+    }
+
+    fn transcribe_test_client(server: &MockServer, auth_path: &std::path::Path) -> CodexClient {
+        let mut client = CodexClient::with_responses_and_transcribe_urls(
+            format!("{}/responses", server.uri()),
+            format!("{}/transcribe", server.uri()),
+        );
+        client.auth_path = auth_path.to_path_buf();
+        client
+    }
+
+    #[tokio::test]
+    async fn transcribe_posts_multipart_with_chatgpt_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({"text": "hello"})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp = TempDir::new().expect("temp auth directory");
+        let auth_path = temp.path().join("auth.json");
+        write_test_auth(&auth_path, "chatgpt");
+        let client = transcribe_test_client(&server, &auth_path);
+
+        let mut request = TranscribeRequest::new(
+            Bytes::from_static(b"RIFF-test-audio"),
+            "audio.wav",
+            "audio/wav",
+        );
+        request.language = Some("en".to_string());
+        request.prompt = Some("meeting notes".to_string());
+        let response = client.transcribe(request).await.expect("transcription");
+        assert_eq!(response.text, "hello");
+
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        let wire = &requests[0];
+        assert_eq!(
+            wire.headers
+                .get("authorization")
+                .expect("Authorization header")
+                .to_str()
+                .expect("ASCII header"),
+            "Bearer test-access-token"
+        );
+        assert_eq!(
+            wire.headers
+                .get("chatgpt-account-id")
+                .expect("ChatGPT-Account-ID header")
+                .to_str()
+                .expect("ASCII header"),
+            "test-account"
+        );
+        assert_eq!(
+            wire.headers
+                .get("originator")
+                .expect("originator header")
+                .to_str()
+                .expect("ASCII header"),
+            ORIGINATOR
+        );
+        assert!(
+            wire.headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("multipart/form-data;")),
+            "multipart content type missing: {:?}",
+            wire.headers.get("content-type")
+        );
+        let body = String::from_utf8_lossy(&wire.body);
+        assert!(body.contains("name=\"file\""));
+        assert!(body.contains("filename=\"audio.wav\""));
+        assert!(body.contains("Content-Type: audio/wav"));
+        assert!(body.contains("RIFF-test-audio"));
+        assert!(body.contains("name=\"language\""));
+        assert!(body.contains("en"));
+        assert!(body.contains("name=\"prompt\""));
+        assert!(body.contains("meeting notes"));
+        assert!(!body.contains("name=\"model\""));
+
+        let mut pinned = TranscribeRequest::new(
+            Bytes::from_static(b"M4A-test-audio"),
+            "audio.m4a",
+            "audio/mp4",
+        );
+        pinned.model = Some(DEFAULT_CODEX_TRANSCRIBE_MODEL.to_string());
+        client
+            .transcribe(pinned)
+            .await
+            .expect("pinned transcription");
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body = String::from_utf8_lossy(&requests[1].body);
+        assert!(body.contains("name=\"model\""));
+        assert!(body.contains(DEFAULT_CODEX_TRANSCRIBE_MODEL));
+    }
+
+    #[tokio::test]
+    async fn transcribe_surfaces_http_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("upstream transcription failure"),
+            )
+            .mount(&server)
+            .await;
+        let temp = TempDir::new().expect("temp auth directory");
+        let auth_path = temp.path().join("auth.json");
+        write_test_auth(&auth_path, "chatgpt");
+        let client = transcribe_test_client(&server, &auth_path);
+
+        let error = client
+            .transcribe(TranscribeRequest::new(
+                Bytes::from_static(b"audio"),
+                "audio.wav",
+                "audio/wav",
+            ))
+            .await
+            .expect_err("500 should fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("HTTP 500"), "{message}");
+        assert!(
+            message.contains("upstream transcription failure"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_rejects_apikey_mode_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "unexpected"})))
+            .mount(&server)
+            .await;
+        let temp = TempDir::new().expect("temp auth directory");
+        let auth_path = temp.path().join("auth.json");
+        write_test_auth(&auth_path, "apikey");
+        let client = transcribe_test_client(&server, &auth_path);
+
+        let error = client
+            .transcribe(TranscribeRequest::new(
+                Bytes::from_static(b"audio"),
+                "audio.wav",
+                "audio/wav",
+            ))
+            .await
+            .expect_err("apikey auth should be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("need \"chatgpt\""), "{message}");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "apikey mode must not hit the transcription endpoint"
+        );
     }
 
     fn responses_sse(text: &str) -> String {

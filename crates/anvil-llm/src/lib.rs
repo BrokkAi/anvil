@@ -20,6 +20,8 @@
 //!   [`grok_auth`], [`kimi_auth`], [`openrouter_auth`], [`deepseek_auth`].
 //! - Credit/balance probes: [`bedrock_credits`], [`codex_credits`],
 //!   [`openrouter_credits`], [`deepseek_balance`].
+//! - ChatGPT-subscription audio transcription: [`transcribe`] request and
+//!   response types, sent through [`codex_client::CodexClient`].
 //! - Streaming/transport plumbing: [`http_retry`], [`responses_api`],
 //!   [`responses_chain`], [`structured_output`], [`tool_arguments`],
 //!   [`trace_logging`].
@@ -53,3 +55,4 @@ pub mod secrets;
 pub mod structured_output;
 pub mod tool_arguments;
 pub mod trace_logging;
+pub mod transcribe;
