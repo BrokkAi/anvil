@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::tools::tool_result_failed;
-use anvil_llm::llm_client::{ChatContentPart, ChatMessage, FunctionCall, ToolCall};
+use anvil_client::llm_client::{ChatContentPart, ChatMessage, FunctionCall, ToolCall};
 
 pub(crate) const PATCHES_TO_TRACES_ENV: &str = "BRK_PATCHES_TO_TRACES";
 const P2T_CONFIG_ENV: &str = "BRK_P2T_CONFIG";
@@ -464,7 +464,7 @@ pub(crate) fn append_debug_trace(path: &Path, event: &str, details: serde_json::
 pub(crate) fn append_window_start_trace(
     path: &Path,
     messages: &[ChatMessage],
-    tools: &[anvil_llm::llm_client::ToolDefinition],
+    tools: &[anvil_client::llm_client::ToolDefinition],
 ) {
     #[derive(Serialize)]
     struct WindowStartRecord<'a> {
@@ -627,7 +627,7 @@ fn append_jsonl(path: &Path, record: &impl Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+    use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
 
     #[test]
     fn load_config_accepts_forced_first_step() {

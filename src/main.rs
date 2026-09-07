@@ -39,11 +39,11 @@ mod utility_model;
 mod workspace_delta;
 
 // The LLM client (providers, auth, discovery, secrets) lives in the
-// standalone `anvil_llm` crate; these module imports keep the bare
+// standalone `anvil_client` crate; these module imports keep the bare
 // `<module>::` paths below working.
-use anvil_llm::llm_client::LlmBackend;
-use anvil_llm::multi_backend::{BackendRegistration, MultiBackend};
-use anvil_llm::{
+use anvil_client::llm_client::LlmBackend;
+use anvil_client::multi_backend::{BackendRegistration, MultiBackend};
+use anvil_client::{
     bedrock_auth, bedrock_client, codex_auth, codex_client, deepseek_auth, discovery, grok_client,
     kimi_auth, llm_client, openai_providers, openrouter_auth, secrets,
 };

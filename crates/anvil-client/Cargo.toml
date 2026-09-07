@@ -1,18 +1,18 @@
 [package]
-name = "brokk-anvil-llm"
-version = "0.28.0"
+name = "brokk-anvil-client"
+version = "0.28.1"
 edition = "2024"
 description = "Standalone LLM client extracted from Anvil: OpenAI-compatible, Bedrock, Codex, Grok, Ollama, OpenRouter, DeepSeek, and Kimi backends with auth, discovery, usage accounting, and ChatGPT-subscription transcription"
 license = "LGPL-3.0-only"
 repository = "https://github.com/BrokkAi/anvil"
 homepage = "https://github.com/BrokkAi/anvil"
 
-# Dependency-renamed by dependents so imports stay `anvil_llm::` while the
+# Dependency-renamed by dependents so imports stay `anvil_client::` while the
 # published crate is namespaced. Versioned in lockstep with brokk-anvil: bump
 # this version, the root version, and the root dependency requirement together
 # on every release (CI enforces the match).
 [lib]
-name = "anvil_llm"
+name = "anvil_client"
 path = "src/lib.rs"
 
 [features]

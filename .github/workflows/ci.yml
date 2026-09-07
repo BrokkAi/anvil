@@ -48,14 +48,14 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    # brokk-anvil-minimizer and brokk-anvil-llm are versioned in lockstep with
+    # brokk-anvil-minimizer and brokk-anvil-client are versioned in lockstep with
     # brokk-anvil; catch a missed bump on the PR instead of at publish time.
     - name: Verify workspace version lockstep
       shell: bash
       run: |
         set -euo pipefail
         ROOT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-        for CRATE in minimizer llm; do
+        for CRATE in minimizer client; do
           SUB=$(grep -m1 '^version = ' crates/anvil-$CRATE/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           REQ=$(grep -m1 "^anvil-$CRATE = " Cargo.toml | sed -E 's/.*version = "([^"]*)".*/\1/')
           if [ "$ROOT" != "$SUB" ] || [ "$ROOT" != "$REQ" ]; then
@@ -145,7 +145,7 @@ jobs:
       run: cargo test -p brokk-anvil-minimizer --locked
 
     - name: Run LLM client crate tests
-      run: cargo test -p brokk-anvil-llm --locked
+      run: cargo test -p brokk-anvil-client --locked
 
   build-android:
     name: Build aarch64-linux-android

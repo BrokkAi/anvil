@@ -9,9 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-use anvil_llm::codex_client::CodexClient;
-use anvil_llm::infer::{InferOptions, StructuredInferRequest, infer_structured};
-use anvil_llm::llm_client::{IdleTimeouts, LlmBackend};
+use anvil_client::codex_client::CodexClient;
+use anvil_client::infer::{InferOptions, StructuredInferRequest, infer_structured};
+use anvil_client::llm_client::{IdleTimeouts, LlmBackend};
 
 const CODEX_MODEL_PREFIX: &str = "codex::";
 const KIMI_MODEL_PREFIX: &str = "kimi::";
@@ -33,11 +33,11 @@ pub(crate) struct InferArgs {
     service_tier: Option<String>,
 
     /// Seconds to wait for the first meaningful response event.
-    #[arg(long, default_value_t = anvil_llm::llm_client::DEFAULT_IDLE_CHUNK_TIMEOUT_SECS)]
+    #[arg(long, default_value_t = anvil_client::llm_client::DEFAULT_IDLE_CHUNK_TIMEOUT_SECS)]
     idle_timeout_secs: u64,
 
     /// Seconds to wait between meaningful response events.
-    #[arg(long, default_value_t = anvil_llm::llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS)]
+    #[arg(long, default_value_t = anvil_client::llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS)]
     stall_timeout_secs: u64,
 
     /// Additional attempts after local structured-output validation fails.
@@ -124,10 +124,10 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
     Ok(())
 }
 
-struct InferErrorContext(anvil_llm::infer::InferError);
+struct InferErrorContext(anvil_client::infer::InferError);
 
-impl From<anvil_llm::infer::InferError> for InferErrorContext {
-    fn from(error: anvil_llm::infer::InferError) -> Self {
+impl From<anvil_client::infer::InferError> for InferErrorContext {
+    fn from(error: anvil_client::infer::InferError) -> Self {
         Self(error)
     }
 }

@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-// The enum lives with the Bedrock client in the standalone `anvil_llm` crate;
+// The enum lives with the Bedrock client in the standalone `anvil_client` crate;
 // re-exported here because it is persisted as part of `SetupState` and
 // surfaced through this module's accessors.
-pub use anvil_llm::bedrock_client::BedrockCatalogMode;
+pub use anvil_client::bedrock_client::BedrockCatalogMode;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SetupState {

@@ -7,7 +7,7 @@ use crate::agents::AgentRegistry;
 use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
-use anvil_llm::llm_client::{FunctionDef, ToolDefinition};
+use anvil_client::llm_client::{FunctionDef, ToolDefinition};
 use sandbox::SandboxPolicy;
 use serde::de;
 use serde::de::DeserializeOwned;

@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 use tiktoken_rs::{CoreBPE, o200k_base};
 
-use anvil_llm::llm_client::ChatMessage;
+use anvil_client::llm_client::ChatMessage;
 
 fn tokenizer() -> &'static CoreBPE {
     static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
@@ -45,14 +45,14 @@ pub fn approximate_tokens_messages(messages: &[ChatMessage]) -> usize {
     for msg in messages {
         for part in &msg.content {
             match part {
-                anvil_llm::llm_client::ChatContentPart::Text { text } => {
+                anvil_client::llm_client::ChatContentPart::Text { text } => {
                     total += approximate_tokens(text);
                 }
                 // Image tokenization is model/provider specific. Count
                 // only the small transport marker here instead of the
                 // base64 payload, which would wildly overestimate context
                 // usage and trigger unnecessary compression.
-                anvil_llm::llm_client::ChatContentPart::Image { .. } => {
+                anvil_client::llm_client::ChatContentPart::Image { .. } => {
                     total += approximate_tokens("[image]");
                 }
             }
@@ -73,7 +73,7 @@ pub fn approximate_tokens_messages(messages: &[ChatMessage]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anvil_llm::llm_client::{FunctionCall, ToolCall};
+    use anvil_client::llm_client::{FunctionCall, ToolCall};
 
     #[test]
     fn empty_string_is_zero_tokens() {

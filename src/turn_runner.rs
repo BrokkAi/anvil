@@ -19,8 +19,8 @@ use crate::runtime::{EventSink, PermissionBroker};
 use crate::session::{ConversationTurn, SessionStore, sanitize_replay_events};
 use crate::tool_loop::{LoopOutcome, LoopStop, NotificationMode, TextSink, TurnFailure};
 use crate::workspace_delta::{WorkspaceDeltaTracker, workspace_delta_for_turn};
-use anvil_llm::llm_client::{ChatMessage, IdleTimeouts, TokenUsage};
-use anvil_llm::structured_output::{
+use anvil_client::llm_client::{ChatMessage, IdleTimeouts, TokenUsage};
+use anvil_client::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, validate_response,
 };
 
@@ -34,7 +34,7 @@ pub(crate) struct PromptTurnRequest<'a> {
     /// Workspace root used for the recap's workspace delta and usage cost
     /// lookups; the session cwd in practice.
     pub fallback_cwd: &'a Path,
-    pub llm: &'a Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    pub llm: &'a Arc<dyn anvil_client::llm_client::LlmBackend>,
     pub registry: &'a Arc<crate::tools::ToolRegistry>,
     pub model: &'a str,
     pub reasoning_effort: Option<&'a str>,
@@ -308,7 +308,7 @@ pub(crate) fn append_mcp_instructions_to_system_prompt(
     let Some(system) = messages.iter_mut().find(|message| message.role == "system") else {
         return;
     };
-    let Some(anvil_llm::llm_client::ChatContentPart::Text { text }) = system.content.first_mut()
+    let Some(anvil_client::llm_client::ChatContentPart::Text { text }) = system.content.first_mut()
     else {
         return;
     };
@@ -322,7 +322,7 @@ pub(crate) fn append_mcp_instructions_to_system_prompt(
 /// deterministic stat lines. Failures are intentionally swallowed -- a recap
 /// is a convenience, never a reason to fail the turn.
 async fn recap_work_summary(
-    llm: &dyn anvil_llm::llm_client::LlmBackend,
+    llm: &dyn anvil_client::llm_client::LlmBackend,
     model: &str,
     turn: &ConversationTurn,
     context_length: Option<u32>,

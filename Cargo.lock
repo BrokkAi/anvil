@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -894,7 +894,7 @@ dependencies = [
  "axum",
  "base64",
  "brokk-acp-sandbox",
- "brokk-anvil-llm",
+ "brokk-anvil-client",
  "brokk-anvil-minimizer",
  "bytes",
  "chrono",
@@ -932,8 +932,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-anvil-llm"
-version = "0.28.0"
+name = "brokk-anvil-client"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil-minimizer"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "brush-parser",
  "parking_lot",

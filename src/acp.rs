@@ -109,12 +109,12 @@ use crate::usage_report::{
     fetch_codex_credits_for_usage, fetch_openrouter_credits_for_usage, insert_turn_failure_meta,
     render_usage_report, usage_by_model_meta,
 };
-use anvil_llm::discovery::{ModelSource, split_wire_id};
-use anvil_llm::llm_client::{
+use anvil_client::discovery::{ModelSource, split_wire_id};
+use anvil_client::llm_client::{
     ChatContentPart, ChatMessage, IdleTimeouts, ModelMetadata, ResolvedModelInfo, ToolDefinition,
 };
-use anvil_llm::multi_backend::MultiBackend;
-use anvil_llm::structured_output::{
+use anvil_client::multi_backend::MultiBackend;
+use anvil_client::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
     parse_structured_output_request,
 };
@@ -338,7 +338,7 @@ fn prompt_response_meta(
     let mut meta = build_structured_output_meta(result).unwrap_or_default();
     if let Some(model) = orchestration_model {
         let mut namespace = meta
-            .remove(anvil_llm::structured_output::ACP_META_NAMESPACE)
+            .remove(anvil_client::structured_output::ACP_META_NAMESPACE)
             .and_then(|value| match value {
                 serde_json::Value::Object(map) => Some(map),
                 _ => None,
@@ -365,7 +365,7 @@ fn prompt_response_meta(
             }),
         );
         meta.insert(
-            anvil_llm::structured_output::ACP_META_NAMESPACE.to_string(),
+            anvil_client::structured_output::ACP_META_NAMESPACE.to_string(),
             serde_json::Value::Object(namespace),
         );
     }
@@ -444,7 +444,7 @@ fn prompt_stop_response_with(stop_reason: StopReason) -> PromptResponse {
     PromptResponse::new(stop_reason)
 }
 
-fn acp_usage_from_token_usage(usage: anvil_llm::llm_client::TokenUsage) -> AcpUsage {
+fn acp_usage_from_token_usage(usage: anvil_client::llm_client::TokenUsage) -> AcpUsage {
     AcpUsage::new(
         usage.total_tokens(),
         usage.input_tokens,
@@ -1253,7 +1253,7 @@ fn send_session_info_update(
 
 fn session_usage_update(
     snap: &SessionSnapshot,
-    available_models: &[anvil_llm::llm_client::ModelMetadata],
+    available_models: &[anvil_client::llm_client::ModelMetadata],
     cost_usd: Option<f64>,
 ) -> UsageUpdate {
     let messages = build_prompt_messages_with_parts(snap, "", &[]);
@@ -1285,7 +1285,7 @@ async fn send_session_usage_update_with_breakdown(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    usage_by_model: Option<&BTreeMap<String, anvil_llm::llm_client::TokenUsage>>,
+    usage_by_model: Option<&BTreeMap<String, anvil_client::llm_client::TokenUsage>>,
     turn_failure: Option<&crate::tool_loop::TurnFailure>,
 ) {
     let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
@@ -1298,13 +1298,21 @@ async fn send_session_usage_update_with_breakdown(
     if let Some(failure) = turn_failure {
         insert_turn_failure_meta(&mut meta, failure);
     }
-    attach_bedrock_credits_meta(&mut meta, &snap.model, anvil_llm::bedrock_credits::status);
+    attach_bedrock_credits_meta(
+        &mut meta,
+        &snap.model,
+        anvil_client::bedrock_credits::status,
+    );
     attach_openrouter_balance_meta(
         &mut meta,
         &snap.model,
-        anvil_llm::openrouter_credits::status,
+        anvil_client::openrouter_credits::status,
     );
-    attach_deepseek_balance_meta(&mut meta, &snap.model, anvil_llm::deepseek_balance::status);
+    attach_deepseek_balance_meta(
+        &mut meta,
+        &snap.model,
+        anvil_client::deepseek_balance::status,
+    );
     if !meta.is_empty() {
         update = update.meta(Some(meta));
     }
@@ -1557,10 +1565,10 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
     let deepseek_count = source_count(catalog, ModelSource::DEEPSEEK);
     let grok_count = source_count(catalog, ModelSource::GROK);
     let openrouter_count = source_count(catalog, ModelSource::OPENROUTER);
-    let bedrock_state = anvil_llm::bedrock_auth::CredentialState::snapshot();
-    let openrouter_state = anvil_llm::openrouter_auth::CredentialState::snapshot();
-    let deepseek_state = anvil_llm::deepseek_auth::CredentialState::snapshot();
-    let codex_connected = anvil_llm::codex_auth::read_auth_dot_json()
+    let bedrock_state = anvil_client::bedrock_auth::CredentialState::snapshot();
+    let openrouter_state = anvil_client::openrouter_auth::CredentialState::snapshot();
+    let deepseek_state = anvil_client::deepseek_auth::CredentialState::snapshot();
+    let codex_connected = anvil_client::codex_auth::read_auth_dot_json()
         .ok()
         .flatten()
         .is_some_and(|auth| {
@@ -1570,7 +1578,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
                     .as_deref()
                     .is_some_and(|key| !key.trim().is_empty())
         });
-    let grok_connected = matches!(anvil_llm::grok_client::GrokClient::load(), Ok(Some(_)));
+    let grok_connected = matches!(anvil_client::grok_client::GrokClient::load(), Ok(Some(_)));
     let choices = SetupHomeRoute::menu()
         .into_iter()
         .map(SetupHomeRoute::markdown_line)
@@ -2885,7 +2893,7 @@ pub fn agent_component(
                 }
 
                 if let Some(loop_spec) = loop_spec {
-                    let llm_for_loop_turns: Arc<dyn anvil_llm::llm_client::LlmBackend> =
+                    let llm_for_loop_turns: Arc<dyn anvil_client::llm_client::LlmBackend> =
                         llm_prompt.clone();
                     let orchestration_model_for_response =
                         llm_for_loop_turns.resolve_model_info(&snap.model);
@@ -3044,7 +3052,7 @@ pub fn agent_component(
                 // the model is configured (the empty-model guard above only
                 // skips for `loop_spec`, and a `/goal` prompt has none).
                 if let Some(goal_spec) = goal_spec {
-                    let llm_for_goal: Arc<dyn anvil_llm::llm_client::LlmBackend> = llm_prompt.clone();
+                    let llm_for_goal: Arc<dyn anvil_client::llm_client::LlmBackend> = llm_prompt.clone();
                     let orchestration_model_for_response =
                         llm_for_goal.resolve_model_info(&snap.model);
                     let sessions_for_goal = sessions_prompt.clone();
@@ -3084,7 +3092,7 @@ pub fn agent_component(
                                     &session_id_for_goal,
                                     "Error: goal dispatcher panicked. See server logs.\n",
                                 );
-                                anvil_llm::llm_client::TokenUsage::default()
+                                anvil_client::llm_client::TokenUsage::default()
                             }
                         };
 
@@ -3210,7 +3218,7 @@ pub fn agent_component(
                 // concrete `Arc<MultiBackend>` here -- keeping the
                 // multi-backend specific surface (e.g. `install_codex`)
                 // out of the generic chat path.
-                let llm_for_loop: Arc<dyn anvil_llm::llm_client::LlmBackend> = llm_prompt.clone();
+                let llm_for_loop: Arc<dyn anvil_client::llm_client::LlmBackend> = llm_prompt.clone();
                 let sessions_for_loop = sessions_prompt.clone();
                 let cx_for_loop = cx.clone();
                 let session_id_for_loop = session_id.clone();
@@ -3825,7 +3833,7 @@ fn acp_diff_from_exchange_diff(diff: &ToolExchangeDiff) -> Diff {
 }
 
 fn trace_openrouter_refresh(line: &str) {
-    anvil_llm::openrouter_auth::append_refresh_log(line);
+    anvil_client::openrouter_auth::append_refresh_log(line);
 }
 
 async fn run_user_prompt_submit_hooks(
@@ -3890,14 +3898,14 @@ enum LoopIterationError {
 
 struct LoopIterationOutcome {
     structured_output_result: Option<StructuredOutputResult>,
-    cumulative_usage: anvil_llm::llm_client::TokenUsage,
+    cumulative_usage: anvil_client::llm_client::TokenUsage,
 }
 
 impl LoopIterationOutcome {
     fn without_usage() -> Self {
         Self {
             structured_output_result: None,
-            cumulative_usage: anvil_llm::llm_client::TokenUsage::default(),
+            cumulative_usage: anvil_client::llm_client::TokenUsage::default(),
         }
     }
 }
@@ -3908,7 +3916,7 @@ async fn run_loop_iteration(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    llm: Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    llm: Arc<dyn anvil_client::llm_client::LlmBackend>,
     llm_setup: Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     target: &str,
@@ -4118,7 +4126,7 @@ async fn run_loop_iteration(
 /// the loop can back off (transient) or stop (fatal).
 struct GoalTurnOutcome {
     response: String,
-    cumulative_usage: anvil_llm::llm_client::TokenUsage,
+    cumulative_usage: anvil_client::llm_client::TokenUsage,
     failure: Option<crate::tool_loop::TurnFailure>,
     /// This turn's tool-call statistics, merged into the goal-level
     /// aggregate for the final `/goal` recap.
@@ -4139,7 +4147,7 @@ async fn run_goal_turn(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    llm: Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    llm: Arc<dyn anvil_client::llm_client::LlmBackend>,
     prompt_text: &str,
     default_idle_timeout_secs: u64,
     default_stall_timeout_secs: u64,
@@ -4206,13 +4214,13 @@ async fn run_goal_loop(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    llm: Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    llm: Arc<dyn anvil_client::llm_client::LlmBackend>,
     spec: &GoalSpec,
     default_idle_timeout_secs: u64,
     default_stall_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
-) -> anvil_llm::llm_client::TokenUsage {
+) -> anvil_client::llm_client::TokenUsage {
     let budget_note = match spec.max_turns {
         Some(max) => format!(" (optional ceiling: {max} turns)"),
         None => String::new(),
@@ -4228,7 +4236,7 @@ async fn run_goal_loop(
         ),
     );
 
-    let mut cumulative = anvil_llm::llm_client::TokenUsage::default();
+    let mut cumulative = anvil_client::llm_client::TokenUsage::default();
     let mut consecutive_blocked = 0u32;
     // Consecutive transient LLM failures (outage). Drives a capped backoff so
     // the goal survives an outage and resumes when it clears, instead of
@@ -4439,7 +4447,7 @@ fn build_prompt_messages_with_parts(
 
 pub(crate) struct PreparedPrompt {
     pub(crate) messages: Vec<ChatMessage>,
-    pub(crate) compaction_usage: anvil_llm::llm_client::TokenUsage,
+    pub(crate) compaction_usage: anvil_client::llm_client::TokenUsage,
     pub(crate) prefix_len: usize,
     pub(crate) current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
@@ -4452,7 +4460,7 @@ pub(crate) async fn build_prompt_messages_with_compression(
     snap: &mut SessionSnapshot,
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
-    llm: &dyn anvil_llm::llm_client::LlmBackend,
+    llm: &dyn anvil_client::llm_client::LlmBackend,
     sessions: &SessionStore,
     session_id: &str,
     cancel: tokio_util::sync::CancellationToken,
@@ -4476,7 +4484,7 @@ pub(crate) async fn build_prompt_messages_with_compression(
     if crate::tokens::approximate_tokens_messages(&messages) <= budget || snap.history.is_empty() {
         return PreparedPrompt {
             messages,
-            compaction_usage: anvil_llm::llm_client::TokenUsage::default(),
+            compaction_usage: anvil_client::llm_client::TokenUsage::default(),
             prefix_len,
             current_plan,
         };
@@ -4533,7 +4541,7 @@ pub(crate) async fn build_prompt_messages_with_compression(
             tracing::warn!(session_id, "history compaction failed: {error:#}");
             PreparedPrompt {
                 messages,
-                compaction_usage: anvil_llm::llm_client::TokenUsage::default(),
+                compaction_usage: anvil_client::llm_client::TokenUsage::default(),
                 prefix_len,
                 current_plan,
             }
@@ -4552,7 +4560,7 @@ pub(crate) async fn build_prompt_messages_with_compression(
 /// truth for the failure, not a parallel field that could drift).
 struct ModelTurnResult {
     structured_output: Option<StructuredOutputResult>,
-    cumulative_usage: anvil_llm::llm_client::TokenUsage,
+    cumulative_usage: anvil_client::llm_client::TokenUsage,
     response: String,
     stop: crate::tool_loop::LoopStop,
     /// Compact per-turn tool-call statistics, computed before the turn (and
@@ -4648,13 +4656,13 @@ fn append_raw_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conve
         if !turn.replay_events.is_empty() {
             append_turn_replay_events(messages, turn);
         } else if !turn.tool_exchanges.is_empty() {
-            let calls: Vec<anvil_llm::llm_client::ToolCall> = turn
+            let calls: Vec<anvil_client::llm_client::ToolCall> = turn
                 .tool_exchanges
                 .iter()
-                .map(|e| anvil_llm::llm_client::ToolCall {
+                .map(|e| anvil_client::llm_client::ToolCall {
                     id: e.call_id.clone(),
                     r#type: "function".to_string(),
-                    function: anvil_llm::llm_client::FunctionCall {
+                    function: anvil_client::llm_client::FunctionCall {
                         name: e.tool_name.clone(),
                         arguments: e.arguments.clone(),
                     },
@@ -4694,10 +4702,10 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
                 }
                 let calls = calls
                     .iter()
-                    .map(|call| anvil_llm::llm_client::ToolCall {
+                    .map(|call| anvil_client::llm_client::ToolCall {
                         id: call.call_id.clone(),
                         r#type: "function".to_string(),
-                        function: anvil_llm::llm_client::FunctionCall {
+                        function: anvil_client::llm_client::FunctionCall {
                             name: call.tool_name.clone(),
                             arguments: call.arguments.clone(),
                         },
@@ -4748,14 +4756,14 @@ async fn run_model_turn_in_spawn(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    llm: &Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    llm: &Arc<dyn anvil_client::llm_client::LlmBackend>,
     registry: &Arc<crate::tools::ToolRegistry>,
     model: &str,
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
     messages: Vec<ChatMessage>,
-    initial_usage: anvil_llm::llm_client::TokenUsage,
+    initial_usage: anvil_client::llm_client::TokenUsage,
     context_length: Option<u32>,
     context_prefix_len: usize,
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
@@ -4852,7 +4860,7 @@ async fn run_prepared_model_turn(
     sessions: &SessionStore,
     session_id: &str,
     fallback_cwd: &Path,
-    llm: &Arc<dyn anvil_llm::llm_client::LlmBackend>,
+    llm: &Arc<dyn anvil_client::llm_client::LlmBackend>,
     snap: &mut SessionSnapshot,
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
@@ -5320,7 +5328,7 @@ fn xml_escape(s: &str) -> String {
 /// refresh, and return the user-facing message. Pure aside from those two
 /// side effects, so both entry points stay byte-for-byte identical.
 fn finish_codex_login(
-    auth: anvil_llm::codex_auth::AuthDotJson,
+    auth: anvil_client::codex_auth::AuthDotJson,
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
@@ -5397,7 +5405,7 @@ async fn handle_setup_codex(
     let arg = rest.trim().to_ascii_lowercase();
 
     match arg.as_str() {
-        "status" => match anvil_llm::codex_auth::read_auth_dot_json() {
+        "status" => match anvil_client::codex_auth::read_auth_dot_json() {
             Ok(Some(auth)) => {
                 let mode = auth.auth_mode.as_deref().unwrap_or("(unset)");
                 let has_key = auth.openai_api_key.is_some();
@@ -5435,7 +5443,7 @@ async fn handle_setup_codex(
             }
             Err(e) => format!("Failed to read ~/.codex/auth.json: {e:#}"),
         },
-        "disconnect" => match anvil_llm::codex_auth::logout() {
+        "disconnect" => match anvil_client::codex_auth::logout() {
             Ok(()) => {
                 // Drop the in-memory backend so subsequent `codex::*`
                 // routes fail loudly (and identically to a no-auth
@@ -5461,7 +5469,7 @@ async fn handle_setup_codex(
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
         "" | "login" | "browser" | "login browser" => {
-            match anvil_llm::codex_auth::interactive_browser_login_with(cancel, |auth_url| async move {
+            match anvil_client::codex_auth::interactive_browser_login_with(cancel, |auth_url| async move {
                 let opened = webbrowser::open(&auth_url).is_ok();
                 let prefix = if opened {
                     "Codex browser sign-in started. Waiting for the localhost callback."
@@ -5487,7 +5495,7 @@ async fn handle_setup_codex(
         }
         "device" | "login device" => {
             let cancel = tokio_util::sync::CancellationToken::new();
-            match anvil_llm::codex_auth::interactive_device_login_with(&cancel, |prompt| async move {
+            match anvil_client::codex_auth::interactive_device_login_with(&cancel, |prompt| async move {
                 send_message(
                     cx,
                     session_id,
@@ -5517,7 +5525,7 @@ async fn handle_setup_codex(
 /// so the setup handler, future status surfaces, and tests stay in
 /// agreement on the wording.
 fn openrouter_env_owned_explanation() -> String {
-    let state = anvil_llm::openrouter_auth::CredentialState::snapshot();
+    let state = anvil_client::openrouter_auth::CredentialState::snapshot();
     format!(
         "OpenRouter credentials are owned by the OPENROUTER_API_KEY environment \
          variable. Anvil reads that value at startup; unset it and restart the \
@@ -5559,7 +5567,7 @@ async fn handle_openrouter_login(
     cx: Option<&ConnectionTo<Client>>,
     session_id: Option<&str>,
 ) -> String {
-    if anvil_llm::openrouter_auth::CredentialState::snapshot().env_owns() {
+    if anvil_client::openrouter_auth::CredentialState::snapshot().env_owns() {
         return openrouter_env_owned_explanation();
     }
     // Take the entire argument tail (everything after the command), not
@@ -5585,7 +5593,7 @@ async fn handle_openrouter_login(
              https://openrouter.ai/keys. Note: the key appears in this session's \
              transcript, so rotate it at openrouter.ai if you share the log. \
              Credentials are persisted to {}.",
-            anvil_llm::openrouter_auth::auth_path()
+            anvil_client::openrouter_auth::auth_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "the OS config directory".to_string())
         ),
@@ -5596,8 +5604,8 @@ async fn handle_openrouter_login(
             // include it in the output anyway for self-contained
             // diagnostics so users can confirm the env is clear from
             // `/setup openrouter status`.
-            let state = anvil_llm::openrouter_auth::CredentialState::snapshot();
-            let file_key = match anvil_llm::openrouter_auth::read() {
+            let state = anvil_client::openrouter_auth::CredentialState::snapshot();
+            let file_key = match anvil_client::openrouter_auth::read() {
                 Ok(Some(auth)) => Some(auth.api_key.trim().to_string()).filter(|s| !s.is_empty()),
                 Ok(None) => None,
                 Err(e) => {
@@ -5609,7 +5617,7 @@ async fn handle_openrouter_login(
                 .map(str::len)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "n/a".to_string());
-            let path = anvil_llm::openrouter_auth::auth_path()
+            let path = anvil_client::openrouter_auth::auth_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "<unresolved>".to_string());
             format!(
@@ -5617,12 +5625,12 @@ async fn handle_openrouter_login(
                  active_key_length: {active_len}\n  base_url: {}\n  \
                  credential_file: {path}\n  file_present: {}\n  env_set: {}",
                 state.active_source(),
-                anvil_llm::discovery::OPENROUTER_BASE_URL,
+                anvil_client::discovery::OPENROUTER_BASE_URL,
                 state.file_present,
                 state.env_set,
             )
         }
-        "disconnect" => match anvil_llm::openrouter_auth::logout() {
+        "disconnect" => match anvil_client::openrouter_auth::logout() {
             Ok(()) => {
                 llm.uninstall_openrouter();
                 spawn_background_refresh(
@@ -5654,9 +5662,11 @@ async fn handle_openrouter_login(
             // issued keys with other shapes and we'd rather not hardcode
             // a check that ages out.
             let key = after_cmd.to_string();
-            match anvil_llm::openrouter_auth::write(&anvil_llm::openrouter_auth::OpenRouterAuth {
-                api_key: key.clone(),
-            }) {
+            match anvil_client::openrouter_auth::write(
+                &anvil_client::openrouter_auth::OpenRouterAuth {
+                    api_key: key.clone(),
+                },
+            ) {
                 Ok(()) => match crate::openrouter_backend_from_key(&key) {
                     Some(backend) => {
                         llm.install_openrouter(backend);
@@ -5673,7 +5683,7 @@ async fn handle_openrouter_login(
                             }),
                             None,
                         );
-                        let path = anvil_llm::openrouter_auth::auth_path()
+                        let path = anvil_client::openrouter_auth::auth_path()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|_| "<unresolved>".to_string());
                         format!(
@@ -5694,7 +5704,7 @@ async fn handle_openrouter_login(
                         // key became empty after trim somewhere -- still
                         // surface a clear error rather than installing a
                         // broken backend.
-                        let _ = anvil_llm::openrouter_auth::logout();
+                        let _ = anvil_client::openrouter_auth::logout();
                         "OpenRouter login failed: provided key was empty after trimming".to_string()
                     }
                 },
@@ -5729,8 +5739,8 @@ fn parse_idle_timeout_arg(prompt_text: &str) -> Result<IdleTimeoutAction, String
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let min = anvil_llm::llm_client::MIN_IDLE_CHUNK_TIMEOUT_SECS;
-    let max = anvil_llm::llm_client::MAX_IDLE_CHUNK_TIMEOUT_SECS;
+    let min = anvil_client::llm_client::MIN_IDLE_CHUNK_TIMEOUT_SECS;
+    let max = anvil_client::llm_client::MAX_IDLE_CHUNK_TIMEOUT_SECS;
 
     match arg.as_str() {
         "" => Ok(IdleTimeoutAction::Show),
@@ -7020,7 +7030,7 @@ async fn run_setup_codex_login_elicitation(
 
     let result = match method {
         CodexLoginMethod::Browser => {
-            anvil_llm::codex_auth::interactive_browser_login_with(
+            anvil_client::codex_auth::interactive_browser_login_with(
                 Some(cancel),
                 |auth_url| async move {
                     let request =
@@ -7040,7 +7050,7 @@ async fn run_setup_codex_login_elicitation(
             .await
         }
         CodexLoginMethod::Device => {
-            anvil_llm::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
+            anvil_client::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
                 let request = build_codex_device_login_elicitation_request(
                     session_id,
                     prompt.verification_url,
@@ -7197,7 +7207,7 @@ async fn run_setup_openrouter_login_elicitation(
 ) {
     let cx = spawned_cx.cx();
 
-    if anvil_llm::openrouter_auth::CredentialState::snapshot().env_owns() {
+    if anvil_client::openrouter_auth::CredentialState::snapshot().env_owns() {
         send_message(cx, session_id, &openrouter_env_owned_explanation());
         return;
     }
@@ -7320,7 +7330,7 @@ async fn run_setup_bedrock_login_elicitation(
     cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
-    if anvil_llm::bedrock_auth::CredentialState::snapshot().env_owns() {
+    if anvil_client::bedrock_auth::CredentialState::snapshot().env_owns() {
         send_message(cx, session_id, &render_bedrock_setup_help());
         return;
     }
@@ -7361,7 +7371,7 @@ async fn run_setup_deepseek_login_elicitation(
     cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
-    if anvil_llm::deepseek_auth::CredentialState::snapshot().env_owns() {
+    if anvil_client::deepseek_auth::CredentialState::snapshot().env_owns() {
         send_message(cx, session_id, &render_deepseek_setup_help());
         return;
     }
@@ -8374,7 +8384,7 @@ async fn handle_setup_bedrock(
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     rest: &str,
 ) -> String {
-    use anvil_llm::bedrock_client::BEDROCK_DEFAULT_MODEL;
+    use anvil_client::bedrock_client::BEDROCK_DEFAULT_MODEL;
 
     if rest.is_empty() {
         return render_bedrock_setup_help();
@@ -8395,12 +8405,12 @@ async fn handle_setup_bedrock(
     }
 
     if let Some(key) = rest.strip_prefix("key ") {
-        let state = anvil_llm::bedrock_auth::CredentialState::snapshot();
+        let state = anvil_client::bedrock_auth::CredentialState::snapshot();
         if state.env_owns() {
             return format!(
                 "Bedrock credentials are managed by the {} environment variable. \
                  Unset it and restart before using `/setup bedrock key`.",
-                anvil_llm::bedrock_client::BEDROCK_API_KEY_ENV
+                anvil_client::bedrock_client::BEDROCK_API_KEY_ENV
             );
         }
         let key = key.trim();
@@ -8408,24 +8418,24 @@ async fn handle_setup_bedrock(
             return "Provide a bearer token: `/setup bedrock key <token>`.".to_string();
         }
 
-        let existing = anvil_llm::bedrock_auth::read().unwrap_or(None);
+        let existing = anvil_client::bedrock_auth::read().unwrap_or(None);
         let region = existing
             .as_ref()
             .and_then(|a| a.region.clone())
-            .unwrap_or_else(anvil_llm::bedrock_auth::region_from_any_source);
+            .unwrap_or_else(anvil_client::bedrock_auth::region_from_any_source);
         let default_model = existing
             .as_ref()
             .and_then(|a| a.default_model.clone())
-            .unwrap_or_else(anvil_llm::bedrock_auth::model_from_any_source);
-        let auth = anvil_llm::bedrock_auth::BedrockAuth {
+            .unwrap_or_else(anvil_client::bedrock_auth::model_from_any_source);
+        let auth = anvil_client::bedrock_auth::BedrockAuth {
             bearer_token: key.to_string(),
             region: Some(region.clone()),
             default_model: Some(default_model.clone()),
         };
-        match anvil_llm::bedrock_auth::write(&auth) {
+        match anvil_client::bedrock_auth::write(&auth) {
             Ok(()) => {
-                let backend: Arc<dyn anvil_llm::llm_client::LlmBackend> = Arc::new(
-                    anvil_llm::bedrock_client::BedrockClient::new_with_catalog_mode(
+                let backend: Arc<dyn anvil_client::llm_client::LlmBackend> = Arc::new(
+                    anvil_client::bedrock_client::BedrockClient::new_with_catalog_mode(
                         key.to_string(),
                         region.clone(),
                         default_model.clone(),
@@ -8460,7 +8470,7 @@ async fn handle_setup_bedrock(
             return "Provide a region: `/setup bedrock region <region>` (e.g. us-east-1)."
                 .to_string();
         }
-        let mut auth = match anvil_llm::bedrock_auth::read() {
+        let mut auth = match anvil_client::bedrock_auth::read() {
             Ok(Some(a)) => a,
             _ => {
                 return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
@@ -8468,10 +8478,10 @@ async fn handle_setup_bedrock(
             }
         };
         auth.region = Some(region.to_string());
-        match anvil_llm::bedrock_auth::write(&auth) {
+        match anvil_client::bedrock_auth::write(&auth) {
             Ok(()) => {
-                let backend: Arc<dyn anvil_llm::llm_client::LlmBackend> = Arc::new(
-                    anvil_llm::bedrock_client::BedrockClient::new_with_catalog_mode(
+                let backend: Arc<dyn anvil_client::llm_client::LlmBackend> = Arc::new(
+                    anvil_client::bedrock_client::BedrockClient::new_with_catalog_mode(
                         auth.bearer_token.clone(),
                         region.to_string(),
                         auth.default_model
@@ -8502,10 +8512,10 @@ async fn handle_setup_bedrock(
         };
         let _guard = refresh_lock.lock().await;
         match sessions.remember_bedrock_catalog_mode(mode) {
-            Ok(()) => match anvil_llm::bedrock_client::backend_config() {
+            Ok(()) => match anvil_client::bedrock_client::backend_config() {
                 Ok(Some((token, region, model))) => {
                     llm.install_bedrock(Arc::new(
-                        anvil_llm::bedrock_client::BedrockClient::new_with_catalog_mode(
+                        anvil_client::bedrock_client::BedrockClient::new_with_catalog_mode(
                             token, region, model, mode,
                         ),
                     ));
@@ -8556,7 +8566,7 @@ async fn handle_setup_bedrock(
         if model.is_empty() {
             return "Provide a model id: `/setup bedrock model <model_id>` (e.g. us.anthropic.claude-sonnet-4-6).".to_string();
         }
-        let mut auth = match anvil_llm::bedrock_auth::read() {
+        let mut auth = match anvil_client::bedrock_auth::read() {
             Ok(Some(a)) => a,
             _ => {
                 return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
@@ -8564,14 +8574,14 @@ async fn handle_setup_bedrock(
             }
         };
         auth.default_model = Some(model.to_string());
-        match anvil_llm::bedrock_auth::write(&auth) {
+        match anvil_client::bedrock_auth::write(&auth) {
             Ok(()) => {
-                let backend: Arc<dyn anvil_llm::llm_client::LlmBackend> = Arc::new(
-                    anvil_llm::bedrock_client::BedrockClient::new_with_catalog_mode(
+                let backend: Arc<dyn anvil_client::llm_client::LlmBackend> = Arc::new(
+                    anvil_client::bedrock_client::BedrockClient::new_with_catalog_mode(
                         auth.bearer_token.clone(),
                         auth.region
                             .clone()
-                            .unwrap_or_else(anvil_llm::bedrock_auth::region_from_any_source),
+                            .unwrap_or_else(anvil_client::bedrock_auth::region_from_any_source),
                         model.to_string(),
                         crate::setup_state::bedrock_catalog_mode(),
                     ),
@@ -8592,20 +8602,20 @@ async fn handle_setup_bedrock(
     } else {
         match lower.as_str() {
             "status" => {
-                let state = anvil_llm::bedrock_auth::CredentialState::snapshot();
+                let state = anvil_client::bedrock_auth::CredentialState::snapshot();
                 if state.env_set {
                     format!(
                         "Bedrock is configured via {} environment variable.\n\
                          Region: {}\n\
                          Model: {}\n\
                          Catalog: {}",
-                        anvil_llm::bedrock_client::BEDROCK_API_KEY_ENV,
-                        anvil_llm::bedrock_auth::region_from_any_source(),
-                        anvil_llm::bedrock_auth::model_from_any_source(),
+                        anvil_client::bedrock_client::BEDROCK_API_KEY_ENV,
+                        anvil_client::bedrock_auth::region_from_any_source(),
+                        anvil_client::bedrock_auth::model_from_any_source(),
                         sessions.bedrock_catalog_mode().as_str(),
                     )
                 } else {
-                    match anvil_llm::bedrock_auth::read() {
+                    match anvil_client::bedrock_auth::read() {
                         Ok(Some(auth)) => {
                             let region = auth.region.as_deref().unwrap_or("(default)");
                             let model = auth.default_model.as_deref().unwrap_or("(default)");
@@ -8619,8 +8629,8 @@ async fn handle_setup_bedrock(
                             "Bedrock is configured from a legacy `~/.secrets` credential file.\n  \
                              Region: {}\n  Model: {}\n\n\
                              Tip: migrate to a managed credential file with `/setup bedrock key <token>`.",
-                            anvil_llm::bedrock_auth::region_from_any_source(),
-                            anvil_llm::bedrock_auth::model_from_any_source(),
+                            anvil_client::bedrock_auth::region_from_any_source(),
+                            anvil_client::bedrock_auth::model_from_any_source(),
                         ),
                         Ok(None) => {
                             "No Bedrock credentials found. Run `/setup bedrock key <token>`."
@@ -8631,8 +8641,8 @@ async fn handle_setup_bedrock(
                 }
             }
             "disconnect" => {
-                let state = anvil_llm::bedrock_auth::CredentialState::snapshot();
-                match anvil_llm::bedrock_auth::logout() {
+                let state = anvil_client::bedrock_auth::CredentialState::snapshot();
+                match anvil_client::bedrock_auth::logout() {
                     Ok(()) => {
                         llm.uninstall_bedrock();
                         refresh_catalog_after(
@@ -8656,9 +8666,9 @@ async fn handle_setup_bedrock(
     }
 }
 
-fn render_bedrock_disconnect_success(state: anvil_llm::bedrock_auth::CredentialState) -> String {
+fn render_bedrock_disconnect_success(state: anvil_client::bedrock_auth::CredentialState) -> String {
     if state.env_owns() {
-        let env = anvil_llm::bedrock_client::BEDROCK_API_KEY_ENV;
+        let env = anvil_client::bedrock_client::BEDROCK_API_KEY_ENV;
         return format!(
             "Bedrock local credential files cleared and the in-memory backend was unloaded, but \
              {env} is still set.\n\
@@ -8677,11 +8687,11 @@ fn render_bedrock_disconnect_success(state: anvil_llm::bedrock_auth::CredentialS
 }
 
 fn render_bedrock_setup_help() -> String {
-    let state = anvil_llm::bedrock_auth::CredentialState::snapshot();
+    let state = anvil_client::bedrock_auth::CredentialState::snapshot();
     let status = match state.active_source() {
         "env" => format!(
             "Bedrock is connected from the {} environment variable.",
-            anvil_llm::bedrock_client::BEDROCK_API_KEY_ENV
+            anvil_client::bedrock_client::BEDROCK_API_KEY_ENV
         ),
         "file" => "Bedrock is connected from saved credentials.".to_string(),
         "legacy" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
@@ -8747,12 +8757,12 @@ async fn handle_setup_deepseek(
     }
 
     if let Some(key) = rest.strip_prefix("key ") {
-        let state = anvil_llm::deepseek_auth::CredentialState::snapshot();
+        let state = anvil_client::deepseek_auth::CredentialState::snapshot();
         if state.env_owns() {
             return format!(
                 "DeepSeek credentials are managed by the {} environment variable. \
                  Unset it and restart before using `/setup deepseek key`.",
-                anvil_llm::discovery::DEEPSEEK_API_KEY_ENV
+                anvil_client::discovery::DEEPSEEK_API_KEY_ENV
             );
         }
         let key = key.trim();
@@ -8760,7 +8770,7 @@ async fn handle_setup_deepseek(
             return "Provide an API key: `/setup deepseek key <key>`.".to_string();
         }
 
-        match anvil_llm::deepseek_auth::write(&anvil_llm::deepseek_auth::DeepSeekAuth {
+        match anvil_client::deepseek_auth::write(&anvil_client::deepseek_auth::DeepSeekAuth {
             api_key: key.to_string(),
         }) {
             Ok(()) => {
@@ -8786,11 +8796,11 @@ async fn handle_setup_deepseek(
     } else {
         match lower.as_str() {
             "status" => {
-                let state = anvil_llm::deepseek_auth::CredentialState::snapshot();
+                let state = anvil_client::deepseek_auth::CredentialState::snapshot();
                 match state.active_source() {
                     "env" => format!(
                         "DeepSeek is configured via the {} environment variable.",
-                        anvil_llm::discovery::DEEPSEEK_API_KEY_ENV
+                        anvil_client::discovery::DEEPSEEK_API_KEY_ENV
                     ),
                     "file" => "DeepSeek is configured from the saved API key.".to_string(),
                     _ => "No DeepSeek credentials found. Run `/setup deepseek key <key>`."
@@ -8798,8 +8808,8 @@ async fn handle_setup_deepseek(
                 }
             }
             "disconnect" => {
-                let state = anvil_llm::deepseek_auth::CredentialState::snapshot();
-                match anvil_llm::deepseek_auth::logout() {
+                let state = anvil_client::deepseek_auth::CredentialState::snapshot();
+                match anvil_client::deepseek_auth::logout() {
                     Ok(()) => {
                         llm.uninstall_deepseek();
                         refresh_catalog_after(
@@ -8811,7 +8821,7 @@ async fn handle_setup_deepseek(
                             "Refreshing model catalog after DeepSeek disconnect...",
                         );
                         if state.env_owns() {
-                            let env = anvil_llm::discovery::DEEPSEEK_API_KEY_ENV;
+                            let env = anvil_client::discovery::DEEPSEEK_API_KEY_ENV;
                             format!(
                                 "DeepSeek stored key cleared and the in-memory backend was \
                                  unloaded, but {env} is still set.\n\
@@ -8838,11 +8848,11 @@ async fn handle_setup_deepseek(
 }
 
 fn render_deepseek_setup_help() -> String {
-    let state = anvil_llm::deepseek_auth::CredentialState::snapshot();
+    let state = anvil_client::deepseek_auth::CredentialState::snapshot();
     let status = match state.active_source() {
         "env" => format!(
             "DeepSeek is connected from the {} environment variable.",
-            anvil_llm::discovery::DEEPSEEK_API_KEY_ENV
+            anvil_client::discovery::DEEPSEEK_API_KEY_ENV
         ),
         "file" => "DeepSeek is connected from the saved API key.".to_string(),
         _ => "DeepSeek is not connected.".to_string(),
@@ -8907,7 +8917,7 @@ async fn handle_setup_grok(
 }
 
 fn render_grok_setup_help() -> String {
-    let status = match anvil_llm::grok_client::GrokClient::load() {
+    let status = match anvil_client::grok_client::GrokClient::load() {
         Ok(Some(_)) => "Anvil found a first-party Grok OAuth credential.",
         Ok(None) => "Anvil did not find a first-party Grok OAuth credential.",
         Err(_) => "Anvil could not read the Grok OAuth credential file.",
@@ -8980,7 +8990,7 @@ async fn handle_setup_openrouter(
 }
 
 fn render_openrouter_setup_help() -> String {
-    let state = anvil_llm::openrouter_auth::CredentialState::snapshot();
+    let state = anvil_client::openrouter_auth::CredentialState::snapshot();
     let status = match state.active_source() {
         "env" => "OpenRouter is connected from the OPENROUTER_API_KEY environment variable.",
         "file" => "OpenRouter is connected from saved credentials.",
@@ -9933,7 +9943,7 @@ async fn handle_rewind(sessions: &SessionStore, session_id: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn handle_compress(
     snap: &SessionSnapshot,
-    llm: &dyn anvil_llm::llm_client::LlmBackend,
+    llm: &dyn anvil_client::llm_client::LlmBackend,
     sessions: &SessionStore,
     session_id: &str,
     cancel: tokio_util::sync::CancellationToken,
@@ -10029,7 +10039,7 @@ async fn handle_compress(
 fn render_context_report(
     snap: &crate::session::SessionSnapshot,
     permission_mode: PermissionMode,
-    available_models: &[anvil_llm::llm_client::ModelMetadata],
+    available_models: &[anvil_client::llm_client::ModelMetadata],
 ) -> String {
     // Sum tokens via the o200k_base encoder so this report matches the
     // numbers the compression layer will see at the threshold. Tool
@@ -10177,12 +10187,14 @@ mod tests {
             "<mcp_instructions>\n  <server name=\"council\">\nCoordinate persistently.\n  </server>\n</mcp_instructions>",
         );
 
-        let anvil_llm::llm_client::ChatContentPart::Text { text: system } = &messages[0].content[0]
+        let anvil_client::llm_client::ChatContentPart::Text { text: system } =
+            &messages[0].content[0]
         else {
             panic!("system prompt should be text")
         };
         assert!(system.starts_with("base system prompt\n\n<mcp_instructions>"));
-        let anvil_llm::llm_client::ChatContentPart::Text { text: user } = &messages[1].content[0]
+        let anvil_client::llm_client::ChatContentPart::Text { text: user } =
+            &messages[1].content[0]
         else {
             panic!("user prompt should be text")
         };
@@ -10972,7 +10984,7 @@ mod tests {
     #[test]
     fn prompt_response_meta_includes_structured_output_success() {
         let result = StructuredOutputResult::Success(
-            anvil_llm::structured_output::StructuredOutputSuccess {
+            anvil_client::structured_output::StructuredOutputSuccess {
                 schema_name: "audit_result".into(),
                 validated_output: serde_json::json!({"answer":"ok"}),
                 coercion_requested: false,
@@ -10996,7 +11008,7 @@ mod tests {
     #[test]
     fn prompt_response_meta_includes_structured_output_coerced_success() {
         let result = StructuredOutputResult::CoercedSuccess(
-            anvil_llm::structured_output::StructuredOutputCoercedSuccess {
+            anvil_client::structured_output::StructuredOutputCoercedSuccess {
                 schema_name: "audit_result".into(),
                 validated_output: serde_json::json!({"answer":"one\ntwo"}),
                 coercions: vec!["response.answer array -> string".into()],
@@ -11025,7 +11037,7 @@ mod tests {
     #[test]
     fn prompt_response_meta_includes_structured_output_validation_error_coercion_flag() {
         let result = StructuredOutputResult::ValidationError(
-            anvil_llm::structured_output::StructuredOutputValidationError {
+            anvil_client::structured_output::StructuredOutputValidationError {
                 schema_name: "audit_result".into(),
                 errors: vec![],
                 invalid_excerpt: "{\"answer\":null}".into(),
@@ -11208,7 +11220,7 @@ mod tests {
     #[test]
     fn render_context_report_lists_session_facts() {
         use crate::session::{ConversationTurn, SessionSnapshot};
-        use anvil_llm::llm_client::ModelMetadata;
+        use anvil_client::llm_client::ModelMetadata;
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
@@ -11316,7 +11328,7 @@ mod tests {
     #[test]
     fn session_usage_update_reports_replayed_prompt_tokens() {
         use crate::session::{ConversationTurn, SessionSnapshot};
-        use anvil_llm::llm_client::ModelMetadata;
+        use anvil_client::llm_client::ModelMetadata;
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
@@ -11357,7 +11369,7 @@ mod tests {
     #[test]
     fn session_usage_update_falls_back_when_model_window_unknown() {
         use crate::session::SessionSnapshot;
-        use anvil_llm::llm_client::ModelMetadata;
+        use anvil_client::llm_client::ModelMetadata;
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
@@ -11393,7 +11405,7 @@ mod tests {
     #[test]
     fn session_usage_update_includes_cost_when_available() {
         use crate::session::SessionSnapshot;
-        use anvil_llm::llm_client::ModelMetadata;
+        use anvil_client::llm_client::ModelMetadata;
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
@@ -12183,7 +12195,7 @@ mod tests {
 
     #[test]
     fn available_commands_expose_public_configuration_slashes() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.blocking_lock();
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
 
@@ -12201,7 +12213,7 @@ mod tests {
 
     #[tokio::test]
     async fn openrouter_setup_reports_env_owned_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
@@ -12218,12 +12230,12 @@ mod tests {
 
     #[tokio::test]
     async fn openrouter_setup_reports_file_owned_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
         let _env = EnvScope::remove("OPENROUTER_API_KEY");
-        anvil_llm::openrouter_auth::write(&anvil_llm::openrouter_auth::OpenRouterAuth {
+        anvil_client::openrouter_auth::write(&anvil_client::openrouter_auth::OpenRouterAuth {
             api_key: "sk-or-on-disk".to_string(),
         })
         .unwrap();
@@ -12239,7 +12251,7 @@ mod tests {
 
     #[tokio::test]
     async fn openrouter_setup_reports_no_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
@@ -12256,7 +12268,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_setup_reports_env_owned_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
@@ -12277,13 +12289,13 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_setup_reports_file_owned_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
         let _secrets = EnvScope::set("BROKK_SECRETS_HOME", tmp_cfg.path());
         let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
-        anvil_llm::bedrock_auth::write(&anvil_llm::bedrock_auth::BedrockAuth {
+        anvil_client::bedrock_auth::write(&anvil_client::bedrock_auth::BedrockAuth {
             bearer_token: "bedrock-on-disk".to_string(),
             region: Some("eu-west-1".to_string()),
             default_model: Some("us.anthropic.claude-sonnet-4-6".to_string()),
@@ -12301,7 +12313,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_setup_reports_no_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
@@ -12319,7 +12331,7 @@ mod tests {
     /// rather than "not connected" / missing-key.
     #[tokio::test]
     async fn bedrock_setup_reports_secrets_backed_credentials() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let tmp_secrets = tempfile::tempdir().unwrap();
@@ -12342,7 +12354,7 @@ mod tests {
 
     #[test]
     fn bedrock_disconnect_success_shows_unset_command_when_env_remains() {
-        let msg = render_bedrock_disconnect_success(anvil_llm::bedrock_auth::CredentialState {
+        let msg = render_bedrock_disconnect_success(anvil_client::bedrock_auth::CredentialState {
             env_set: true,
             file_present: true,
             legacy_secrets_present: true,
@@ -12373,46 +12385,46 @@ mod tests {
     /// covered transitively by the same short-circuit.
     #[tokio::test]
     async fn handle_openrouter_login_short_circuits_when_env_owns() {
-        use anvil_llm::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        use anvil_client::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
 
         let store = SessionStore::new("m".into());
-        let llm = std::sync::Arc::new(anvil_llm::multi_backend::MultiBackend::new(vec![
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::BEDROCK,
+        let llm = std::sync::Arc::new(anvil_client::multi_backend::MultiBackend::new(vec![
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::BEDROCK,
                 "Bedrock",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::CODEX,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::CODEX,
                 "Codex",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::OLLAMA,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::OLLAMA,
                 "Local models",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::DS4,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::DS4,
                 "ds4",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::DEEPSEEK,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::DEEPSEEK,
                 "DeepSeek",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::OPENAI,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::OPENAI,
                 "OpenAI-compatible",
                 None,
             ),
-            anvil_llm::multi_backend::BackendRegistration::new(
-                anvil_llm::discovery::ModelSource::OPENROUTER,
+            anvil_client::multi_backend::BackendRegistration::new(
+                anvil_client::discovery::ModelSource::OPENROUTER,
                 "OpenRouter",
                 None,
             ),
@@ -12442,7 +12454,7 @@ mod tests {
             );
         }
         // And critically: no file was written despite the candidate key.
-        let path = anvil_llm::openrouter_auth::auth_path().unwrap();
+        let path = anvil_client::openrouter_auth::auth_path().unwrap();
         assert!(
             !path.exists(),
             "env-owned mode must not persist a key on disk; file at {path:?} should not exist"
@@ -12721,7 +12733,7 @@ mod tests {
 
     #[test]
     fn model_related_config_options_use_distinct_acp_categories() {
-        use anvil_llm::llm_client::{ModelServiceTier, ReasoningLevelPreset};
+        use anvil_client::llm_client::{ModelServiceTier, ReasoningLevelPreset};
 
         let model_id = "codex::test-model";
         let catalog = vec![ModelMetadata {
@@ -13049,7 +13061,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_clears_reasoning_when_model_drops_it() {
-        use anvil_llm::llm_client::ReasoningLevelPreset;
+        use anvil_client::llm_client::ReasoningLevelPreset;
         let (store, id) = make_store_with_session("model-a").await;
         // model-a publishes a "high" preset; model-b publishes nothing,
         // so swapping to it forces the store to drop the user's pick.
@@ -13081,7 +13093,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_sets_reasoning_off_and_omits_default() {
-        use anvil_llm::llm_client::ReasoningLevelPreset;
+        use anvil_client::llm_client::ReasoningLevelPreset;
 
         let (store, id) = make_store_with_session("model-a").await;
         store
@@ -13168,7 +13180,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_sets_and_clears_service_tier() {
-        use anvil_llm::llm_client::ModelServiceTier;
+        use anvil_client::llm_client::ModelServiceTier;
 
         let (store, id) = make_store_with_session("codex::gpt-5.5").await;
         store
