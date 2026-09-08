@@ -45,6 +45,7 @@ pub mod http_retry;
 pub mod infer;
 pub mod kimi_auth;
 pub mod llm_client;
+pub mod meta_client;
 pub mod multi_backend;
 pub mod openai_providers;
 pub mod openrouter_auth;

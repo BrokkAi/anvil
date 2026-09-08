@@ -29,7 +29,19 @@ printf '%s' '{"messages":[{"role":"system","content":"Classify the item."},{"rol
   | anvil infer --model codex::gpt-5.5 --reasoning-effort medium
 ```
 
-This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The required model prefix selects the backend so no provider fallback can pick a different model: `codex::<model>`, `kimi::<model>`, `grok::<model>`, or `deepseek::<model>`. The corresponding credentials are the Codex auth file, Kimi Code credentials, Grok Build OAuth credentials, and the DeepSeek API key. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, aggregate token `usage`, and effective request settings. `--validation-retries` controls additional attempts after local JSON Schema validation fails.
+This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The required model prefix selects the backend so no provider fallback can pick a different model: `codex::<model>`, `meta::<model>`, `kimi::<model>`, `grok::<model>`, or `deepseek::<model>`. The corresponding credentials are the Codex auth file, native Muse login, Kimi Code credentials, Grok Build OAuth credentials, and the DeepSeek API key. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, aggregate token `usage`, and effective request settings. `--validation-retries` controls additional attempts after local JSON Schema validation fails.
+
+## Meta / Muse
+
+Anvil reuses the native login created by `muse login`. Credentials are read from `$XDG_CONFIG_HOME/muse/auth.json`, or `~/.config/muse/auth.json` when `XDG_CONFIG_HOME` is unset. The saved access token is exchanged at Meta's native key endpoint; the resulting API key stays in memory and the native credential file is not rewritten.
+
+Spark models use IDs such as `meta::muse-spark-1.3`. They support streamed responses and tool-free structured inference through Meta's Responses API:
+
+```bash
+anvil infer --model meta::muse-spark-1.3 --reasoning-effort low < request.json
+```
+
+Use the request format shown above. No separate Anvil login or API-key configuration is required.
 
 ## Local Models
 
@@ -110,4 +122,4 @@ These profiles use baseline Chat Completions with streaming, tools, usage, and s
 
 Clients that advertise ACP elicitation forms receive out-of-transcript credential fields for OpenRouter, Bedrock, and DeepSeek. In a text-only client, commands such as `/setup openrouter key <key>` remain available but the pasted secret becomes part of the session transcript. Prefer environment variables or elicitation forms for sensitive credentials.
 
-Provider priority for automatic selection is Bedrock, Codex, local models (Ollama then ds4), DeepSeek, Kimi, Grok, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.
+Provider priority for automatic selection is Bedrock, Codex, Meta, local models (Ollama then ds4), DeepSeek, Kimi, Grok, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.

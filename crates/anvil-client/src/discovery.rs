@@ -55,6 +55,7 @@ pub struct ModelSource;
 impl ModelSource {
     pub const BEDROCK: &'static str = "bedrock";
     pub const CODEX: &'static str = "codex";
+    pub const META: &'static str = "meta";
     pub const DEEPSEEK: &'static str = "deepseek";
     pub const DS4: &'static str = "ds4";
     pub const GROK: &'static str = "grok";

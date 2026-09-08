@@ -672,6 +672,13 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
     let deepseek_backend = build_deepseek_backend();
     let kimi_backend = build_kimi_backend();
     let grok_backend = build_grok_backend();
+    let meta_backend = match anvil_client::meta_client::MetaClient::load() {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::info!("Meta backend unavailable: {error}");
+            None
+        }
+    };
     let openai_backend = build_openai_compatible_backend()?;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
@@ -722,6 +729,7 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
     Ok(Arc::new(MultiBackend::new(vec![
         BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
         BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
+        BackendRegistration::new(discovery::ModelSource::META, "Meta (Muse)", meta_backend),
         BackendRegistration::new(
             discovery::ModelSource::OLLAMA,
             "Local models",

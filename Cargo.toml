@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.28.1"
+version = "0.28.2"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0-only"
@@ -36,8 +36,8 @@ axum = { version = "0.8", optional = true }
 # the published crates are namespaced. Both are versioned in lockstep with this
 # crate: bump the requirement, the sub-crate's version, and the root version
 # together on every release (CI enforces the match).
-anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.28.1", path = "crates/anvil-minimizer" }
-anvil-client = { package = "brokk-anvil-client", version = "0.28.1", path = "crates/anvil-client", features = ["bedrock-credits"] }
+anvil-minimizer = { package = "brokk-anvil-minimizer", version = "0.28.2", path = "crates/anvil-minimizer" }
+anvil-client = { package = "brokk-anvil-client", version = "0.28.2", path = "crates/anvil-client", features = ["bedrock-credits"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
@@ -114,7 +114,7 @@ tempfile = "3"
 # Enables anvil-client's `test-support` feature so Anvil's tests can use
 # `openrouter_auth::test_support` (env-var guard/scope helpers). Feature
 # unification means only test builds see it; published binaries never do.
-anvil-client = { package = "brokk-anvil-client", version = "0.28.1", path = "crates/anvil-client", features = ["bedrock-credits", "test-support"] }
+anvil-client = { package = "brokk-anvil-client", version = "0.28.2", path = "crates/anvil-client", features = ["bedrock-credits", "test-support"] }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
