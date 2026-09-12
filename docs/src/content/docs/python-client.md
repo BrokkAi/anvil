@@ -28,11 +28,14 @@ Grok, and DeepSeek. It reuses native authentication, retries, schema validation,
 and usage accounting. No tools, agent sessions, or project instructions run.
 
 DeepSeek structured inference uses its stateless Responses API with native
-`text.format: json_schema` enforcement. Truncated responses are rejected even
+`text.format: json_schema` requests. DeepSeek can still return schema violations
+even with `strict: true`; the client validates locally and uses bounded repair
+retries before returning an error. Its beta strict tool-call mode also cannot
+be relied on to enforce nested schemas. Truncated responses are rejected even
 when their partial text happens to be valid JSON. The schema is sent out of band,
 so changing it does not prepend instructions ahead of your stable message prefix.
 Other providers that require JSON-mode fallback receive the schema after your
-messages; local validation still checks every provider's output. DeepSeek's normal
+messages; local validation checks every provider's output. DeepSeek's normal
 agent chat continues to use Chat Completions.
 
 Keep one client for repeated calls to reuse provider connections. Use it as an

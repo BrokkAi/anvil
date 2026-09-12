@@ -987,9 +987,10 @@ impl ModelMetadata {
 // ---------------------------------------------------------------------------
 
 pub trait LlmBackend: Send + Sync {
-    /// True when structured inference sends the schema through an enforced
-    /// native output format and does not need an in-band schema instruction.
-    fn enforces_structured_output(&self) -> bool {
+    /// True when structured inference sends the schema through a native output
+    /// format and does not need an in-band schema instruction. This is not a
+    /// guarantee of provider enforcement: local validation remains mandatory.
+    fn supports_native_structured_output(&self) -> bool {
         false
     }
 

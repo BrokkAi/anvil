@@ -1,8 +1,10 @@
 //! DeepSeek's stateless Responses API for native structured inference.
 //!
 //! Agent chat continues to use the Chat Completions backend. This client is
-//! deliberately routed only by HostedClient, where JSON Schema enforcement is
-//! required and partial completions must never be accepted as valid output.
+//! deliberately routed only by HostedClient, where a native JSON Schema request is
+//! useful and partial completions must never be accepted as valid output.
+//! DeepSeek may violate its requested schema even with strict=true, so the
+//! shared inference layer must still validate every result locally.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,7 +138,7 @@ impl DeepSeekClient {
 }
 
 impl LlmBackend for DeepSeekClient {
-    fn enforces_structured_output(&self) -> bool {
+    fn supports_native_structured_output(&self) -> bool {
         true
     }
 
@@ -203,7 +205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_wire_preserves_prefix_and_enforces_native_schema() {
+    async fn structured_wire_preserves_prefix_and_requests_native_schema() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
@@ -253,6 +255,35 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["store"], false);
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn native_format_still_rejects_provider_schema_violations_locally() {
+        let server = MockServer::start().await;
+        let body = completed().replace(r#"\"slot0\":true"#, r#"\"slot0\":true,\"no_match\":true"#);
+        Mock::given(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = DeepSeekClient::new(server.uri(), "test").unwrap();
+        let error = infer_structured(
+            &client,
+            "deepseek-v4-flash",
+            StructuredInferRequest {
+                messages: vec![InferMessage::user("Classify this")],
+                schema_name: "coverage".to_string(),
+                schema: schema(),
+            },
+            InferOptions {
+                validation_retries: 0,
+                ..InferOptions::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::infer::InferErrorKind::StructuredOutput);
+        assert!(error.to_string().contains("no_match"));
     }
 
     #[tokio::test]
