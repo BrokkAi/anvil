@@ -1,6 +1,6 @@
 [package]
 name = "brokk-anvil-client"
-version = "0.28.2"
+version = "0.28.3"
 edition = "2024"
 description = "Standalone LLM client extracted from Anvil: OpenAI-compatible, Bedrock, Codex, Meta/Muse, Grok, Ollama, OpenRouter, DeepSeek, and Kimi backends with auth, discovery, usage accounting, and ChatGPT-subscription transcription"
 license = "LGPL-3.0-only"

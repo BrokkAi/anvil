@@ -41,6 +41,7 @@ pub mod deepseek_balance;
 pub mod discovery;
 pub mod grok_auth;
 pub mod grok_client;
+pub mod hosted;
 pub mod http_retry;
 pub mod infer;
 pub mod kimi_auth;

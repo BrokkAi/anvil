@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.12,<2"]
+build-backend = "maturin"
+
+[project]
+name = "brokk-anvil-client"
+dynamic = ["version"]
+description = "Native asynchronous Python bindings for Anvil's LLM client"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LGPL-3.0-only"
+license-files = ["LICENSE"]
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Rust", "Typing :: Typed"]
+
+[project.urls]
+Repository = "https://github.com/BrokkAi/anvil"
+Documentation = "https://anvil.brokk.ai/python-client/"
+
+[tool.maturin]
+python-source = "python"
+module-name = "anvil_client._native"
+include = [
+  { path = "tests/**", format = "sdist" },
+  { path = "python/anvil_client/licenses/*", format = "wheel" },
+]

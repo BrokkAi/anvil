@@ -29,6 +29,15 @@ Prerequisite: `rustup target add wasm32-wasip2` (needed by `build.rs` when the d
 - **The LLM client is a standalone crate.** `crates/anvil-client` (published as `brokk-anvil-client`, imported as `anvil_client`) holds everything needed to talk to models — core types and `LlmBackend`, all provider backends (Bedrock, Codex, Grok, OpenAI-compatible), auth flows and the `secrets` store, discovery, and retry/streaming plumbing. It must not depend on the rest of Anvil: Anvil-only concerns (sessions, ACP, tools, setup state) reference it, never the reverse. It is versioned in lockstep with the root crate exactly like `brokk-anvil-minimizer`. Items Anvil consumes must be `pub`; `openrouter_auth::test_support` is exposed to Anvil's tests via the crate's `test-support` feature, enabled only through the root `[dev-dependencies]` entry.
 - **Lint suppressions**: do not add `#[allow(...)]` to get around linting. Prefer refactoring the code so the lint passes; if a suppression is truly necessary, document the invariant or external constraint that makes it safe.
 
+## Python client
+
+`crates/anvil-client-python` is the PyO3/Maturin distribution `brokk-anvil-client`.
+Keep it thin: provider construction, authentication, retries, and schema validation
+live in `anvil-client`; CLI and Python use `HostedClient`. Keep package and path
+dependency versions in lockstep. Python task cancellation must cancel native work,
+and client close must cancel outstanding calls. Build wheels and run installed-wheel
+tests before publishing. The existing `python/` package remains the CLI launcher.
+
 ## Release workflow
 
 Releases are driven by a `vX.Y.Z` tag on master. The tag fans out to three

@@ -3,21 +3,12 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Args;
 use tokio_util::sync::CancellationToken;
 
-use std::sync::Arc;
-
-use anvil_client::codex_client::CodexClient;
-use anvil_client::infer::{InferOptions, StructuredInferRequest, infer_structured};
-use anvil_client::llm_client::{IdleTimeouts, LlmBackend};
-
-const CODEX_MODEL_PREFIX: &str = "codex::";
-const META_MODEL_PREFIX: &str = "meta::";
-const KIMI_MODEL_PREFIX: &str = "kimi::";
-const GROK_MODEL_PREFIX: &str = "grok::";
-const DEEPSEEK_MODEL_PREFIX: &str = "deepseek::";
+use anvil_client::infer::{HostedClient, InferOptions, StructuredInferRequest};
+use anvil_client::llm_client::IdleTimeouts;
 
 #[derive(Args, Debug)]
 pub(crate) struct InferArgs {
@@ -47,61 +38,6 @@ pub(crate) struct InferArgs {
 }
 
 pub(crate) async fn run(args: &InferArgs) -> Result<()> {
-    // Route on the provider prefix so the same tool-free, schema-constrained
-    // path can judge with any explicitly supported hosted backend. The
-    // prefix is required in every case to prevent provider
-    // fallback picking a different model than the caller pinned.
-    let (backend, wire_model): (Arc<dyn LlmBackend>, String) = if let Some(model) =
-        args.model.strip_prefix(CODEX_MODEL_PREFIX)
-    {
-        if model.trim().is_empty() {
-            bail!("--model must name a model after the codex:: prefix");
-        }
-        (Arc::new(CodexClient::new()), model.to_string())
-    } else if let Some(model) = args.model.strip_prefix(META_MODEL_PREFIX) {
-        if model.trim().is_empty() {
-            bail!("--model must name a model after the meta:: prefix");
-        }
-        let backend = anvil_client::meta_client::MetaClient::load()?.ok_or_else(|| {
-            anyhow::anyhow!("Meta backend is not configured; sign in with `muse login`")
-        })?;
-        (backend, model.to_string())
-    } else if let Some(model) = args.model.strip_prefix(KIMI_MODEL_PREFIX) {
-        if model.trim().is_empty() {
-            bail!("--model must name a model after the kimi:: prefix");
-        }
-        let backend = crate::build_kimi_backend().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kimi backend is not configured; set KIMI_API_KEY or sign in with the Kimi CLI"
-            )
-        })?;
-        (backend, model.to_string())
-    } else if let Some(model) = args.model.strip_prefix(GROK_MODEL_PREFIX) {
-        if model.trim().is_empty() {
-            bail!("--model must name a model after the grok:: prefix");
-        }
-        let backend = crate::build_grok_backend().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Grok backend is not configured; install Grok Build and run `grok login --oauth`"
-            )
-        })?;
-        (backend, model.to_string())
-    } else if let Some(model) = args.model.strip_prefix(DEEPSEEK_MODEL_PREFIX) {
-        if model.trim().is_empty() {
-            bail!("--model must name a model after the deepseek:: prefix");
-        }
-        let backend = crate::build_deepseek_backend().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DeepSeek backend is not configured; set DEEPSEEK_API_KEY or run `/setup deepseek key <key>`"
-                )
-            })?;
-        (backend, model.to_string())
-    } else {
-        bail!(
-            "--model must use a codex::<model-id>, meta::<model-id>, kimi::<model-id>, grok::<model-id>, or deepseek::<model-id> wire form"
-        );
-    };
-
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
@@ -109,24 +45,23 @@ pub(crate) async fn run(args: &InferArgs) -> Result<()> {
     let input: StructuredInferRequest =
         serde_json::from_str(&raw).context("parsing inference request JSON")?;
     let cancel = CancellationToken::new();
-    let mut result = infer_structured(
-        backend.as_ref(),
-        wire_model,
-        input,
-        InferOptions {
-            reasoning_effort: args.reasoning_effort.clone(),
-            service_tier: args.service_tier.clone(),
-            idle_timeouts: IdleTimeouts {
-                first_progress: Duration::from_secs(args.idle_timeout_secs),
-                inter_chunk: Duration::from_secs(args.stall_timeout_secs),
+    let result = HostedClient::default()
+        .infer(
+            &args.model,
+            input,
+            InferOptions {
+                reasoning_effort: args.reasoning_effort.clone(),
+                service_tier: args.service_tier.clone(),
+                idle_timeouts: IdleTimeouts {
+                    first_progress: Duration::from_secs(args.idle_timeout_secs),
+                    inter_chunk: Duration::from_secs(args.stall_timeout_secs),
+                },
+                validation_retries: args.validation_retries,
             },
-            validation_retries: args.validation_retries,
-        },
-        cancel,
-    )
-    .await
-    .map_err(InferErrorContext::from)?;
-    result.model.clone_from(&args.model);
+            cancel,
+        )
+        .await
+        .map_err(InferErrorContext::from)?;
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .context("writing inference response JSON")?;
     std::io::stdout().lock().write_all(b"\n")?;

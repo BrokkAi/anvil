@@ -40,6 +40,8 @@ exceptions = [
     # third-party dependencies.
     { crate = "brokk-anvil", allow = ["LGPL-3.0-only"] },
     { crate = "brokk-anvil-client", allow = ["LGPL-3.0-only"] },
+    { crate = "brokk-anvil-client-python", allow = ["LGPL-3.0-only"] },
+    { crate = "xtask", allow = ["LGPL-3.0-only"] },
     # This parser is embedded both as native Rust code and as a wasm32-wasip2
     # guest. Its exact source and LGPL/GPL texts are represented in the report.
     { crate = "brokk-acp-sandbox@0.1.0", allow = ["LGPL-3.0-only"] },

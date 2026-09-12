@@ -123,8 +123,8 @@ Node.js 24 and the tool versions pinned by CI to refresh the reports:
 cargo install --locked cargo-about --version 0.9.1 --features cli
 cargo install --locked cargo-deny --version 0.20.2
 
-cargo deny --config licenses/deny.toml --locked check licenses
-cargo about generate --offline --config licenses/about.toml --locked --fail \
+cargo deny --workspace --config licenses/deny.toml --locked check licenses
+cargo about generate --workspace --offline --config licenses/about.toml --locked --fail \
   licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
 node scripts/generate-supplemental-third-party-notices.mjs
 ```

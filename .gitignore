@@ -48,3 +48,5 @@ __pycache__/
 
 # PyPI packaging build output
 /python/dist/
+
+/crates/anvil-client-python/python/anvil_client/licenses/

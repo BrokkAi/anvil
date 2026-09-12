@@ -31,6 +31,14 @@ def main() -> None:
         r'^__version__ = "([^"]+)"$',
         "Python package",
     )
+    for package in ("anvil-client", "anvil-client-python", "anvil-minimizer"):
+        manifest = root / "crates" / package / "Cargo.toml"
+        version = version_from(manifest, r'^version = "([^"]+)"$', package)
+        if version != cargo:
+            raise SystemExit(f"{package} version {version} differs from Anvil {cargo}")
+    binding = (root / "crates/anvil-client-python/Cargo.toml").read_text()
+    if f'version = "{cargo}"' not in next(line for line in binding.splitlines() if line.startswith("anvil-client =")):
+        raise SystemExit("Python binding dependency differs from Anvil version")
     expected = args.tag.removeprefix("v") if args.tag else cargo
     if cargo != python or python != expected:
         raise SystemExit(

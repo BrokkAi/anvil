@@ -79,11 +79,11 @@ jobs:
         cargo install --locked cargo-deny --version 0.20.2
 
     - name: Check dependency license policy
-      run: cargo deny --config licenses/deny.toml --locked check licenses
+      run: cargo deny --workspace --config licenses/deny.toml --locked check licenses
 
     - name: Check shipped notice reports
       run: |
-        cargo about generate --offline --config licenses/about.toml --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
+        cargo about generate --workspace --offline --config licenses/about.toml --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
         diff -u licenses/THIRD_PARTY_LICENSES.html /tmp/THIRD_PARTY_LICENSES.html
         node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
         diff -u licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt

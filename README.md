@@ -41,6 +41,13 @@ custom TUI  --------------------------------------->  tools + sessions
 - **Explicit safety boundaries.** Clients choose permission behavior while Anvil applies permission gates, workspace path checks, and the configured sandbox strategy.
 - **Persistent work.** Load and resume sessions with durable history, usage reporting, and context compaction.
 
+## Python inference client
+
+`uv add brokk-anvil-client` installs native async Python bindings to Anvil's
+standalone model client. It shares provider authentication, structured output,
+and retries with `anvil infer`, without an agent session or subprocess.
+See [Python LLM Client](https://anvil.brokk.ai/python-client/).
+
 ## Install and Evaluate
 
 Install the released native binary through [uv](https://docs.astral.sh/uv/),

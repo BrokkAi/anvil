@@ -3,6 +3,10 @@
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::http_retry::RetryableLlmError;
@@ -143,6 +147,68 @@ impl InferError {
     }
 }
 
+/// Reusable, explicitly routed hosted inference, independent of the agent runtime.
+#[derive(Default)]
+pub struct HostedClient {
+    backends: Mutex<HashMap<String, Arc<dyn LlmBackend>>>,
+}
+
+impl HostedClient {
+    pub async fn infer(
+        &self,
+        model: &str,
+        request: StructuredInferRequest,
+        options: InferOptions,
+        cancel: CancellationToken,
+    ) -> Result<StructuredInferResponse, InferError> {
+        let (source, id) = model
+            .split_once("::")
+            .filter(|(_, id)| !id.trim().is_empty())
+            .ok_or_else(|| {
+                InferError::new(
+                    InferErrorKind::InvalidRequest,
+                    anyhow!("model must be provider-qualified as <source>::<id>"),
+                )
+            })?;
+        let backend = {
+            let mut backends = self.backends.lock().map_err(|_| {
+                InferError::new(InferErrorKind::Provider, anyhow!("provider cache poisoned"))
+            })?;
+            if let Some(backend) = backends.get(source) {
+                backend.clone()
+            } else {
+                let backend: Option<Arc<dyn LlmBackend>> = match source {
+                    "codex" => Some(Arc::new(crate::codex_client::CodexClient::new())),
+                    "meta" => crate::meta_client::MetaClient::load()
+                        .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
+                    "deepseek" => crate::hosted::build_deepseek_backend(),
+                    "kimi" => crate::hosted::build_kimi_backend(),
+                    "grok" => crate::hosted::build_grok_backend(),
+                    _ => {
+                        return Err(InferError::new(
+                            InferErrorKind::InvalidRequest,
+                            anyhow!(
+                                "unsupported inference provider {source:?}; expected codex, meta, kimi, grok, or deepseek"
+                            ),
+                        ));
+                    }
+                };
+                let backend = backend.ok_or_else(|| {
+                    InferError::new(
+                        InferErrorKind::Authentication,
+                        anyhow!("{source} credentials are not configured"),
+                    )
+                })?;
+                backends.insert(source.to_owned(), backend.clone());
+                backend
+            }
+        };
+        let mut response = infer_structured(backend.as_ref(), id, request, options, cancel).await?;
+        response.model = model.to_owned();
+        Ok(response)
+    }
+}
+
 impl std::fmt::Display for InferError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.source.fmt(formatter)
@@ -208,6 +274,16 @@ pub async fn infer_structured(
         prefer_json_object: false,
     };
     let mut messages = messages;
+    // Some providers downgrade json_schema to json_object. They require the
+    // word JSON in the prompt and otherwise never receive the actual schema.
+    // Supply it in-band as well; local validation remains authoritative.
+    messages.insert(
+        0,
+        ChatMessage::system(format!(
+            "Return only JSON matching this JSON Schema: {}",
+            structured_output.schema,
+        )),
+    );
     let mut total_usage = TokenUsage::default();
     let mut validation_attempt = 0;
     let output = loop {
@@ -421,7 +497,11 @@ mod tests {
             observed.lock().unwrap().as_slice(),
             [ObservedRequest {
                 model: "utility-model".to_string(),
-                roles: vec!["system".to_string(), "user".to_string()],
+                roles: vec![
+                    "system".to_string(),
+                    "system".to_string(),
+                    "user".to_string()
+                ],
                 tools_are_none: true,
                 has_structured_output: true,
                 reasoning_effort: Some("low".to_string()),

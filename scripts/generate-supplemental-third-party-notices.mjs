@@ -26,6 +26,10 @@ const auditedLinksPackages = new Set([
   "aws-lc-sys",
   "libsqlite3-sys",
   "prettyplease",
+  // PyO3 provides MIT/Apache FFI declarations for the user-supplied Python
+  // interpreter. Our abi3 wheels do not bundle CPython or its runtime.
+  "pyo3",
+  "pyo3-ffi",
   "rayon-core",
   "ring",
   "wasm-bindgen-shared",

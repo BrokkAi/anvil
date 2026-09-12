@@ -1,0 +1,106 @@
+name: Python client wheels
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master, 'ci/**']
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: Publish with the configured PyPI trusted publisher
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64
+          - os: macos-latest
+            target: aarch64
+          - os: windows-latest
+            target: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python python/scripts/check_version.py
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p brokk-anvil-client-python --all-targets --locked -- -D warnings
+      - run: python scripts/prepare-python-client.py
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: '1.15.0'
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          args: --release --locked --manifest-path crates/anvil-client-python/Cargo.toml --out dist
+      - name: Install wheel and test native transport
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist brokk-anvil-client
+          python -m unittest discover -s crates/anvil-client-python/tests -v
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Verify stable ABI on newer Python
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist brokk-anvil-client
+          python -m unittest discover -s crates/anvil-client-python/tests -v
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-client-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_pypi
+    needs: wheels
+    runs-on: ubuntu-latest
+    environment: pypi-publish
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-client-*
+          merge-multiple: true
+          path: dist
+      - name: Attach wheels to the tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 120); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" dist/*.whl --clobber
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Release did not become available" >&2
+          exit 1
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: inputs.publish_pypi
+        with:
+          packages-dir: dist
+          print-hash: true
+
