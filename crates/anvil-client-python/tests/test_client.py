@@ -21,7 +21,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append(request)
-        prompt = request["messages"][-1]["content"]
+        # The native client may append an in-band schema for JSON-mode
+        # providers. Dispatch mock behavior from the original caller input.
+        prompt = next(message["content"] for message in request["messages"]
+                      if message["role"] == "user")
         if "slow" in prompt:
             time.sleep(0.5)
         output = {"wrong": True} if "invalid" in prompt else {"ok": True}

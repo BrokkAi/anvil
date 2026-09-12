@@ -1,6 +1,6 @@
 [package]
 name = "brokk-anvil-client-python"
-version = "0.28.3"
+version = "0.28.4"
 edition = "2024"
 license = "LGPL-3.0-only"
 description = "Native asynchronous Python bindings for Anvil's LLM client"
@@ -12,7 +12,7 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-anvil-client = { package = "brokk-anvil-client", path = "../anvil-client", version = "0.28.3" }
+anvil-client = { package = "brokk-anvil-client", path = "../anvil-client", version = "0.28.4" }
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 serde = { version = "1", features = ["derive"] }

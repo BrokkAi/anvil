@@ -987,6 +987,13 @@ impl ModelMetadata {
 // ---------------------------------------------------------------------------
 
 pub trait LlmBackend: Send + Sync {
+    /// True when structured inference sends the schema through a native output
+    /// format and does not need an in-band schema instruction. This is not a
+    /// guarantee of provider enforcement: local validation remains mandatory.
+    fn supports_native_structured_output(&self) -> bool {
+        false
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>>;
 
     fn resolve_model_info(&self, configured_model: &str) -> ResolvedModelInfo {

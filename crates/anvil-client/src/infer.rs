@@ -181,7 +181,8 @@ impl HostedClient {
                     "codex" => Some(Arc::new(crate::codex_client::CodexClient::new())),
                     "meta" => crate::meta_client::MetaClient::load()
                         .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
-                    "deepseek" => crate::hosted::build_deepseek_backend(),
+                    "deepseek" => crate::deepseek_client::DeepSeekClient::load()
+                        .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
                     "kimi" => crate::hosted::build_kimi_backend(),
                     "grok" => crate::hosted::build_grok_backend(),
                     _ => {
@@ -274,16 +275,14 @@ pub async fn infer_structured(
         prefer_json_object: false,
     };
     let mut messages = messages;
-    // Some providers downgrade json_schema to json_object. They require the
-    // word JSON in the prompt and otherwise never receive the actual schema.
-    // Supply it in-band as well; local validation remains authoritative.
-    messages.insert(
-        0,
-        ChatMessage::system(format!(
+    // JSON-object fallbacks need an in-band schema, but dynamic schemas must
+    // follow the caller's stable prompt/article prefix rather than displace it.
+    if !backend.supports_native_structured_output() {
+        messages.push(ChatMessage::user(format!(
             "Return only JSON matching this JSON Schema: {}",
             structured_output.schema,
-        )),
-    );
+        )));
+    }
     let mut total_usage = TokenUsage::default();
     let mut validation_attempt = 0;
     let output = loop {
@@ -497,11 +496,7 @@ mod tests {
             observed.lock().unwrap().as_slice(),
             [ObservedRequest {
                 model: "utility-model".to_string(),
-                roles: vec![
-                    "system".to_string(),
-                    "system".to_string(),
-                    "user".to_string()
-                ],
+                roles: vec!["system".to_string(), "user".to_string(), "user".to_string()],
                 tools_are_none: true,
                 has_structured_output: true,
                 reasoning_effort: Some("low".to_string()),

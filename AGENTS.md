@@ -37,6 +37,12 @@ live in `anvil-client`; CLI and Python use `HostedClient`. Keep package and path
 dependency versions in lockstep. Python task cancellation must cancel native work,
 and client close must cancel outstanding calls. Build wheels and run installed-wheel
 tests before publishing. The existing `python/` package remains the CLI launcher.
+DeepSeek structured inference uses the stateless Responses backend; agent chat
+keeps its Chat Completions backend. Native schema requests must not
+prepend dynamic schema text ahead of caller messages. Reject incomplete Responses
+output even when its text parses as valid JSON. DeepSeek Responses and beta
+strict tool calls have returned schema violations in live probes: native format
+support is not an enforcement guarantee, and local validation must remain.
 
 ## Release workflow
 

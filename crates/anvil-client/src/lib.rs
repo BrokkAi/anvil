@@ -38,6 +38,7 @@ pub mod codex_client;
 pub mod codex_credits;
 pub mod deepseek_auth;
 pub mod deepseek_balance;
+pub mod deepseek_client;
 pub mod discovery;
 pub mod grok_auth;
 pub mod grok_client;
