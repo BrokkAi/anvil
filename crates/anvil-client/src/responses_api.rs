@@ -345,6 +345,8 @@ enum OutputItemContent {
 pub(crate) struct ResponsesStreamOutcome {
     pub(crate) response: LlmResponse,
     pub(crate) response_id: Option<String>,
+    /// A token-limited partial response, which structured callers must reject.
+    pub(crate) incomplete: bool,
 }
 
 pub(crate) async fn drive_responses_sse_stream<S>(
@@ -363,6 +365,7 @@ where
     let mut deadline = tokio::time::Instant::now() + idle.first_progress;
     let mut saw_progress = false;
     let mut completed = false;
+    let mut incomplete = false;
     let mut failure: Option<anyhow::Error> = None;
     let mut usage = TokenUsage::default();
     let mut deltas_received = false;
@@ -521,6 +524,7 @@ where
                             break;
                         }
                         "response.incomplete" => {
+                            incomplete = true;
                             if let Some(final_body) = event.response {
                                 if let Some(u) = final_body.usage {
                                     usage = u.into_usage();
@@ -591,6 +595,7 @@ where
                 codex_reasoning: None,
             },
             response_id,
+            incomplete,
         });
     }
     if !completed {
@@ -608,6 +613,7 @@ where
                 codex_reasoning: None,
             },
             response_id,
+            incomplete,
         })
     } else {
         Ok(ResponsesStreamOutcome {
@@ -619,6 +625,7 @@ where
                 codex_reasoning: None,
             },
             response_id,
+            incomplete,
         })
     }
 }
