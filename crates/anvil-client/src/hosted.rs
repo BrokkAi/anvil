@@ -1,7 +1,7 @@
 //! Shared hosted-provider construction for Anvil and language bindings.
 
 use crate::llm_client::LlmBackend;
-use crate::{deepseek_auth, discovery, grok_client, kimi_auth, llm_client};
+use crate::{deepseek_auth, discovery, grok_client, kimi_auth, llm_client, mimo_client};
 use std::sync::Arc;
 
 /// Build a hosted DeepSeek chat backend from a raw API key. DeepSeek's API
@@ -99,6 +99,20 @@ pub fn build_grok_backend() -> Option<Arc<dyn LlmBackend>> {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!("failed to configure Grok OAuth authentication: {error:#}");
+            None
+        }
+    }
+}
+
+/// Build the Xiaomi MiMo Token Plan backend. This intentionally does not
+/// expose a constructor for MiMo's pay-as-you-go endpoint: sending a Token
+/// Plan key to the wrong base URL can cause unexpected billing or auth
+/// failures, and generic OpenAI-compatible profiles already cover pay-as-you-go.
+pub fn build_mimo_token_plan_backend() -> Option<Arc<dyn LlmBackend>> {
+    match mimo_client::MimoTokenPlanClient::load() {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!("failed to configure Xiaomi MiMo Token Plan authentication: {error:#}");
             None
         }
     }

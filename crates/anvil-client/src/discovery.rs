@@ -3,7 +3,7 @@
 //! (`http://localhost:11434/v1/models`), a local ds4-server
 //! (antirez/ds4, an OpenAI-compatible DeepSeek V4 inference engine), and
 //! Kimi Code, Grok Build OAuth, generic OpenAI-compatible profiles from `providers.json`,
-//! and OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
+//! Xiaomi MiMo Token Plan, and OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
 //! `OPENROUTER_API_KEY` env var), and hosted DeepSeek
 //! (`https://api.deepseek.com/v1/models`, gated on `DEEPSEEK_API_KEY`).
 //!
@@ -16,6 +16,9 @@
 //! the official Grok Build OAuth credential file. Generic
 //! OpenAI-compatible profiles are enabled only when `providers.json`
 //! configures them.
+//! Xiaomi MiMo Token Plan is enabled by `MIMO_TOKEN_PLAN_API_KEY` (or
+//! Xiaomi's broader `MIMO_API_KEY` fallback) and deliberately targets its
+//! dedicated subscription endpoint rather than MiMo's pay-as-you-go endpoint.
 //!
 //! ds4 is the one source whose port is *not* fixed: `ds4-server` has no
 //! standard port, so instead of probing a constant we detect a running
@@ -29,7 +32,7 @@
 //! (`MultiBackend`) can pick the right HTTP client at request time. The
 //! catalog is presented to ACP clients as `<source>::<id>` wire ids, e.g.
 //! `codex::gpt-5-codex`, `ollama::llama3:latest`, `deepseek::deepseek-v4-pro`,
-//! `kimi::k3`, `openai::deca/model-id`, and
+//! `kimi::k3`, `openai::deca/model-id`, `mimo::mimo-v2.6-pro`, and
 //! `openrouter::anthropic/claude-3.5-sonnet`. The double-colon separator
 //! avoids collision with Ollama tags (`model:tag`) and with OpenRouter
 //! ids (`vendor/model`).
@@ -60,6 +63,7 @@ impl ModelSource {
     pub const DS4: &'static str = "ds4";
     pub const GROK: &'static str = "grok";
     pub const KIMI: &'static str = "kimi";
+    pub const MIMO: &'static str = "mimo";
     pub const OLLAMA: &'static str = "ollama";
     pub const OPENAI: &'static str = "openai";
     pub const OPENROUTER: &'static str = "openrouter";
