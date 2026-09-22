@@ -29,7 +29,7 @@ printf '%s' '{"messages":[{"role":"system","content":"Classify the item."},{"rol
   | anvil infer --model codex::gpt-5.5 --reasoning-effort medium
 ```
 
-This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The required model prefix selects the backend so no provider fallback can pick a different model: `codex::<model>`, `meta::<model>`, `kimi::<model>`, `grok::<model>`, `mimo::<model>`, or `deepseek::<model>`. The corresponding credentials are the Codex auth file, native Muse login, Kimi Code credentials, Grok Build OAuth credentials, Xiaomi MiMo Token Plan API key, and the DeepSeek API key. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, aggregate token `usage`, and effective request settings. `--validation-retries` controls additional attempts after local JSON Schema validation fails.
+This path accepts only system and user text, supplies no tools, and bypasses ACP sessions, project instructions, skills, hooks, history, and the agent loop. The required model prefix selects the backend so no provider fallback can pick a different model: `codex::<model>`, `meta::<model>`, `kimi::<model>`, `grok::<model>`, `mimo::<model>`, `mimo-payg::<model>`, or `deepseek::<model>`. The corresponding credentials are the Codex auth file, native Muse login, Kimi Code credentials, Grok Build OAuth credentials, the Xiaomi MiMo Token Plan and pay-as-you-go API keys, and the DeepSeek API key. Omit `--service-tier` to use the provider default. Transport diagnostics go to stderr, while successful stdout contains the validated `output`, aggregate token `usage`, and effective request settings. `--validation-retries` controls additional attempts after local JSON Schema validation fails.
 
 ## Meta / Muse
 
@@ -54,7 +54,9 @@ Anvil probes Ollama at `http://localhost:11434/v1/models`. Start Ollama, then ru
 
 On macOS and Linux, a running `ds4-server` is discovered from its listening port. Set `DS4_BASE_URL` to point at a non-default or remote endpoint, then refresh local discovery.
 
-## Xiaomi MiMo Token Plan
+## Xiaomi MiMo
+
+### Token Plan
 
 Set `MIMO_TOKEN_PLAN_API_KEY` to the `tp-...` key from Xiaomi's Token Plan console. Anvil routes `mimo::*` models through Xiaomi's dedicated subscription Responses endpoint (`https://token-plan-cn.xiaomimimo.com/v1`), not the pay-as-you-go endpoint:
 
@@ -62,9 +64,17 @@ Set `MIMO_TOKEN_PLAN_API_KEY` to the `tp-...` key from Xiaomi's Token Plan conso
 export MIMO_TOKEN_PLAN_API_KEY="tp-your-token-plan-key"
 ```
 
-Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback, but the dedicated variable is safer when your environment also contains a pay-as-you-go `sk-...` MiMo key. Set `MIMO_TOKEN_PLAN_BASE_URL` only if Xiaomi's console provides a different Token Plan base URL. Current models include `mimo::mimo-v2.6-pro`, `mimo::mimo-v2.6-flash`, and `mimo::mimo-v2.6-pro-ultraspeed`.
+Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback only when its `tp-` prefix identifies a Token Plan key. Set `MIMO_TOKEN_PLAN_BASE_URL` only if Xiaomi's console provides a different Token Plan base URL. Current models include `mimo::mimo-v2.6-pro`, `mimo::mimo-v2.6-flash`, and `mimo::mimo-v2.6-pro-ultraspeed`.
 
-For MiMo pay-as-you-go access, configure the ordinary OpenAI-compatible base URL through `providers.json` instead; this prevents a Token Plan credential from being sent to the billed endpoint.
+### Pay-as-you-go
+
+Set `MIMO_PAY_AS_YOU_GO_API_KEY` to the `sk-...` key from Xiaomi's API Keys console. Anvil routes `mimo-payg::*` models through the billed Responses endpoint (`https://api.xiaomimimo.com/v1`):
+
+```bash
+export MIMO_PAY_AS_YOU_GO_API_KEY="sk-your-pay-as-you-go-key"
+```
+
+Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback only when its `sk-` prefix identifies a pay-as-you-go key. Set `MIMO_PAY_AS_YOU_GO_BASE_URL` only if you need to route through a compatible proxy. Both plans can coexist by setting their dedicated variables and explicitly selecting either `mimo::mimo-v2.6-pro` or `mimo-payg::mimo-v2.6-pro`.
 
 ## Hosted DeepSeek and Kimi Code
 
@@ -134,4 +144,4 @@ These profiles use baseline Chat Completions with streaming, tools, usage, and s
 
 Clients that advertise ACP elicitation forms receive out-of-transcript credential fields for OpenRouter, Bedrock, and DeepSeek. In a text-only client, commands such as `/setup openrouter key <key>` remain available but the pasted secret becomes part of the session transcript. Prefer environment variables or elicitation forms for sensitive credentials.
 
-Provider priority for automatic selection is Bedrock, Codex, Meta, local models (Ollama then ds4), DeepSeek, Kimi, Grok, Xiaomi MiMo Token Plan, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.
+Provider priority for automatic selection is Bedrock, Codex, Meta, local models (Ollama then ds4), DeepSeek, Kimi, Grok, Xiaomi MiMo Token Plan then pay-as-you-go, generic OpenAI-compatible profiles, then OpenRouter. Override it for the current session with `/setup model <wire-id>`.

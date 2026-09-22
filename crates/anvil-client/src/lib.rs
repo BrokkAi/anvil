@@ -15,8 +15,8 @@
 //! - [`infer`]: one-shot, tool-free, schema-constrained inference for callers
 //!   that do not need an ACP session or Anvil's agent loop.
 //! - Provider backends: [`bedrock_client`], [`codex_client`], [`grok_client`],
-//!   Xiaomi MiMo Token Plan via [`mimo_client`], and user-configured
-//!   OpenAI-compatible endpoints via [`openai_providers`].
+//!   Xiaomi MiMo Token Plan and pay-as-you-go APIs via [`mimo_client`], and
+//!   user-configured OpenAI-compatible endpoints via [`openai_providers`].
 //! - Auth and credential storage: [`secrets`], [`codex_auth`], [`bedrock_auth`],
 //!   [`grok_auth`], [`kimi_auth`], [`openrouter_auth`], [`deepseek_auth`].
 //! - Credit/balance probes: [`bedrock_credits`], [`codex_credits`],

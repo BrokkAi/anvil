@@ -104,15 +104,27 @@ pub fn build_grok_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
-/// Build the Xiaomi MiMo Token Plan backend. This intentionally does not
-/// expose a constructor for MiMo's pay-as-you-go endpoint: sending a Token
-/// Plan key to the wrong base URL can cause unexpected billing or auth
-/// failures, and generic OpenAI-compatible profiles already cover pay-as-you-go.
+/// Build the Xiaomi MiMo Token Plan backend. The generic `MIMO_API_KEY` is
+/// accepted only when its `tp-` prefix identifies a Token Plan credential.
 pub fn build_mimo_token_plan_backend() -> Option<Arc<dyn LlmBackend>> {
-    match mimo_client::MimoTokenPlanClient::load() {
+    match mimo_client::MimoClient::load(mimo_client::MimoPlan::TokenPlan) {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!("failed to configure Xiaomi MiMo Token Plan authentication: {error:#}");
+            None
+        }
+    }
+}
+
+/// Build Xiaomi MiMo's billed pay-as-you-go backend. The generic
+/// `MIMO_API_KEY` is accepted only when its `sk-` prefix identifies that plan.
+pub fn build_mimo_pay_as_you_go_backend() -> Option<Arc<dyn LlmBackend>> {
+    match mimo_client::MimoClient::load(mimo_client::MimoPlan::PayAsYouGo) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(
+                "failed to configure Xiaomi MiMo pay-as-you-go authentication: {error:#}"
+            );
             None
         }
     }

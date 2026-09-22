@@ -1,9 +1,8 @@
-//! Xiaomi MiMo Token Plan's OpenAI-compatible Responses API.
+//! Xiaomi MiMo's OpenAI-compatible Responses APIs.
 //!
-//! Token Plan is deliberately separate from MiMo's pay-as-you-go API: it
-//! uses a different base URL and a `tp-` API key. Routing this backend to
-//! the ordinary MiMo endpoint would turn subscription traffic into billed
-//! pay-as-you-go traffic, so the Token Plan URL is the only built-in target.
+//! Token Plan and pay-as-you-go deliberately use different base URLs and key
+//! prefixes. Keeping them as explicit plan routes prevents subscription traffic
+//! from accidentally hitting the billed endpoint (or vice versa).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,49 +20,97 @@ pub const MIMO_TOKEN_PLAN_API_KEY_ENV: &str = "MIMO_TOKEN_PLAN_API_KEY";
 pub const MIMO_API_KEY_ENV: &str = "MIMO_API_KEY";
 pub const MIMO_TOKEN_PLAN_BASE_URL_ENV: &str = "MIMO_TOKEN_PLAN_BASE_URL";
 pub const MIMO_TOKEN_PLAN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
+pub const MIMO_PAY_AS_YOU_GO_API_KEY_ENV: &str = "MIMO_PAY_AS_YOU_GO_API_KEY";
+pub const MIMO_PAY_AS_YOU_GO_BASE_URL_ENV: &str = "MIMO_PAY_AS_YOU_GO_BASE_URL";
+pub const MIMO_PAY_AS_YOU_GO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 
-pub struct MimoTokenPlanClient {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MimoPlan {
+    TokenPlan,
+    PayAsYouGo,
+}
+
+impl MimoPlan {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TokenPlan => "Xiaomi MiMo Token Plan",
+            Self::PayAsYouGo => "Xiaomi MiMo pay-as-you-go",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::TokenPlan => MIMO_TOKEN_PLAN_BASE_URL,
+            Self::PayAsYouGo => MIMO_PAY_AS_YOU_GO_BASE_URL,
+        }
+    }
+
+    fn base_url_env(self) -> &'static str {
+        match self {
+            Self::TokenPlan => MIMO_TOKEN_PLAN_BASE_URL_ENV,
+            Self::PayAsYouGo => MIMO_PAY_AS_YOU_GO_BASE_URL_ENV,
+        }
+    }
+
+    fn dedicated_api_key_env(self) -> &'static str {
+        match self {
+            Self::TokenPlan => MIMO_TOKEN_PLAN_API_KEY_ENV,
+            Self::PayAsYouGo => MIMO_PAY_AS_YOU_GO_API_KEY_ENV,
+        }
+    }
+
+    fn generic_api_key_matches(self, key: &str) -> bool {
+        match self {
+            Self::TokenPlan => key.starts_with("tp-"),
+            Self::PayAsYouGo => key.starts_with("sk-"),
+        }
+    }
+}
+
+pub struct MimoClient {
+    plan: MimoPlan,
     http: reqwest::Client,
     api_key: String,
     base_url: String,
 }
 
-impl MimoTokenPlanClient {
-    /// Load the dedicated Token Plan variable first, then Xiaomi's generic
-    /// `MIMO_API_KEY` convention. Discovery failures remain nonfatal upstream.
-    pub fn load() -> Result<Option<Arc<dyn LlmBackend>>> {
-        let key = std::env::var(MIMO_TOKEN_PLAN_API_KEY_ENV)
-            .or_else(|_| std::env::var(MIMO_API_KEY_ENV))
-            .ok()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty());
+impl MimoClient {
+    /// Load a dedicated plan variable first. Xiaomi's generic `MIMO_API_KEY`
+    /// is accepted only when its documented key prefix identifies the plan.
+    pub fn load(plan: MimoPlan) -> Result<Option<Arc<dyn LlmBackend>>> {
+        let key = select_api_key(plan, |name| std::env::var(name).ok());
         let Some(key) = key else {
             return Ok(None);
         };
 
-        let base_url = match std::env::var(MIMO_TOKEN_PLAN_BASE_URL_ENV) {
+        let base_url = match std::env::var(plan.base_url_env()) {
             Ok(value) => {
                 let value = value.trim().to_string();
                 if value.is_empty() {
-                    bail!("{MIMO_TOKEN_PLAN_BASE_URL_ENV} is set but empty");
+                    bail!("{} is set but empty", plan.base_url_env());
                 }
                 value
             }
-            Err(_) => MIMO_TOKEN_PLAN_BASE_URL.to_string(),
+            Err(_) => plan.default_base_url().to_string(),
         };
         Ok(Some(
-            Arc::new(Self::new(base_url, key)?) as Arc<dyn LlmBackend>
+            Arc::new(Self::new(plan, base_url, key)?) as Arc<dyn LlmBackend>
         ))
     }
 
     /// Explicit endpoint construction also supports local wire-level tests.
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
+    pub fn new(
+        plan: MimoPlan,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self> {
         Ok(Self {
+            plan,
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(20))
                 .build()
-                .context("building Xiaomi MiMo Token Plan Responses client")?,
+                .context("building Xiaomi MiMo Responses client")?,
             api_key: api_key.into().trim().to_string(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         })
@@ -106,7 +153,7 @@ impl MimoTokenPlanClient {
         body.parallel_tool_calls = false;
 
         let response = crate::http_retry::send_with_retries(
-            "posting Xiaomi MiMo Token Plan Responses request",
+            "posting Xiaomi MiMo Responses request",
             || {
                 self.http
                     .post(self.responses_url())
@@ -122,7 +169,7 @@ impl MimoTokenPlanClient {
         if !status.is_success() {
             let body_text = read_limited_error_body(response).await;
             return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
-                format!("Xiaomi MiMo Token Plan Responses API failed (HTTP {status})"),
+                format!("{} Responses API failed (HTTP {status})", self.plan.label()),
                 status,
                 &body_text,
             ));
@@ -135,12 +182,35 @@ impl MimoTokenPlanClient {
             drive_responses_sse_stream(stream, on_token, on_thought, cancel.clone(), idle_timeouts)
                 .await?;
         if cancel.is_cancelled() {
-            bail!("Xiaomi MiMo Token Plan request cancelled");
+            bail!("{} request cancelled", self.plan.label());
         }
         if outcome.incomplete {
-            bail!("Xiaomi MiMo Token Plan output was incomplete");
+            bail!("{} output was incomplete", self.plan.label());
         }
         Ok(outcome.response)
+    }
+}
+
+fn select_api_key(plan: MimoPlan, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(key) = lookup(plan.dedicated_api_key_env())
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key);
+    }
+
+    let generic = lookup(MIMO_API_KEY_ENV)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())?;
+    if plan.generic_api_key_matches(&generic) {
+        Some(generic)
+    } else {
+        tracing::info!(
+            "{} is set but its key prefix does not identify {}; backend skipped",
+            MIMO_API_KEY_ENV,
+            plan.label()
+        );
+        None
     }
 }
 
@@ -193,7 +263,7 @@ fn mimo_reasoning_presets() -> Vec<crate::llm_client::ReasoningLevelPreset> {
 /// Xiaomi's `/models` response is OpenAI-shaped and may not expose all of
 /// the capabilities published in its Codex model catalog. Enrich known IDs
 /// while preserving newly introduced models from the live endpoint.
-fn enrich_mimo_metadata(mut metadata: ModelMetadata) -> ModelMetadata {
+fn enrich_mimo_metadata(mut metadata: ModelMetadata, plan: MimoPlan) -> ModelMetadata {
     let known = matches!(
         metadata.id.as_str(),
         "mimo-v2.6-pro"
@@ -206,7 +276,9 @@ fn enrich_mimo_metadata(mut metadata: ModelMetadata) -> ModelMetadata {
         metadata.default_reasoning_level = Some("low".to_string());
         metadata.supported_reasoning_levels = mimo_reasoning_presets();
         metadata.context_length = Some(1_048_576);
-        metadata.pricing = None;
+        if plan == MimoPlan::TokenPlan {
+            metadata.pricing = None;
+        }
         if metadata.id != "mimo-v2.5-pro" {
             metadata.supports_images = Some(true);
         } else {
@@ -216,7 +288,7 @@ fn enrich_mimo_metadata(mut metadata: ModelMetadata) -> ModelMetadata {
     metadata
 }
 
-impl LlmBackend for MimoTokenPlanClient {
+impl LlmBackend for MimoClient {
     fn supports_native_structured_output(&self) -> bool {
         true
     }
@@ -237,7 +309,10 @@ impl LlmBackend for MimoTokenPlanClient {
             )
             .list_model_metadata()
             .await?;
-            Ok(models.into_iter().map(enrich_mimo_metadata).collect())
+            Ok(models
+                .into_iter()
+                .map(|metadata| enrich_mimo_metadata(metadata, self.plan))
+                .collect())
         })
     }
 
@@ -296,18 +371,75 @@ mod tests {
     }
 
     #[test]
-    fn token_plan_urls_avoid_the_pay_as_you_go_endpoint() {
-        let client = MimoTokenPlanClient::new(MIMO_TOKEN_PLAN_BASE_URL, "tp-test").unwrap();
+    fn plan_urls_stay_separate() {
+        let token_plan =
+            MimoClient::new(MimoPlan::TokenPlan, MIMO_TOKEN_PLAN_BASE_URL, "tp-test").unwrap();
         assert_eq!(
-            client.responses_url(),
+            token_plan.responses_url(),
             "https://token-plan-cn.xiaomimimo.com/v1/responses"
         );
 
-        let custom_origin =
-            MimoTokenPlanClient::new("https://token-plan.example.test", "tp-test").unwrap();
+        let pay_as_you_go =
+            MimoClient::new(MimoPlan::PayAsYouGo, MIMO_PAY_AS_YOU_GO_BASE_URL, "sk-test").unwrap();
+        assert_eq!(
+            pay_as_you_go.responses_url(),
+            "https://api.xiaomimimo.com/v1/responses"
+        );
+
+        let custom_origin = MimoClient::new(
+            MimoPlan::TokenPlan,
+            "https://token-plan.example.test",
+            "tp-test",
+        )
+        .unwrap();
         assert_eq!(
             custom_origin.responses_url(),
             "https://token-plan.example.test/v1/responses"
+        );
+    }
+
+    #[test]
+    fn generic_credentials_select_only_their_documented_plan() {
+        let lookup = |name: &str| match name {
+            MIMO_TOKEN_PLAN_API_KEY_ENV => None,
+            MIMO_PAY_AS_YOU_GO_API_KEY_ENV => None,
+            MIMO_API_KEY_ENV => Some("tp-token-plan".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            select_api_key(MimoPlan::TokenPlan, lookup),
+            Some("tp-token-plan".to_string())
+        );
+        assert_eq!(select_api_key(MimoPlan::PayAsYouGo, lookup), None);
+
+        let lookup = |name: &str| match name {
+            MIMO_TOKEN_PLAN_API_KEY_ENV => None,
+            MIMO_PAY_AS_YOU_GO_API_KEY_ENV => None,
+            MIMO_API_KEY_ENV => Some("sk-payg".to_string()),
+            _ => None,
+        };
+        assert_eq!(select_api_key(MimoPlan::TokenPlan, lookup), None);
+        assert_eq!(
+            select_api_key(MimoPlan::PayAsYouGo, lookup),
+            Some("sk-payg".to_string())
+        );
+    }
+
+    #[test]
+    fn dedicated_credentials_take_precedence_over_generic_keys() {
+        let lookup = |name: &str| match name {
+            MIMO_TOKEN_PLAN_API_KEY_ENV => Some("tp-dedicated".to_string()),
+            MIMO_PAY_AS_YOU_GO_API_KEY_ENV => Some("sk-dedicated".to_string()),
+            MIMO_API_KEY_ENV => Some("sk-generic".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            select_api_key(MimoPlan::TokenPlan, lookup),
+            Some("tp-dedicated".to_string())
+        );
+        assert_eq!(
+            select_api_key(MimoPlan::PayAsYouGo, lookup),
+            Some("sk-dedicated".to_string())
         );
     }
 
@@ -325,7 +457,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = MimoTokenPlanClient::new(server.uri(), "tp-test-key").unwrap();
+        let client = MimoClient::new(MimoPlan::TokenPlan, server.uri(), "tp-test-key").unwrap();
         client
             .stream_chat(request(CancellationToken::new()))
             .await
@@ -354,7 +486,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = MimoTokenPlanClient::new(server.uri(), "tp-test-key").unwrap();
+        let client = MimoClient::new(MimoPlan::TokenPlan, server.uri(), "tp-test-key").unwrap();
         let models = client.list_model_metadata().await.unwrap();
         assert_eq!(models.len(), 2);
 
@@ -375,5 +507,31 @@ mod tests {
         let unknown = &models[1];
         assert_eq!(unknown.id, "future-mimo");
         assert!(unknown.default_reasoning_level.is_none());
+    }
+
+    #[tokio::test]
+    async fn pay_as_you_go_discovery_preserves_provider_pricing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("Authorization", "Bearer sk-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "mimo-v2.6-pro", "object": "model", "pricing": {"prompt": "0.0000036", "completion": "0.00000087"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = MimoClient::new(MimoPlan::PayAsYouGo, server.uri(), "sk-test-key").unwrap();
+        let models = client.list_model_metadata().await.unwrap();
+        assert_eq!(
+            models[0].pricing.map(|pricing| (
+                pricing.input_cost_per_token_usd,
+                pricing.output_cost_per_token_usd
+            )),
+            Some((0.0000036, 0.00000087))
+        );
     }
 }

@@ -42,8 +42,8 @@ mod workspace_delta;
 // standalone `anvil_client` crate; these module imports keep the bare
 // `<module>::` paths below working.
 use anvil_client::hosted::{
-    build_deepseek_backend, build_grok_backend, build_kimi_backend, build_mimo_token_plan_backend,
-    deepseek_backend_from_key,
+    build_deepseek_backend, build_grok_backend, build_kimi_backend,
+    build_mimo_pay_as_you_go_backend, build_mimo_token_plan_backend, deepseek_backend_from_key,
 };
 use anvil_client::llm_client::LlmBackend;
 use anvil_client::multi_backend::{BackendRegistration, MultiBackend};
@@ -576,6 +576,7 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
     let deepseek_backend = build_deepseek_backend();
     let kimi_backend = build_kimi_backend();
     let mimo_backend = build_mimo_token_plan_backend();
+    let mimo_payg_backend = build_mimo_pay_as_you_go_backend();
     let grok_backend = build_grok_backend();
     let meta_backend = match anvil_client::meta_client::MetaClient::load() {
         Ok(backend) => backend,
@@ -629,6 +630,13 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
              Xiaomi's MIMO_API_KEY) to a Token Plan key to enable it."
         );
     }
+    if mimo_payg_backend.is_none() {
+        tracing::info!(
+            "Xiaomi MiMo pay-as-you-go backend not available; set \
+             MIMO_PAY_AS_YOU_GO_API_KEY (or Xiaomi's MIMO_API_KEY) to a \
+             pay-as-you-go key to enable it."
+        );
+    }
     if openrouter_backend.is_none() {
         tracing::info!(
             "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
@@ -657,6 +665,11 @@ async fn build_multi_backend(transient_setup: bool) -> Result<Arc<MultiBackend>>
             discovery::ModelSource::MIMO,
             "Xiaomi MiMo Token Plan",
             mimo_backend,
+        ),
+        BackendRegistration::new(
+            discovery::ModelSource::MIMO_PAYG,
+            "Xiaomi MiMo Pay-as-you-go",
+            mimo_payg_backend,
         ),
         BackendRegistration::new(discovery::ModelSource::GROK, "Grok", grok_backend),
         BackendRegistration::new(

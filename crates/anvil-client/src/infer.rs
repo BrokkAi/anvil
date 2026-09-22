@@ -184,13 +184,14 @@ impl HostedClient {
                     "deepseek" => crate::deepseek_client::DeepSeekClient::load()
                         .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
                     "mimo" => crate::hosted::build_mimo_token_plan_backend(),
+                    "mimo-payg" => crate::hosted::build_mimo_pay_as_you_go_backend(),
                     "kimi" => crate::hosted::build_kimi_backend(),
                     "grok" => crate::hosted::build_grok_backend(),
                     _ => {
                         return Err(InferError::new(
                             InferErrorKind::InvalidRequest,
                             anyhow!(
-                                "unsupported inference provider {source:?}; expected codex, meta, kimi, grok, mimo, or deepseek"
+                                "unsupported inference provider {source:?}; expected codex, meta, kimi, grok, mimo, mimo-payg, or deepseek"
                             ),
                         ));
                     }
