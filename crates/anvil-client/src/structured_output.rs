@@ -25,6 +25,14 @@ pub struct StructuredOutputRequest {
     pub prefer_json_object: bool,
 }
 
+/// In-band schema instruction for providers that only support JSON-object mode.
+pub(crate) fn json_schema_instruction(request: &StructuredOutputRequest) -> String {
+    format!(
+        "Return only JSON matching this JSON Schema: {}",
+        request.schema
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredOutputSchemaError {
     pub instance_location: String,

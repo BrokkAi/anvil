@@ -1,7 +1,7 @@
 //! Shared hosted-provider construction for Anvil and language bindings.
 
 use crate::llm_client::LlmBackend;
-use crate::{deepseek_auth, discovery, grok_client, kimi_auth, llm_client};
+use crate::{deepseek_auth, discovery, grok_client, kimi_auth, llm_client, mimo_client};
 use std::sync::Arc;
 
 /// Build a hosted DeepSeek chat backend from a raw API key. DeepSeek's API
@@ -99,6 +99,33 @@ pub fn build_grok_backend() -> Option<Arc<dyn LlmBackend>> {
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!("failed to configure Grok OAuth authentication: {error:#}");
+            None
+        }
+    }
+}
+
+/// Build the Xiaomi MiMo Token Plan backend. The generic `MIMO_API_KEY` is
+/// accepted when its `tp-` (individual) or `ttp-` (team) prefix identifies
+/// a Token Plan credential.
+pub fn build_mimo_token_plan_backend() -> Option<Arc<dyn LlmBackend>> {
+    match mimo_client::MimoClient::load(mimo_client::MimoPlan::TokenPlan) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!("failed to configure Xiaomi MiMo Token Plan authentication: {error:#}");
+            None
+        }
+    }
+}
+
+/// Build Xiaomi MiMo's billed pay-as-you-go backend. The generic
+/// `MIMO_API_KEY` is accepted only when its `sk-` prefix identifies that plan.
+pub fn build_mimo_pay_as_you_go_backend() -> Option<Arc<dyn LlmBackend>> {
+    match mimo_client::MimoClient::load(mimo_client::MimoPlan::PayAsYouGo) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(
+                "failed to configure Xiaomi MiMo pay-as-you-go authentication: {error:#}"
+            );
             None
         }
     }

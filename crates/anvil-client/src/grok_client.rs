@@ -12,7 +12,9 @@ use crate::llm_client::{
     LlmBackend, LlmResponse, ModelMetadata, ReasoningLevelPreset, ResolvedModelInfo,
     StreamChatRequest,
 };
-use crate::responses_api::{ReasoningConfig, build_responses_request, drive_responses_sse_stream};
+use crate::responses_api::{
+    ReasoningConfig, ResponsesRequestOptions, build_responses_request, drive_responses_sse_stream,
+};
 
 const GROK_API_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 
@@ -183,8 +185,7 @@ impl GrokClient {
             tools.as_deref(),
             reasoning_effort.as_deref(),
             structured_output.as_ref(),
-            false,
-            None,
+            ResponsesRequestOptions::default(),
         );
         match body.reasoning.as_mut() {
             Some(reasoning) => reasoning.summary = Some("concise".to_string()),

@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 use crate::llm_client::{
     LlmBackend, LlmResponse, ModelMetadata, ResolvedModelInfo, StreamChatRequest,
 };
-use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
+use crate::responses_api::{
+    ResponsesRequestOptions, build_responses_request, drive_responses_sse_stream,
+};
 
 const META_API_BASE_URL: &str = "https://api.meta.ai/v1";
 const META_MINT_BASE_URL: &str = "https://api.meta.ai";
@@ -298,8 +300,7 @@ impl MetaClient {
             tools.as_deref(),
             reasoning_effort.as_deref(),
             structured_output.as_ref(),
-            false,
-            None,
+            ResponsesRequestOptions::default(),
         );
         let api_key = self.api_key_for(&cancel).await?;
         let response = self

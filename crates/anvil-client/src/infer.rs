@@ -183,13 +183,15 @@ impl HostedClient {
                         .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
                     "deepseek" => crate::deepseek_client::DeepSeekClient::load()
                         .map_err(|e| InferError::new(InferErrorKind::Authentication, e))?,
+                    "mimo" => crate::hosted::build_mimo_token_plan_backend(),
+                    "mimo-payg" => crate::hosted::build_mimo_pay_as_you_go_backend(),
                     "kimi" => crate::hosted::build_kimi_backend(),
                     "grok" => crate::hosted::build_grok_backend(),
                     _ => {
                         return Err(InferError::new(
                             InferErrorKind::InvalidRequest,
                             anyhow!(
-                                "unsupported inference provider {source:?}; expected codex, meta, kimi, grok, or deepseek"
+                                "unsupported inference provider {source:?}; expected codex, meta, kimi, grok, mimo, mimo-payg, or deepseek"
                             ),
                         ));
                     }
@@ -278,10 +280,9 @@ pub async fn infer_structured(
     // JSON-object fallbacks need an in-band schema, but dynamic schemas must
     // follow the caller's stable prompt/article prefix rather than displace it.
     if !backend.supports_native_structured_output() {
-        messages.push(ChatMessage::user(format!(
-            "Return only JSON matching this JSON Schema: {}",
-            structured_output.schema,
-        )));
+        messages.push(ChatMessage::user(
+            crate::structured_output::json_schema_instruction(&structured_output),
+        ));
     }
     let mut total_usage = TokenUsage::default();
     let mut validation_attempt = 0;

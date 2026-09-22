@@ -9,7 +9,9 @@ use crate::llm_client::{
     LlmResponse, ModelMetadata, ModelsResponse, OpenAiClient, OutputBudgetExhaustedError,
     ReasoningLevelPreset, StreamChatRequest, TokenSink, TokenUsage, ToolCall, ToolDefinition,
 };
-use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
+use crate::responses_api::{
+    ResponsesRequestOptions, build_responses_request, drive_responses_sse_stream,
+};
 use crate::responses_chain::{
     RESPONSES_CHAIN_CACHE_CAP, ResponsesChainCache, find_responses_continuation,
     hash_responses_context, looks_like_expired_previous_response_id,
@@ -1023,8 +1025,10 @@ impl BedrockClient {
                 tools.as_deref(),
                 reasoning_effort.as_deref(),
                 structured_output.as_ref(),
-                true,
-                None,
+                ResponsesRequestOptions {
+                    store: true,
+                    ..Default::default()
+                },
             )
         };
 
@@ -1037,8 +1041,11 @@ impl BedrockClient {
                     tools.as_deref(),
                     reasoning_effort.as_deref(),
                     structured_output.as_ref(),
-                    true,
-                    Some(previous_response_id.as_str()),
+                    ResponsesRequestOptions {
+                        store: true,
+                        previous_response_id: Some(previous_response_id.as_str()),
+                        ..Default::default()
+                    },
                 );
                 (body, Some(hash_responses_context(&messages[..*boundary])))
             }
@@ -2983,8 +2990,10 @@ mod tests {
                 None,
                 Some("medium"),
                 None,
-                true,
-                None,
+                ResponsesRequestOptions {
+                    store: true,
+                    ..Default::default()
+                },
             )
         };
         let req_with = serde_json::to_value(build(&messages_with)).unwrap();
