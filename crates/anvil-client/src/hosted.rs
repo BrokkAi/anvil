@@ -105,7 +105,8 @@ pub fn build_grok_backend() -> Option<Arc<dyn LlmBackend>> {
 }
 
 /// Build the Xiaomi MiMo Token Plan backend. The generic `MIMO_API_KEY` is
-/// accepted only when its `tp-` prefix identifies a Token Plan credential.
+/// accepted when its `tp-` (individual) or `ttp-` (team) prefix identifies
+/// a Token Plan credential.
 pub fn build_mimo_token_plan_backend() -> Option<Arc<dyn LlmBackend>> {
     match mimo_client::MimoClient::load(mimo_client::MimoPlan::TokenPlan) {
         Ok(backend) => backend,

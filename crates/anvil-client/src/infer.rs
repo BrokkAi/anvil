@@ -280,10 +280,9 @@ pub async fn infer_structured(
     // JSON-object fallbacks need an in-band schema, but dynamic schemas must
     // follow the caller's stable prompt/article prefix rather than displace it.
     if !backend.supports_native_structured_output() {
-        messages.push(ChatMessage::user(format!(
-            "Return only JSON matching this JSON Schema: {}",
-            structured_output.schema,
-        )));
+        messages.push(ChatMessage::user(
+            crate::structured_output::json_schema_instruction(&structured_output),
+        ));
     }
     let mut total_usage = TokenUsage::default();
     let mut validation_attempt = 0;

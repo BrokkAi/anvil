@@ -52,6 +52,7 @@ pub(crate) struct ResponsesTextConfig {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponsesTextFormat {
+    JsonObject,
     JsonSchema {
         name: String,
         schema: serde_json::Value,
@@ -62,6 +63,10 @@ pub(crate) enum ResponsesTextFormat {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponsesInputItem {
+    Reasoning {
+        id: String,
+        content: Vec<ResponsesContent>,
+    },
     Message {
         role: String,
         content: Vec<ResponsesContent>,
@@ -80,6 +85,7 @@ pub(crate) enum ResponsesInputItem {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponsesContent {
+    ReasoningText { text: String },
     InputText { text: String },
     InputImage { image_url: String },
     OutputText { text: String },
@@ -91,6 +97,15 @@ pub(crate) struct ResponsesToolDef {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) parameters: serde_json::Value,
+}
+
+#[derive(Default)]
+pub(crate) struct ResponsesRequestOptions<'a> {
+    pub(crate) store: bool,
+    pub(crate) previous_response_id: Option<&'a str>,
+    /// MiMo accepts plain reasoning text when replaying stateless history.
+    /// Other providers may require encrypted items or server-side state.
+    pub(crate) replay_reasoning: bool,
 }
 
 /// Builds a Responses API request body from `messages`.
@@ -110,13 +125,12 @@ pub(crate) fn build_responses_request(
     tools: Option<&[ToolDefinition]>,
     reasoning_effort: Option<&str>,
     structured_output: Option<&StructuredOutputRequest>,
-    store: bool,
-    previous_response_id: Option<&str>,
+    options: ResponsesRequestOptions<'_>,
 ) -> ResponsesRequest {
     let mut instructions_parts: Vec<String> = Vec::new();
     let mut input: Vec<ResponsesInputItem> = Vec::new();
 
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
             "system" => {
                 let text = msg.content_text();
@@ -142,6 +156,16 @@ pub(crate) fn build_responses_request(
                 });
             }
             "assistant" => {
+                if options.replay_reasoning
+                    && let Some(text) = msg.reasoning_content.as_ref().filter(|s| !s.is_empty())
+                {
+                    input.push(ResponsesInputItem::Reasoning {
+                        // Stateless replay needs unique, stable item IDs, not
+                        // a reference to a previous server-side response.
+                        id: format!("rs_anvil_{index}"),
+                        content: vec![ResponsesContent::ReasoningText { text: text.clone() }],
+                    });
+                }
                 if let Some(calls) = &msg.tool_calls {
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
@@ -203,8 +227,8 @@ pub(crate) fn build_responses_request(
         tools,
         parallel_tool_calls: true,
         stream: true,
-        store,
-        previous_response_id: previous_response_id.map(str::to_string),
+        store: options.store,
+        previous_response_id: options.previous_response_id.map(str::to_string),
         reasoning: reasoning_effort.map(|effort| ReasoningConfig {
             effort: Some(effort.to_string()),
             summary: None,
@@ -305,6 +329,10 @@ struct ResponseError {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutputItem {
+    Reasoning {
+        #[serde(default)]
+        content: Vec<OutputItemContent>,
+    },
     Message {
         #[serde(default)]
         role: Option<String>,
@@ -326,6 +354,10 @@ enum OutputItem {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutputItemContent {
+    ReasoningText {
+        #[serde(default)]
+        text: String,
+    },
     OutputText {
         #[serde(default)]
         text: String,
@@ -360,6 +392,8 @@ where
     S: Stream<Item = Result<Vec<u8>>> + Unpin,
 {
     let mut full_text = String::new();
+    let mut full_reasoning = String::new();
+    let mut pending_reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut raw_buf: Vec<u8> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle.first_progress;
@@ -459,6 +493,24 @@ where
                                 && let Ok(item) = serde_json::from_value::<OutputItem>(item_val)
                             {
                                 match item {
+                                    OutputItem::Reasoning { content } => {
+                                        let text: String = content.into_iter().filter_map(|part| {
+                                            match part {
+                                                OutputItemContent::ReasoningText { text } => Some(text),
+                                                _ => None,
+                                            }
+                                        }).collect();
+                                        if pending_reasoning.is_empty() && !text.is_empty() {
+                                            on_thought(&text);
+                                        }
+                                        full_reasoning.push_str(if text.is_empty() {
+                                            &pending_reasoning
+                                        } else {
+                                            &text
+                                        });
+                                        pending_reasoning.clear();
+                                        made_progress = true;
+                                    }
                                     OutputItem::Message { role, content } => {
                                         if role.as_deref() == Some("assistant") && !deltas_received {
                                             for c in content {
@@ -556,8 +608,14 @@ where
                                 );
                             }
                         }
-                        "response.reasoning_text.delta"
-                        | "response.reasoning_summary_text.delta" => {
+                        "response.reasoning_text.delta" => {
+                            if let Some(delta) = event.delta {
+                                on_thought(&delta);
+                                pending_reasoning.push_str(&delta);
+                                made_progress = true;
+                            }
+                        }
+                        "response.reasoning_summary_text.delta" => {
                             if let Some(delta) = event.delta {
                                 on_thought(&delta);
                                 made_progress = true;
@@ -586,11 +644,13 @@ where
     if let Some(err) = failure {
         return Err(err);
     }
+    full_reasoning.push_str(&pending_reasoning);
+    let reasoning_content = (!full_reasoning.is_empty()).then_some(full_reasoning);
     if cancel.is_cancelled() {
         return Ok(ResponsesStreamOutcome {
             response: LlmResponse::Text {
                 text: full_text,
-                reasoning_content: None,
+                reasoning_content,
                 usage,
                 codex_reasoning: None,
             },
@@ -608,7 +668,7 @@ where
         Ok(ResponsesStreamOutcome {
             response: LlmResponse::Text {
                 text: full_text,
-                reasoning_content: None,
+                reasoning_content,
                 usage,
                 codex_reasoning: None,
             },
@@ -619,7 +679,7 @@ where
         Ok(ResponsesStreamOutcome {
             response: LlmResponse::ToolCalls {
                 text: full_text,
-                reasoning_content: None,
+                reasoning_content,
                 calls: tool_calls,
                 usage,
                 codex_reasoning: None,
@@ -649,6 +709,78 @@ mod tests {
 
     fn noop_sink() -> TokenSink {
         Box::new(|_| {})
+    }
+
+    #[test]
+    fn reasoning_replay_is_opt_in_and_uses_stable_unique_ids() {
+        let messages = [
+            ChatMessage::user("question"),
+            ChatMessage::assistant_with_reasoning("first answer", Some("first thought".into())),
+            ChatMessage::user("follow-up"),
+            ChatMessage::assistant_with_reasoning("second answer", Some("second thought".into())),
+        ];
+        let build = |replay_reasoning| {
+            serde_json::to_value(build_responses_request(
+                "model",
+                &messages,
+                None,
+                None,
+                None,
+                ResponsesRequestOptions {
+                    replay_reasoning,
+                    ..Default::default()
+                },
+            ))
+            .unwrap()
+        };
+        let default = build(false);
+        assert_eq!(default["input"].as_array().unwrap().len(), 4);
+        assert!(!default.to_string().contains("thought"));
+        let replay = build(true);
+        assert_eq!(replay, build(true));
+        let input = replay["input"].as_array().unwrap();
+        assert_eq!(input.len(), 6);
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[4]["type"], "reasoning");
+        assert_ne!(input[1]["id"], input[4]["id"]);
+        assert_eq!(input[1]["content"][0]["text"], "first thought");
+        assert_eq!(input[4]["content"][0]["text"], "second thought");
+    }
+
+    #[tokio::test]
+    async fn reasoning_items_are_accumulated_without_replaying_summaries() {
+        let events = [
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"summary"}),
+            serde_json::json!({"type":"response.reasoning_text.delta","delta":"first"}),
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"reasoning","content":[{"type":"reasoning_text","text":"first"}]}}),
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"reasoning","content":[{"type":"reasoning_text","text":"second"}]}}),
+            serde_json::json!({"type":"response.reasoning_text.delta","delta":"third"}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"answer"}),
+            serde_json::json!({"type":"response.completed","response":{}}),
+        ];
+        let stream =
+            stream::iter(events.map(|event| Ok(format!("data: {event}\n\n").into_bytes())));
+        let (on_thought, thoughts) = collect_tokens();
+        let outcome = drive_responses_sse_stream(
+            stream,
+            noop_sink(),
+            on_thought,
+            CancellationToken::new(),
+            IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let LlmResponse::Text {
+            text,
+            reasoning_content,
+            ..
+        } = outcome.response
+        else {
+            panic!("expected text response");
+        };
+        assert_eq!(text, "answer");
+        assert_eq!(reasoning_content.as_deref(), Some("firstsecondthird"));
+        assert_eq!(*thoughts.lock().unwrap(), "summaryfirstsecondthird");
     }
 
     fn delayed_chunks(

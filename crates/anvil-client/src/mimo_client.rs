@@ -10,8 +10,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, future::BoxFuture};
 
-use crate::llm_client::{LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
-use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
+use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
+use crate::responses_api::{
+    ResponsesRequestOptions, ResponsesTextConfig, ResponsesTextFormat, build_responses_request,
+    drive_responses_sse_stream,
+};
 
 pub const MIMO_TOKEN_PLAN_API_KEY_ENV: &str = "MIMO_TOKEN_PLAN_API_KEY";
 /// Xiaomi's integration examples use this name for both MiMo plans. Anvil
@@ -61,7 +64,7 @@ impl MimoPlan {
 
     fn generic_api_key_matches(self, key: &str) -> bool {
         match self {
-            Self::TokenPlan => key.starts_with("tp-"),
+            Self::TokenPlan => key.starts_with("tp-") || key.starts_with("ttp-"),
             Self::PayAsYouGo => key.starts_with("sk-"),
         }
     }
@@ -127,7 +130,7 @@ impl MimoClient {
     async fn invoke(&self, request: StreamChatRequest) -> Result<LlmResponse> {
         let StreamChatRequest {
             model,
-            messages,
+            mut messages,
             tools,
             reasoning_effort,
             structured_output,
@@ -137,16 +140,33 @@ impl MimoClient {
             idle_timeouts,
             ..
         } = request;
+        // MiMo supports JSON-object mode, not native JSON Schema. Include
+        // the schema after the stable caller prefix, including direct ACP
+        // callers that do not go through infer_structured's fallback.
+        if let Some(output) = &structured_output {
+            let instruction = crate::structured_output::json_schema_instruction(output);
+            if !messages
+                .iter()
+                .any(|message| message.role == "user" && message.content_text() == instruction)
+            {
+                messages.push(ChatMessage::user(instruction));
+            }
+        }
         let effort = reasoning_effort.as_deref().map(mimo_reasoning_effort);
         let mut body = build_responses_request(
             &model,
             &messages,
             tools.as_deref(),
             effort,
-            structured_output.as_ref(),
-            false,
             None,
+            ResponsesRequestOptions {
+                replay_reasoning: true,
+                ..Default::default()
+            },
         );
+        body.text = structured_output.as_ref().map(|_| ResponsesTextConfig {
+            format: ResponsesTextFormat::JsonObject,
+        });
         // Xiaomi's model catalog explicitly marks parallel tool calls
         // unsupported. Keep the wire request sequential even when the agent
         // loop is willing to execute a returned batch concurrently.
@@ -167,7 +187,14 @@ impl MimoClient {
         .await?;
         let status = response.status();
         if !status.is_success() {
-            let body_text = read_limited_error_body(response).await;
+            let body_text = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("{} request cancelled", self.plan.label()),
+                body = tokio::time::timeout(
+                    Duration::from_secs(3).min(idle_timeouts.inter_chunk),
+                    read_limited_error_body(response),
+                ) => body.unwrap_or_default(),
+            };
             return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
                 format!("{} Responses API failed (HTTP {status})", self.plan.label()),
                 status,
@@ -289,15 +316,14 @@ fn enrich_mimo_metadata(mut metadata: ModelMetadata, plan: MimoPlan) -> ModelMet
 }
 
 impl LlmBackend for MimoClient {
-    fn supports_native_structured_output(&self) -> bool {
-        true
-    }
-
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
-            crate::llm_client::OpenAiClient::new(self.base_url.clone(), Some(self.api_key.clone()))
-                .list_models()
-                .await
+            Ok(self
+                .list_model_metadata()
+                .await?
+                .into_iter()
+                .map(|model| model.id)
+                .collect())
         })
     }
 
@@ -311,6 +337,7 @@ impl LlmBackend for MimoClient {
             .await?;
             Ok(models
                 .into_iter()
+                .filter(|metadata| !is_audio_only_model(&metadata.id))
                 .map(|metadata| enrich_mimo_metadata(metadata, self.plan))
                 .collect())
         })
@@ -321,10 +348,24 @@ impl LlmBackend for MimoClient {
     }
 }
 
+fn is_audio_only_model(id: &str) -> bool {
+    matches!(
+        id,
+        "mimo-v2.5-asr"
+            | "mimo-v2.5-tts"
+            | "mimo-v2.5-tts-voiceclone"
+            | "mimo-v2.5-tts-voicedesign"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{ChatMessage, IdleTimeouts};
+    use crate::infer::{
+        InferErrorKind, InferMessage, InferOptions, StructuredInferRequest, infer_structured,
+    };
+    use crate::llm_client::IdleTimeouts;
+    use crate::structured_output::StructuredOutputRequest;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{header, method, path};
@@ -441,6 +482,265 @@ mod tests {
             select_api_key(MimoPlan::PayAsYouGo, lookup),
             Some("sk-dedicated".to_string())
         );
+    }
+
+    #[test]
+    fn shared_team_credentials_select_token_plan_only() {
+        let lookup = |name: &str| (name == MIMO_API_KEY_ENV).then(|| "  ttp-team-key  ".into());
+        assert_eq!(
+            select_api_key(MimoPlan::TokenPlan, lookup),
+            Some("ttp-team-key".into())
+        );
+        assert_eq!(select_api_key(MimoPlan::PayAsYouGo, lookup), None);
+    }
+
+    fn output_schema() -> serde_json::Value {
+        json!({"type":"object", "properties":{"ok":{"type":"boolean"}},
+            "required":["ok"], "additionalProperties":false})
+    }
+
+    #[tokio::test]
+    async fn structured_inference_uses_json_object_and_validates_locally() {
+        for (output, valid) in [(r#"{"ok":true}"#, true), (r#"{"ok":"wrong type"}"#, false)] {
+            let server = MockServer::start().await;
+            let body = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"type":"response.output_text.delta","delta":output}),
+                json!({"type":"response.completed","response":{"id":"resp_test"}})
+            );
+            Mock::given(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            let client = MimoClient::new(MimoPlan::PayAsYouGo, server.uri(), "sk-test").unwrap();
+            let result = infer_structured(
+                &client,
+                "mimo-v2.6-pro",
+                StructuredInferRequest {
+                    messages: vec![
+                        InferMessage::system("stable rules"),
+                        InferMessage::user("stable input"),
+                    ],
+                    schema_name: "result".into(),
+                    schema: output_schema(),
+                },
+                InferOptions {
+                    validation_retries: 0,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            if valid {
+                assert_eq!(result.unwrap().output, json!({"ok":true}));
+            } else {
+                assert_eq!(result.unwrap_err().kind(), InferErrorKind::StructuredOutput);
+            }
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["text"]["format"], json!({"type":"json_object"}));
+            assert_eq!(body["instructions"], "stable rules");
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 2, "schema must be included exactly once");
+            assert_eq!(input[0]["content"][0]["text"], "stable input");
+            assert_eq!(
+                input[1]["content"][0]["text"],
+                format!(
+                    "Return only JSON matching this JSON Schema: {}",
+                    output_schema()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_structured_chat_also_includes_schema_after_caller_input() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(completed()))
+            .mount(&server)
+            .await;
+        let client = MimoClient::new(MimoPlan::TokenPlan, server.uri(), "tp-test").unwrap();
+        let mut req = request(CancellationToken::new());
+        req.structured_output = Some(StructuredOutputRequest {
+            schema_name: "result".into(),
+            schema: output_schema(),
+            allow_coercion: false,
+            prefer_json_object: false,
+        });
+        client.stream_chat(req).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["text"]["format"], json!({"type":"json_object"}));
+        assert_eq!(body["instructions"], "stable rules");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "summarize the issue"
+        );
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            format!(
+                "Return only JSON matching this JSON Schema: {}",
+                output_schema()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn error_body_obeys_cancellation_and_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for cancel_request in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let mut request_headers = Vec::new();
+                while !request_headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let received = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(received, 0, "request ended before its headers");
+                    request_headers.extend_from_slice(&buffer[..received]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 100\r\n\r\n")
+                    .await
+                    .unwrap();
+                headers_sent.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client = MimoClient::new(MimoPlan::TokenPlan, endpoint, "tp-test").unwrap();
+            let cancel = CancellationToken::new();
+            let mut req = request(cancel.clone());
+            if !cancel_request {
+                req.idle_timeouts.inter_chunk = Duration::from_millis(100);
+            }
+            let mut call = tokio::spawn(async move { client.stream_chat(req).await });
+            headers_received.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if cancel_request {
+                cancel.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), &mut call).await;
+            call.abort();
+            server.abort();
+            let error = result
+                .expect("stalled error body must terminate promptly")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if cancel_request {
+                    "cancelled"
+                } else {
+                    "HTTP 400"
+                }),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_round_trip_replays_reasoning_without_duplication() {
+        for (send_delta, send_done) in [(true, true), (true, false), (false, true)] {
+            let server = MockServer::start().await;
+            let mut events = vec![];
+            if send_delta {
+                events.push(json!({"type":"response.reasoning_text.delta","delta":"Inspect the file first"}));
+            }
+            if send_done {
+                events.push(json!({"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","content":[{"type":"reasoning_text","text":"Inspect the file first"}]}}));
+            }
+            events.extend([
+                json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"call1","name":"read_file","arguments":"{}"}}),
+                json!({"type":"response.completed","response":{"id":"resp1"}}),
+            ]);
+            let body = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            Mock::given(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            let client = MimoClient::new(MimoPlan::TokenPlan, server.uri(), "tp-test").unwrap();
+            let mut req = request(CancellationToken::new());
+            let thoughts = Arc::new(std::sync::Mutex::new(String::new()));
+            let captured = thoughts.clone();
+            req.on_thought = Box::new(move |text| captured.lock().unwrap().push_str(text));
+            let response = client.stream_chat(req).await.unwrap();
+            let LlmResponse::ToolCalls {
+                text,
+                reasoning_content,
+                calls,
+                ..
+            } = response
+            else {
+                panic!("expected tool response");
+            };
+            assert_eq!(reasoning_content.as_deref(), Some("Inspect the file first"));
+            assert_eq!(*thoughts.lock().unwrap(), "Inspect the file first");
+            let mut next = request(CancellationToken::new());
+            next.messages.push(
+                ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                    text,
+                    calls,
+                    reasoning_content,
+                ),
+            );
+            next.messages.push(ChatMessage::tool_result(
+                "call1",
+                "read_file",
+                "file contents",
+            ));
+            client.stream_chat(next).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(
+                input
+                    .iter()
+                    .map(|item| item["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "message",
+                    "reasoning",
+                    "function_call",
+                    "function_call_output"
+                ]
+            );
+            assert!(input[1]["id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(
+                input[1]["content"],
+                json!([{"type":"reasoning_text","text":"Inspect the file first"}])
+            );
+            assert_eq!(input[2]["call_id"], input[3]["call_id"]);
+            assert_eq!(input[3]["output"], "file contents");
+        }
+    }
+
+    #[tokio::test]
+    async fn both_discovery_methods_exclude_audio_and_preserve_unknown_models() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+                {"id":"mimo-v2.5-asr"}, {"id":"mimo-v2.5-tts"},
+                {"id":"mimo-v2.5-tts-voiceclone"}, {"id":"mimo-v2.5-tts-voicedesign"},
+                {"id":"mimo-v2.6-pro"}, {"id":"future-mimo"}
+            ]})))
+            .mount(&server)
+            .await;
+        for plan in [MimoPlan::TokenPlan, MimoPlan::PayAsYouGo] {
+            let client = MimoClient::new(plan, server.uri(), "test-key").unwrap();
+            let metadata_ids: Vec<_> = client
+                .list_model_metadata()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|model| model.id)
+                .collect();
+            assert_eq!(metadata_ids, vec!["mimo-v2.6-pro", "future-mimo"]);
+            assert_eq!(client.list_models().await.unwrap(), metadata_ids);
+        }
     }
 
     #[tokio::test]

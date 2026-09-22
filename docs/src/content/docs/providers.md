@@ -58,13 +58,13 @@ On macOS and Linux, a running `ds4-server` is discovered from its listening port
 
 ### Token Plan
 
-Set `MIMO_TOKEN_PLAN_API_KEY` to the `tp-...` key from Xiaomi's Token Plan console. Anvil routes `mimo::*` models through Xiaomi's dedicated subscription Responses endpoint (`https://token-plan-cn.xiaomimimo.com/v1`), not the pay-as-you-go endpoint:
+Set `MIMO_TOKEN_PLAN_API_KEY` to the `tp-...` individual key or `ttp-...` team key from Xiaomi's Token Plan console. Anvil routes `mimo::*` models through Xiaomi's dedicated subscription Responses endpoint (`https://token-plan-cn.xiaomimimo.com/v1`), not the pay-as-you-go endpoint:
 
 ```bash
 export MIMO_TOKEN_PLAN_API_KEY="tp-your-token-plan-key"
 ```
 
-Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback only when its `tp-` prefix identifies a Token Plan key. Set `MIMO_TOKEN_PLAN_BASE_URL` only if Xiaomi's console provides a different Token Plan base URL. Current models include `mimo::mimo-v2.6-pro`, `mimo::mimo-v2.6-flash`, and `mimo::mimo-v2.6-pro-ultraspeed`.
+Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback when its `tp-` or `ttp-` prefix identifies a Token Plan key. Set `MIMO_TOKEN_PLAN_BASE_URL` only if Xiaomi's console provides a different Token Plan base URL. Current models include `mimo::mimo-v2.6-pro`, `mimo::mimo-v2.6-flash`, and `mimo::mimo-v2.6-pro-ultraspeed`.
 
 ### Pay-as-you-go
 
@@ -75,6 +75,8 @@ export MIMO_PAY_AS_YOU_GO_API_KEY="sk-your-pay-as-you-go-key"
 ```
 
 Xiaomi's broader `MIMO_API_KEY` convention is accepted as a fallback only when its `sk-` prefix identifies a pay-as-you-go key. Set `MIMO_PAY_AS_YOU_GO_BASE_URL` only if you need to route through a compatible proxy. Both plans can coexist by setting their dedicated variables and explicitly selecting either `mimo::mimo-v2.6-pro` or `mimo-payg::mimo-v2.6-pro`.
+
+MiMo structured inference uses JSON-object mode with schema instructions in the prompt and local validation. Discovery excludes audio-only ASR and TTS models.
 
 ## Hosted DeepSeek and Kimi Code
 

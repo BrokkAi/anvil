@@ -13,7 +13,9 @@ use anyhow::{Context, Result, bail};
 use futures::{StreamExt, future::BoxFuture};
 
 use crate::llm_client::{LlmBackend, LlmResponse, StreamChatRequest};
-use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
+use crate::responses_api::{
+    ResponsesRequestOptions, build_responses_request, drive_responses_sse_stream,
+};
 
 pub struct DeepSeekClient {
     http: reqwest::Client,
@@ -79,8 +81,7 @@ impl DeepSeekClient {
             tools.as_deref(),
             effort,
             structured_output.as_ref(),
-            false,
-            None,
+            ResponsesRequestOptions::default(),
         );
         let response = crate::http_retry::send_with_retries(
             "posting DeepSeek Responses request",
