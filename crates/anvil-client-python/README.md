@@ -21,8 +21,9 @@ async def main():
 asyncio.run(main())
 ```
 
-Models require an explicit `codex::`, `meta::`, `kimi::`, `grok::`, or `deepseek::`
-prefix. Credentials and provider behavior are shared with `anvil infer`.
+Models require an explicit `codex::`, `meta::`, `kimi::`, `grok::`, `mimo::`,
+`mimo-payg::`, or `deepseek::` prefix. Credentials and provider behavior are
+shared with `anvil infer`.
 DeepSeek uses `DEEPSEEK_API_KEY` or Anvil's stored DeepSeek credentials.
 The client supplies no tools and creates no agent sessions.
 

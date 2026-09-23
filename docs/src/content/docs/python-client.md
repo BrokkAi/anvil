@@ -24,8 +24,9 @@ async def classify(text: str):
 
 The client accepts the same explicit hosted-provider routes and credentials as
 [`anvil infer`](/providers/#tool-free-structured-inference): Codex, Meta, Kimi,
-Grok, and DeepSeek. It reuses native authentication, retries, schema validation,
-and usage accounting. No tools, agent sessions, or project instructions run.
+Grok, Xiaomi MiMo, and DeepSeek. It reuses native authentication, retries,
+schema validation, and usage accounting. No tools, agent sessions, or project
+instructions run.
 
 DeepSeek structured inference uses its stateless Responses API with native
 `text.format: json_schema` requests. DeepSeek can still return schema violations
@@ -63,4 +64,3 @@ Configure a PyPI trusted publisher for project `brokk-anvil-client`, owner
 `BrokkAi`, repository `anvil`, workflow `python-client.yml`, environment
 `pypi-publish` before its first publication. Wheels carry Anvil's LGPL license;
 the tagged repository is their corresponding source.
-
