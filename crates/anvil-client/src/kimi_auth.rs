@@ -48,30 +48,48 @@ impl KimiBackendConfig {
     }
 
     pub fn build(self) -> Result<Option<Arc<dyn LlmBackend>>> {
-        let auth: Arc<dyn BearerTokenProvider> =
-            if let Some(api_key) = self.api_key.filter(|value| !value.trim().is_empty()) {
-                Arc::new(StaticToken { token: api_key })
-            } else {
-                if !self.credentials_path.is_file() {
-                    return Ok(None);
-                }
-                Arc::new(KimiOAuthTokenProvider {
-                    path: self.credentials_path,
-                    oauth_host: self.oauth_host,
-                    http: reqwest::Client::builder()
-                        .connect_timeout(std::time::Duration::from_secs(10))
-                        .timeout(std::time::Duration::from_secs(30))
-                        .build()
-                        .context("building Kimi OAuth HTTP client")?,
-                    refresh_lock: tokio::sync::Mutex::new(()),
-                })
-            };
+        let auth: Arc<dyn BearerTokenProvider> = if let Some(api_key) = self
+            .api_key
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Arc::new(StaticToken { token: api_key })
+        } else {
+            if !self.credentials_path.is_file() {
+                return Ok(None);
+            }
+            Arc::new(KimiOAuthTokenProvider {
+                path: self.credentials_path.clone(),
+                oauth_host: self.oauth_host.clone(),
+                http: reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .context("building Kimi OAuth HTTP client")?,
+                refresh_lock: tokio::sync::Mutex::new(()),
+            })
+        };
+        self.build_with_token_provider(auth).map(Some)
+    }
+
+    /// Build the backend around a caller-owned token provider.
+    ///
+    /// A host that already refreshes this profile's OAuth credential, such as a
+    /// quota poller, passes the same provider here so the profile has exactly
+    /// one refresher and one credential writer in the process. Headers, base
+    /// URL and device identity are applied exactly as `build` applies them;
+    /// `api_key` and `credentials_path` are ignored because the provider owns
+    /// authentication.
+    pub fn build_with_token_provider(
+        self,
+        auth: Arc<dyn BearerTokenProvider>,
+    ) -> Result<Arc<dyn LlmBackend>> {
         let headers = profile_headers(self.device_id_path.as_deref(), self.custom_headers)?;
-        Ok(Some(Arc::new(OpenAiClient::with_kimi_support(
+        Ok(Arc::new(OpenAiClient::with_kimi_support(
             self.base_url.trim_end_matches('/').to_string(),
             auth,
             headers,
-        ))))
+        )))
     }
 }
 
