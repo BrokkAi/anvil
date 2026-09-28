@@ -70,6 +70,3 @@ tokio = { version = "1", features = ["test-util"] }
 # Mocks the Ollama `/v1/models` HTTP response shape in `discovery::tests`.
 wiremock = "0.6"
 tempfile = "3"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
