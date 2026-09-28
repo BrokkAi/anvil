@@ -135,11 +135,30 @@ impl KimiService {
                 Ok::<_, anyhow::Error>((owner(config.home.clone())?, config))
             })
             .await?;
+        let lease = if let Some(path) = &config.lease_path {
+            let path = path.clone();
+            Some(
+                tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .context("open admitted Kimi runtime lease")?;
+                    FileExt::lock_shared(&file).context("retain admitted Kimi runtime lease")?;
+                    Ok(file)
+                })
+                .await
+                .context("join Kimi runtime lease admission")??,
+            )
+        } else {
+            None
+        };
         let (reply, response) = oneshot::channel();
         owner
             .sender
             .send(Request {
                 owner: owner.clone(),
+                lease,
                 config: config.clone(),
                 reply,
             })
@@ -213,6 +232,9 @@ impl BearerTokenProvider for KimiService {
 struct Request {
     // Keep the canonical owner discoverable until an accepted operation settles.
     owner: Arc<Owner>,
+    // Admission takes this lease before the caller can release its preparation
+    // lease. It remains held even while a canceled request waits for the actor.
+    lease: Option<std::fs::File>,
     config: KimiServiceConfig,
     reply: oneshot::Sender<Result<Value>>,
 }
@@ -261,6 +283,7 @@ fn owner(home: PathBuf) -> Result<Arc<Owner>> {
                 let mut recent: Option<(String, Instant, Value)> = None;
                 while let Some(Request {
                     owner,
+                    lease,
                     config,
                     reply,
                 }) = receiver.recv().await
@@ -287,6 +310,7 @@ fn owner(home: PathBuf) -> Result<Arc<Owner>> {
                         tracing::warn!("Kimi vendor usage failed: {error:#}");
                     }
                     let _ = reply.send(result);
+                    drop(lease);
                     drop(owner);
                 }
             });
@@ -1355,5 +1379,77 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn canceled_queued_request_retains_installation_until_vendor_inherits_lease() {
+        let (home, mut config) = fixture();
+        let lease_path = home.path().join("runtime.lease");
+        std::fs::write(&lease_path, "").unwrap();
+        let preparation_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        FileExt::lock_shared(&preparation_lease).unwrap();
+        config.lease_path = Some(lease_path.clone());
+        std::fs::create_dir(home.path().join("server")).unwrap();
+        let launch_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.path().join("server/anvil-service.lock"))
+            .unwrap();
+        launch_lock.lock_exclusive().unwrap();
+        let service = KimiService::new(config).unwrap();
+        let request = tokio::spawn(async move { service.usage().await });
+        let canonical = std::fs::canonicalize(home.path()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let admitted = OWNERS.get().is_some_and(|owners| {
+                    owners
+                        .lock()
+                        .unwrap()
+                        .get(&canonical)
+                        .is_some_and(|owner| owner.strong_count() >= 2)
+                });
+                if admitted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        let _ = request.await;
+        drop(preparation_lease);
+        let collector = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease_path)
+            .unwrap();
+        assert_eq!(
+            collector.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        FileExt::unlock(&launch_lock).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let bytes =
+                    tokio::fs::read_to_string(home.path().join("credentials/kimi-code.json"))
+                        .await
+                        .unwrap();
+                if bytes.contains("vendor-rotated") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            collector.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        stop(home.path()).await;
     }
 }
