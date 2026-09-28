@@ -1293,6 +1293,16 @@ enum MetadataWire {
 
 pub trait BearerTokenProvider: Send + Sync {
     fn bearer_token(&self) -> BoxFuture<'_, Result<Option<String>>>;
+
+    /// After an explicit 401, return only a token already replaced by its owner.
+    /// The default disables auth retries; implementations must not replay a
+    /// credential mutation here.
+    fn rejected_bearer_token<'a>(
+        &'a self,
+        _rejected: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 #[derive(Debug)]
@@ -1907,6 +1917,7 @@ impl OpenAiClient {
         }
         let http = self.http.clone();
         let api_key = self.auth.bearer_token().await?;
+        let rejected_key = api_key.clone();
         let url_for_task = url.clone();
         let trace_for_task = trace_openrouter;
         let mut send_task = tokio::spawn(async move {
@@ -1925,7 +1936,7 @@ impl OpenAiClient {
                 .await
                 .with_context(|| format!("GET {url_for_task}"))
         });
-        let resp = tokio::select! {
+        let mut resp = tokio::select! {
             joined = &mut send_task => {
                 match joined {
                     Ok(Ok(resp)) => resp,
@@ -1953,6 +1964,20 @@ impl OpenAiClient {
                 );
             }
         };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = rejected_key.as_deref()
+            && let Some(replacement) = self.auth.rejected_bearer_token(rejected).await?
+            && replacement != rejected
+        {
+            resp = self
+                .http
+                .get(&url)
+                .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS))
+                .bearer_auth(replacement)
+                .send()
+                .await
+                .context("retry model discovery with changed credential")?;
+        }
         if trace_openrouter {
             crate::openrouter_auth::append_refresh_log(
                 "OpenRouter fetch_models_response: req.send() returned",
@@ -2143,7 +2168,7 @@ impl OpenAiClient {
             response_format,
         };
         let api_key = self.auth.bearer_token().await?;
-        let resp = match crate::http_retry::send_with_retries(
+        let mut resp = match crate::http_retry::send_with_retries(
             "sending chat completion request",
             || {
                 let mut req = self.http.post(&url).json(&body);
@@ -2160,6 +2185,20 @@ impl OpenAiClient {
             Ok(resp) => resp,
             Err(e) => return Err(e),
         };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = api_key.as_deref()
+            && let Some(replacement) = self.auth.rejected_bearer_token(rejected).await?
+            && replacement != rejected
+        {
+            // Exactly one attempt, only after an explicit rejection. Neither a
+            // transport failure nor a lost acknowledgement authorizes replay.
+            resp = tokio::select! {
+                _ = cancel.cancelled() => anyhow::bail!("chat completion cancelled"),
+                response = self.http.post(&url).json(&body).bearer_auth(replacement)
+                    .timeout(idle_timeouts.first_progress).send() =>
+                    response.context("retry chat completion with changed credential")?,
+            };
+        }
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
