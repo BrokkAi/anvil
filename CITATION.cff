@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use Anvil, please cite the software using these metadata and record the exact version and commit used."
+title: "Anvil: A portable agent runtime for ACP clients"
+type: software
+abstract: "Anvil is a Rust Agent Client Protocol (ACP) server providing a reusable agent engine for editors, bots, TUIs, and internal tools. It handles model routing, tool execution, permissions, sessions, context compaction, sandboxing, and MCP integration."
+authors:
+  - name: "Anvil contributors"
+    website: "https://github.com/BrokkAi/anvil/graphs/contributors"
+contact:
+  - name: "Brokk, Inc."
+    website: "https://brokk.ai"
+repository-code: "https://github.com/BrokkAi/anvil"
+repository-artifact: "https://github.com/BrokkAi/anvil/releases"
+url: "https://anvil.brokk.ai/"
+license: LGPL-3.0-only
+keywords:
+  - coding agents
+  - agent runtime
+  - Agent Client Protocol
+  - ACP
+  - MCP
+  - Rust
