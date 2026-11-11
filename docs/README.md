@@ -10,7 +10,7 @@ npm ci
 npm run dev
 ```
 
-Astro serves the site at the root during local development and production. The production site is deployed to the custom domain [`https://anvil.brokk.ai`](https://anvil.brokk.ai), so its default base path is `/`.
+Astro serves the site at the root during local development and production. The production site is deployed to the custom domain [`https://anvil.slopcop.com`](https://anvil.slopcop.com), so its default base path is `/`.
 
 ## Validation
 
